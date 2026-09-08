@@ -1,0 +1,34 @@
+# ============================================================
+# Week 1 — Kotlin Toolchain (ex-Amper) + IntelliJ IDEA + kotlinc CLI
+# ============================================================
+
+# --- Kotlin Toolchain: каталог сборки (./kotlin build, ./kotlin run) ---
+build/
+
+# --- Артефакты компиляции через CLI-утилиты Kotlin (kotlinc) ---
+# kotlinc file.kt кладёт .class рядом с исходниками,
+# kotlinc -d app.jar — собирает jar в текущую папку.
+# (Зависимости проекта тянутся из Maven, локальных jar в репо нет.)
+*.class
+*.jar
+*.war
+*.ear
+*.klib
+
+# --- IntelliJ IDEA ---
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# --- macOS (дубль корневого .gitignore — чтобы проект жил и отдельно) ---
+.DS_Store
+
+# --- ВАЖНО: врапперы и манифесты НЕ игнорировать, они должны быть в git ---
+# kotlin, kotlin.bat — запуск сборки без установленного Kotlin;
+# project.yaml, */module.yaml — описание модулей agent и app.
+!kotlin
+!kotlin.bat
+!project.yaml
+!**/module.yaml

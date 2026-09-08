@@ -1,0 +1,13 @@
+product: jvm/app
+
+dependencies:
+  - //agent
+  - $compose.desktop.currentOs
+  - $compose.foundation
+  - $compose.material3
+  - org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2
+  - com.mikepenz:multiplatform-markdown-renderer-jvm:0.41.0
+  - com.mikepenz:multiplatform-markdown-renderer-m3-jvm:0.41.0
+
+settings:
+  compose: enabled
