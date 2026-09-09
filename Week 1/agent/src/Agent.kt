@@ -1,20 +1,15 @@
 package agent
 
-import io.ktor.client.HttpClient
-import io.ktor.client.call.body
-import io.ktor.client.engine.cio.CIO
-import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
-import io.ktor.client.request.header
-import io.ktor.client.request.post
-import io.ktor.client.request.setBody
-import io.ktor.http.ContentType
-import io.ktor.http.HttpHeaders
-import io.ktor.http.contentType
-import io.ktor.http.isSuccess
-import io.ktor.serialization.kotlinx.json.json
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-import java.nio.file.Paths
+import agent.data.db.DatabaseFactory
+import agent.data.db.SqliteChatRepository
+import agent.domain.ChatMessage
+import agent.domain.ChatRepository
+import agent.network.ApiKeyProvider
+import agent.network.DeepSeekClient
+import agent.network.LlmResult
+import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 // --- Публичные ошибки агента (UI показывает только userMessage) ---
 sealed class AgentError(val userMessage: String) {
@@ -32,56 +27,70 @@ sealed interface AgentResult {
     data class Failure(val error: AgentError) : AgentResult
 }
 
-@Serializable
-private data class ChatMessage(val role: String, val content: String)
-
-@Serializable
-private data class ChatRequest(
-    val model: String,
-    val messages: List<ChatMessage>,
-    val temperature: Double = 0.7,
-    val stream: Boolean = false,
-)
-
-@Serializable
-private data class ChatChoiceMessage(val content: String? = null)
-
-@Serializable
-private data class ChatChoice(val message: ChatChoiceMessage? = null)
-
-@Serializable
-private data class ChatResponse(val choices: List<ChatChoice> = emptyList())
-
-// --- Агент: отдельная сущность, вся работа с DeepSeek инкапсулирована здесь ---
+// --- Агент: фасад Clean Architecture. HTTP — в DeepSeekClient, история — в ChatRepository (SQLite+Flyway).
+// Публичный API (ask/reset/historySnapshot/close/resolveApiKey) сохранён для UI и тестов. ---
 class Agent(
-    private val model: String = "deepseek-chat",
-    systemPrompt: String? = null,
-    private val temperature: Double = 0.7,
+    model: String = "deepseek-chat",
+    private val systemPrompt: String? = null,
+    temperature: Double = 0.7,
+    private val repository: ChatRepository,
+    private val conversationId: String = ChatRepository.DEFAULT_CONVERSATION,
+    private val llm: DeepSeekClient = DeepSeekClient(model = model, temperature = temperature),
 ) {
-    private val history: MutableList<ChatMessage> = mutableListOf()
+    constructor(
+        model: String = "deepseek-chat",
+        systemPrompt: String? = null,
+        temperature: Double = 0.7,
+        dbFile: File = DatabaseFactory.defaultDbFile(),
+        conversationId: String = ChatRepository.DEFAULT_CONVERSATION,
+    ) : this(
+        model = model,
+        systemPrompt = systemPrompt,
+        temperature = temperature,
+        repository = SqliteChatRepository(dbFile),
+        conversationId = conversationId,
+        llm = DeepSeekClient(model = model, temperature = temperature),
+    )
 
-    private val client: HttpClient by lazy {
-        HttpClient(CIO) {
-            install(ContentNegotiation) {
-                json(Json { ignoreUnknownKeys = true })
+    private val history: MutableList<ChatMessage> = mutableListOf()
+    private val lock = Any()
+
+    init {
+        val stored = try {
+            repository.load(conversationId)
+        } catch (_: Exception) {
+            emptyList()
+        }
+        synchronized(lock) {
+            history += stored
+            if (history.isEmpty() && systemPrompt != null) {
+                history += ChatMessage("system", systemPrompt)
+                persistLocked()
             }
         }
     }
 
-    init {
-        if (systemPrompt != null) {
-            history += ChatMessage("system", systemPrompt)
+    fun reset() {
+        synchronized(lock) {
+            val system = history.firstOrNull()?.takeIf { it.role == "system" }
+            history.clear()
+            if (system != null) history += system
+            persistLocked()
         }
     }
 
-    fun reset() {
-        val system = history.firstOrNull()?.takeIf { it.role == "system" }
-        history.clear()
-        if (system != null) history += system
+    fun clearHistory() {
+        synchronized(lock) {
+            history.clear()
+            if (systemPrompt != null) history += ChatMessage("system", systemPrompt)
+            persistLocked()
+        }
     }
 
     fun historySnapshot(): List<Pair<String, String>> =
-        history.filter { it.role != "system" }.map { it.role to it.content }
+        synchronized(lock) {
+            history.filter { it.role != "system" }.map { it.role to it.content }.toList()
+        }
 
     suspend fun ask(prompt: String): AgentResult {
         val clean = prompt.trim()
@@ -90,73 +99,64 @@ class Agent(
         val apiKey = resolveApiKey()
         if (apiKey.isNullOrBlank()) return AgentResult.Failure(AgentError.MissingKey)
 
-        history += ChatMessage("user", clean)
-        return try {
-            val http = client.post("https://api.deepseek.com/chat/completions") {
-                header(HttpHeaders.Authorization, "Bearer $apiKey")
-                contentType(ContentType.Application.Json)
-                setBody(ChatRequest(model = model, messages = history.toList(), temperature = temperature))
-                // Таймауты по умолчанию CIO; при желании добавить HttpTimeout
-            }
-            if (!http.status.isSuccess()) {
-                history.removeLastOrNull()
-                val err = when (http.status.value) {
-                    401 -> AgentError.Unauthorized
-                    else -> AgentError.Api("HTTP ${http.status.value}")
+        val toSend: List<ChatMessage> = synchronized(lock) {
+            history += ChatMessage("user", clean)
+            persistLocked()
+            history.toList()
+        }
+
+        return when (val r = llm.complete(toSend, apiKey)) {
+            is LlmResult.Ok -> {
+                synchronized(lock) {
+                    history += ChatMessage("assistant", r.text)
+                    persistLocked()
                 }
-                return AgentResult.Failure(err)
+                AgentResult.Success(r.text)
             }
-            val parsed = http.body<ChatResponse>()
-            val text = parsed.choices.firstOrNull()?.message?.content?.trim().orEmpty()
-            if (text.isEmpty()) {
-                history.removeLastOrNull()
+            is LlmResult.HttpError -> {
+                rollbackLastUser()
+                val err = if (r.code == 401) AgentError.Unauthorized else AgentError.Api("HTTP ${r.code}")
+                AgentResult.Failure(err)
+            }
+            is LlmResult.Empty -> {
+                rollbackLastUser()
                 AgentResult.Failure(AgentError.EmptyResponse)
-            } else {
-                history += ChatMessage("assistant", text)
-                AgentResult.Success(text)
             }
-        } catch (e: Exception) {
-            history.removeLastOrNull()
-            AgentResult.Failure(AgentError.Network(e.message ?: e.javaClass.simpleName))
+            is LlmResult.NetworkError -> {
+                rollbackLastUser()
+                AgentResult.Failure(AgentError.Network(r.detail))
+            }
         }
     }
 
     suspend fun close() {
-        client.close()
+        withContext(Dispatchers.IO) { repository.close() }
+        llm.close()
+    }
+
+    private fun rollbackLastUser() {
+        synchronized(lock) {
+            if (history.lastOrNull()?.role == "user") history.removeLastOrNull()
+            persistLocked()
+        }
+    }
+
+    private fun persistLocked() {
+        try {
+            repository.replaceAll(conversationId, history.toList())
+        } catch (_: Exception) {
+            // Историю в памяти не теряем; SQLite/Flyway ошибки не должны ронять чат.
+            // UI всё равно покажет ошибку сети/БД при следующем рестарте через пустой load.
+        }
     }
 
     companion object {
-        @Volatile
-        var apiKeyOverride: String? = null
-
-        // Ключ — ответственность модуля агента: override -> env -> .env файлы вверх по дереву.
-        // Не-null override авторитативен (даже пустой = форсировать MissingKey, удобно для тестов).
-        fun resolveApiKey(): String? {
-            if (apiKeyOverride != null) return apiKeyOverride!!.trim().ifBlank { null }
-            System.getenv("DEEPSEEK_API_KEY")?.takeIf { it.isNotBlank() }?.let { return it.trim() }
-            return findDotEnvKey()
-        }
-
-        private fun findDotEnvKey(): String? {
-            return try {
-                var dir = Paths.get(System.getProperty("user.dir")).toAbsolutePath()
-                repeat(5) {
-                    val dotEnv = dir.resolve(".env").toFile()
-                    if (dotEnv.isFile) {
-                        dotEnv.readLines().forEach { line ->
-                            val t = line.trim()
-                            if (t.startsWith("DEEPSEEK_API_KEY")) {
-                                val value = t.substringAfter("=", "").trim().trim('"', '\'')
-                                if (value.isNotBlank()) return value
-                            }
-                        }
-                    }
-                    dir = dir.parent ?: return null
-                }
-                null
-            } catch (_: Exception) {
-                null
+        var apiKeyOverride: String?
+            get() = ApiKeyProvider.override
+            set(value) {
+                ApiKeyProvider.override = value
             }
-        }
+
+        fun resolveApiKey(): String? = ApiKeyProvider.resolve()
     }
 }
