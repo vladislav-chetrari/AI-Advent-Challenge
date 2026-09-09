@@ -3,7 +3,7 @@ package agent.data.db
 import org.jetbrains.exposed.sql.ReferenceOption
 import org.jetbrains.exposed.sql.Table
 
-// Отражает состояние после ВСЕХ миграций (V1+V2). Схему создаёт Flyway, а не Exposed.
+// Отражает состояние после ВСЕХ миграций (V1..V4). Схему создаёт Flyway, а не Exposed.
 object Conversations : Table("conversation") {
     val id = text("id")
     val title = text("title")
@@ -18,5 +18,10 @@ object ChatMessages : Table("chat_message") {
     val content = text("content")
     val createdAt = long("created_at")
     val model = text("model").nullable()
+    val promptTokens = integer("prompt_tokens").default(0)
+    val completionTokens = integer("completion_tokens").default(0)
+    val totalTokens = integer("total_tokens").default(0)
+    val tokens = integer("tokens").default(0)
+    val costUsd = double("cost_usd").default(0.0)
     override val primaryKey = PrimaryKey(id)
 }

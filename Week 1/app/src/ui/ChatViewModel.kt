@@ -1,6 +1,7 @@
 package app.ui
 
 import agent.Agent
+import agent.AgentError
 import agent.AgentResult
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -9,13 +10,26 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
-data class UiMessage(val role: String, val text: String)
+data class UiMessage(
+    val role: String,
+    val text: String,
+    val tokens: Int = 0,
+    val costUsd: Double = 0.0,
+)
+
+data class TokenStatsUi(
+    val sessionTokens: Long = 0,
+    val sessionCostUsd: Double = 0.0,
+    val contextTokens: Int = 0,
+)
 
 data class ChatUiState(
     val messages: List<UiMessage> = emptyList(),
     val input: String = "",
     val busy: Boolean = false,
-    val status: String? = null,
+    // Ошибка хранится типом, текст резолвится в Screen через ресурсы (локализация + plurals).
+    val status: AgentError? = null,
+    val tokens: TokenStatsUi = TokenStatsUi(),
 )
 
 // MVVM: ViewModel владеет состоянием и юзкейсом ask(), Screen только рисует.
@@ -29,8 +43,20 @@ class ChatViewModel(
 
     init {
         // Восстановление контекста после рестарта: история уже загружена Agent из SQLite.
-        val restored = agent.historySnapshot().map { (role, text) -> UiMessage(role, text) }
-        _state.update { it.copy(messages = restored) }
+        refreshAll()
+    }
+
+    private fun refreshAll() {
+        val restored = agent.historyWithTokens().map {
+            UiMessage(it.role, it.content, it.tokens, it.costUsd)
+        }
+        val s = agent.statsSnapshot()
+        _state.update {
+            it.copy(
+                messages = restored,
+                tokens = TokenStatsUi(s.sessionTokens, s.sessionCostUsd, s.contextTokens),
+            )
+        }
     }
 
     fun onInputChange(value: String) {
@@ -44,10 +70,15 @@ class ChatViewModel(
         scope.launch {
             try {
                 when (val r = agent.ask(q)) {
-                    is AgentResult.Success ->
-                        _state.update { it.copy(messages = it.messages + UiMessage("assistant", r.text)) }
+                    is AgentResult.Success -> refreshAll()
                     is AgentResult.Failure ->
-                        _state.update { it.copy(status = r.error.userMessage) }
+                        _state.update {
+                            // Откат оптимистичного user-бабла: история в Agent уже откачена.
+                            it.copy(
+                                messages = it.messages.dropLast(1),
+                                status = r.error,
+                            )
+                        }
                 }
             } finally {
                 _state.update { it.copy(busy = false) }
@@ -57,6 +88,7 @@ class ChatViewModel(
 
     fun clearHistory() {
         agent.clearHistory()
-        _state.update { it.copy(messages = emptyList(), status = null) }
+        refreshAll()
+        _state.update { it.copy(status = null) }
     }
 }

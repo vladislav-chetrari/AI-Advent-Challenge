@@ -10,4 +10,7 @@ dependencies:
   - com.mikepenz:multiplatform-markdown-renderer-m3-jvm:0.41.0
 
 settings:
-  compose: enabled
+  compose:
+    enabled: true
+    resources:
+      packageName: ai.advent.week1.resources

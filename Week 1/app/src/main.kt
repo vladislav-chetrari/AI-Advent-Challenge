@@ -23,12 +23,16 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import ai.advent.week1.resources.Res
+import ai.advent.week1.resources.api_key_label
+import ai.advent.week1.resources.app_title
 import app.ui.ChatScreen
 import app.ui.ChatViewModel
+import org.jetbrains.compose.resources.stringResource
 
 fun main() = application {
     val windowState = rememberWindowState(width = 1100.dp, height = 750.dp)
-    Window(onCloseRequest = ::exitApplication, title = "Первый агент — DeepSeek + SQLite", state = windowState) {
+    Window(onCloseRequest = ::exitApplication, title = stringResource(Res.string.app_title), state = windowState) {
         MaterialTheme {
             AgentApp()
         }
@@ -52,7 +56,7 @@ fun AgentApp() {
                 keyInput = it
                 Agent.apiKeyOverride = it.ifBlank { null }
             },
-            label = { Text("DEEPSEEK_API_KEY (опционально, иначе env/.env)") },
+            label = { Text(stringResource(Res.string.api_key_label)) },
             visualTransformation = PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth(),
             singleLine = true,

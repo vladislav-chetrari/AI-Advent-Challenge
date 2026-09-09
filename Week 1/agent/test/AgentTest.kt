@@ -122,4 +122,71 @@ class AgentTest {
             runBlocking { agent.close() }
         }
     }
+
+    @Test
+    fun `sqlite repository roundtrips tokens with default 0 for old messages`() {
+        val db = tempDb()
+        val repo1: ChatRepository = SqliteChatRepository(db)
+        // Старое сообщение без замера — все нули по умолчанию.
+        repo1.replaceAll(
+            messages = listOf(
+                ChatMessage("user", "привет"),
+                ChatMessage("assistant", "здравствуй", promptTokens = 100, completionTokens = 20, totalTokens = 120, tokens = 20, costUsd = 0.0000056),
+                ChatMessage("user", "как дела", tokens = 30, costUsd = 0.0000042),
+            ),
+        )
+        repo1.close()
+
+        val repo2: ChatRepository = SqliteChatRepository(db)
+        try {
+            val loaded = repo2.load()
+            assertEquals(3, loaded.size)
+            assertEquals(0, loaded[0].tokens)
+            assertEquals(0.0, loaded[0].costUsd)
+            assertEquals(100, loaded[1].promptTokens)
+            assertEquals(20, loaded[1].tokens)
+            assertEquals(30, loaded[2].tokens)
+            assertTrue(loaded[2].costUsd > 0.0)
+        } finally {
+            repo2.close()
+        }
+    }
+
+    @Test
+    fun `agent hydrates token stats from sqlite on restart`() {
+        val db = tempDb()
+        val seed: ChatRepository = SqliteChatRepository(db)
+        seed.replaceAll(
+            messages = listOf(
+                ChatMessage("user", "ping", tokens = 40, costUsd = 0.0000056),
+                ChatMessage("assistant", "pong", promptTokens = 50, completionTokens = 10, totalTokens = 60, tokens = 10, costUsd = 0.0000028),
+            ),
+        )
+        seed.close()
+
+        Agent.apiKeyOverride = ""
+        try {
+            val agent = Agent(dbFile = db)
+            try {
+                val withTokens = agent.historyWithTokens()
+                assertEquals(2, withTokens.size)
+                assertEquals(40, withTokens[0].tokens)
+                assertEquals(10, withTokens[1].tokens)
+                val stats = agent.statsSnapshot()
+                assertEquals(50, stats.contextTokens)
+                assertEquals(50, stats.sessionTokens)
+                assertTrue(stats.sessionCostUsd > 0.0)
+            } finally {
+                runBlocking { agent.close() }
+            }
+        } finally {
+            Agent.apiKeyOverride = null
+        }
+    }
+
+    @Test
+    fun `token pricing formats to 10 decimals`() {
+        assertEquals("0.0000056000", agent.domain.formatCostUsd(agent.domain.TokenPricing.outputCostUsd(20)))
+        assertEquals("0.0000042000", agent.domain.formatCostUsd(agent.domain.TokenPricing.inputCostUsd(30)))
+    }
 }

@@ -22,7 +22,17 @@ class SqliteChatRepository(
         ChatMessages.selectAll()
             .where { ChatMessages.conversationId eq conversationId }
             .orderBy(ChatMessages.id)
-            .map { ChatMessage(role = it[ChatMessages.role], content = it[ChatMessages.content]) }
+            .map {
+                ChatMessage(
+                    role = it[ChatMessages.role],
+                    content = it[ChatMessages.content],
+                    promptTokens = try { it[ChatMessages.promptTokens] } catch (_: Exception) { 0 },
+                    completionTokens = try { it[ChatMessages.completionTokens] } catch (_: Exception) { 0 },
+                    totalTokens = try { it[ChatMessages.totalTokens] } catch (_: Exception) { 0 },
+                    tokens = try { it[ChatMessages.tokens] } catch (_: Exception) { 0 },
+                    costUsd = try { it[ChatMessages.costUsd] } catch (_: Exception) { 0.0 },
+                )
+            }
     }
 
     override fun replaceAll(conversationId: String, messages: List<ChatMessage>) {
@@ -35,6 +45,11 @@ class SqliteChatRepository(
                     this[ChatMessages.role] = m.role
                     this[ChatMessages.content] = m.content
                     this[ChatMessages.createdAt] = System.currentTimeMillis()
+                    this[ChatMessages.promptTokens] = m.promptTokens
+                    this[ChatMessages.completionTokens] = m.completionTokens
+                    this[ChatMessages.totalTokens] = m.totalTokens
+                    this[ChatMessages.tokens] = m.tokens
+                    this[ChatMessages.costUsd] = m.costUsd
                 }
             }
         }
