@@ -67,6 +67,7 @@ fun AgentApp() {
             onInputChange = vm::onInputChange,
             onSend = vm::send,
             onClear = vm::clearHistory,
+            onSelectModel = vm::selectModel,
         )
     }
 }

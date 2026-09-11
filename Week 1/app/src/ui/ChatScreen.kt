@@ -18,11 +18,17 @@ import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -50,6 +56,7 @@ import ai.advent.week1.resources.err_unauthorized
 import ai.advent.week1.resources.history_hint
 import ai.advent.week1.resources.input_label
 import ai.advent.week1.resources.message_tokens
+import ai.advent.week1.resources.model_label
 import ai.advent.week1.resources.role_agent
 import ai.advent.week1.resources.role_user
 import ai.advent.week1.resources.send
@@ -60,8 +67,7 @@ import org.jetbrains.compose.resources.pluralStringResource
 import org.jetbrains.compose.resources.stringResource
 
 // Тупая вьюха: рисует state, события уходят наверх. Никакой логики сети/БД.
-// Лимит контекста deepseek-chat (legacy) — 64k. Для v4-flash/pro — 1M, правится одной константой.
-private const val CONTEXT_LIMIT = 64_000
+// Лимит контекста берётся из текущей модели (DeepSeek 64k / TinyLlama 2k).
 
 // Тупая вьюха: рисует state, события уходят наверх. Никакой логики сети/БД.
 @Composable
@@ -70,6 +76,7 @@ fun ChatScreen(
     onInputChange: (String) -> Unit,
     onSend: () -> Unit,
     onClear: () -> Unit,
+    onSelectModel: (String) -> Unit,
 ) {
     val listState = rememberLazyListState()
 
@@ -86,6 +93,8 @@ fun ChatScreen(
             Spacer(Modifier.weight(1f))
             OutlinedButton(onClick = onClear, enabled = !state.busy) { Text(stringResource(Res.string.clear)) }
         }
+        Spacer(Modifier.height(4.dp))
+        ModelSelector(state, onSelectModel)
         Spacer(Modifier.height(4.dp))
         TokenPanel(state)
         Spacer(Modifier.height(8.dp))
@@ -167,10 +176,36 @@ fun ChatScreen(
 }
 
 @Composable
+private fun ModelSelector(state: ChatUiState, onSelectModel: (String) -> Unit) {
+    var expanded by remember { mutableStateOf(false) }
+    val selected = state.models.firstOrNull { it.id == state.selectedModelId } ?: state.models.firstOrNull()
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Text(stringResource(Res.string.model_label), color = Color.Gray)
+        Spacer(Modifier.width(8.dp))
+        Box {
+            OutlinedButton(onClick = { expanded = true }, enabled = !state.busy) {
+                Text(selected?.label ?: "")
+            }
+            DropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                state.models.forEach { m ->
+                    DropdownMenuItem(
+                        text = { Text(m.label) },
+                        onClick = {
+                            expanded = false
+                            onSelectModel(m.id)
+                        },
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
 private fun TokenPanel(state: ChatUiState) {
     val t = state.tokens
     val sessionQty = t.sessionTokens.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
-    val pct = if (CONTEXT_LIMIT > 0) t.contextTokens * 100 / CONTEXT_LIMIT else 0
+    val pct = if (t.contextLimit > 0) t.contextTokens * 100 / t.contextLimit else 0
     val color = if (pct >= 90) Color.Red else Color.Gray
     Text(
         stringResource(
@@ -181,7 +216,7 @@ private fun TokenPanel(state: ChatUiState) {
         color = color,
     )
     Text(
-        stringResource(Res.string.context_fill, t.contextTokens, CONTEXT_LIMIT, pct),
+        stringResource(Res.string.context_fill, t.contextTokens, t.contextLimit, pct),
         color = color,
     )
 }

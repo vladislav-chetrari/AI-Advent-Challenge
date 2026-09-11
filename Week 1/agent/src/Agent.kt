@@ -1,12 +1,13 @@
 package agent
 
+import agent.data.ModelStore
 import agent.data.db.DatabaseFactory
 import agent.data.db.SqliteChatRepository
 import agent.domain.ChatMessage
 import agent.domain.ChatRepository
-import agent.domain.TokenPricing
+import agent.domain.LlmModel
 import agent.network.ApiKeyProvider
-import agent.network.DeepSeekClient
+import agent.network.LlmClient
 import agent.network.LlmResult
 import agent.network.TokenUsage
 import java.io.File
@@ -42,30 +43,33 @@ data class AgentStats(
     val contextTokens: Int = 0,
 )
 
-// --- Агент: фасад Clean Architecture. HTTP — в DeepSeekClient, история — в ChatRepository (SQLite+Flyway).
+// --- Агент: фасад Clean Architecture. HTTP — в LlmClient, история — в ChatRepository (SQLite+Flyway).
 // Публичный API (ask/reset/historySnapshot/close/resolveApiKey) сохранён для UI и тестов. ---
 class Agent(
-    model: String = "deepseek-chat",
+    private var llmModel: LlmModel = LlmModel.DEEPSEEK,
     private val systemPrompt: String? = null,
     temperature: Double = 0.7,
     private val repository: ChatRepository,
     private val conversationId: String = ChatRepository.DEFAULT_CONVERSATION,
-    private val llm: DeepSeekClient = DeepSeekClient(model = model, temperature = temperature),
+    private var llm: LlmClient = LlmClient(model = llmModel.apiId, temperature = temperature, baseUrl = llmModel.baseUrl),
+    private val modelDir: File? = null,
 ) {
     constructor(
-        model: String = "deepseek-chat",
         systemPrompt: String? = null,
         temperature: Double = 0.7,
         dbFile: File = DatabaseFactory.defaultDbFile(),
         conversationId: String = ChatRepository.DEFAULT_CONVERSATION,
     ) : this(
-        model = model,
+        llmModel = ModelStore.load(dbFile.parentFile),
         systemPrompt = systemPrompt,
         temperature = temperature,
         repository = SqliteChatRepository(dbFile),
         conversationId = conversationId,
-        llm = DeepSeekClient(model = model, temperature = temperature),
+        modelDir = dbFile.parentFile,
     )
+
+    val currentModel: LlmModel
+        get() = synchronized(lock) { llmModel }
 
     private val history: MutableList<ChatMessage> = mutableListOf()
     private val lock = Any()
@@ -124,6 +128,27 @@ class Agent(
         }
     }
 
+    // Смена модели: чат стирается чтобы было проще (история другой модели
+    // бессмысленна — токены и лимиты разные). Выбор сохраняется в файл.
+    fun switchModel(next: LlmModel, temperature: Double = 0.7) {
+        synchronized(lock) {
+            if (next.id == llmModel.id) return
+            try {
+                llm.close()
+            } catch (_: Exception) {
+            }
+            llmModel = next
+            llm = LlmClient(model = next.apiId, temperature = temperature, baseUrl = next.baseUrl)
+            history.clear()
+            if (systemPrompt != null) history += ChatMessage("system", systemPrompt)
+            persistLocked()
+            lastUsage = TokenUsage()
+            sessionTokens = 0
+            sessionCostUsd = 0.0
+            ModelStore.save(modelDir, next)
+        }
+    }
+
     fun historySnapshot(): List<Pair<String, String>> =
         synchronized(lock) {
             history.filter { it.role != "system" }.map { it.role to it.content }.toList()
@@ -149,7 +174,9 @@ class Agent(
         if (clean.isEmpty()) return AgentResult.Failure(AgentError.EmptyPrompt)
 
         val apiKey = resolveApiKey()
-        if (apiKey.isNullOrBlank()) return AgentResult.Failure(AgentError.MissingKey)
+        if (currentModel.needsApiKey && apiKey.isNullOrBlank()) {
+            return AgentResult.Failure(AgentError.MissingKey)
+        }
 
         val toSend: List<ChatMessage> = synchronized(lock) {
             history += ChatMessage("user", clean)
@@ -159,6 +186,7 @@ class Agent(
 
         return when (val r = llm.complete(toSend, apiKey)) {
             is LlmResult.Ok -> {
+                val model = currentModel
                 synchronized(lock) {
                     // Токены user-сообщения знаем только ПОСЛЕ ответа: дельта prompt_tokens
                     // минус предыдущий контекст и предыдущий ответ. Включает system/oверхед
@@ -166,8 +194,8 @@ class Agent(
                     val userTokens =
                         (r.usage.promptTokens - lastUsage.promptTokens - lastUsage.completionTokens)
                             .coerceAtLeast(0)
-                    val userCost = TokenPricing.inputCostUsd(userTokens)
-                    val assistantCost = TokenPricing.outputCostUsd(r.usage.completionTokens)
+                    val userCost = model.inputCostUsd(userTokens)
+                    val assistantCost = model.outputCostUsd(r.usage.completionTokens)
                     val lastUserIdx = history.indexOfLast { it.role == "user" }
                     if (lastUserIdx >= 0) {
                         val u = history[lastUserIdx]

@@ -8,6 +8,7 @@
     <string name="role_agent">Агент</string>
     <string name="input_label">Запрос агенту… (Enter — отправить, Shift+Enter — перенос)</string>
     <string name="send">Отправить</string>
+    <string name="model_label">Модель:</string>
     <string name="tokens_spent">Потрачено: %1$s (~$%2$s)</string>
     <string name="context_fill">Контекст: %1$d / %2$d (%3$d%%)</string>
     <string name="message_tokens">%1$s · $%2$s</string>

@@ -8,6 +8,7 @@
     <string name="role_agent">Agent</string>
     <string name="input_label">Ask the agent… (Enter to send, Shift+Enter for newline)</string>
     <string name="send">Send</string>
+    <string name="model_label">Model:</string>
     <string name="tokens_spent">Spent: %1$s (~$%2$s)</string>
     <string name="context_fill">Context: %1$d / %2$d (%3$d%%)</string>
     <string name="message_tokens">%1$s · $%2$s</string>

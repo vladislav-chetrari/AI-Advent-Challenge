@@ -70,10 +70,12 @@ sealed interface LlmResult {
     data object Empty : LlmResult
 }
 
-// SRP: только HTTP к DeepSeek. Про историю и SQLite ничего не знает.
-class DeepSeekClient(
+// SRP: только HTTP к OpenAI-совместимому endpoint (DeepSeek или локальная Ollama).
+// Про историю и SQLite ничего не знает.
+class LlmClient(
     private val model: String = "deepseek-chat",
     private val temperature: Double = 0.7,
+    private val baseUrl: String = "https://api.deepseek.com",
 ) {
     val modelName: String get() = model
 
@@ -85,10 +87,10 @@ class DeepSeekClient(
         }
     }
 
-    suspend fun complete(history: List<ChatMessage>, apiKey: String): LlmResult {
+    suspend fun complete(history: List<ChatMessage>, apiKey: String?): LlmResult {
         return try {
-            val http = client.post("https://api.deepseek.com/chat/completions") {
-                header(HttpHeaders.Authorization, "Bearer $apiKey")
+            val http = client.post("${baseUrl.trimEnd('/')}/chat/completions") {
+                if (!apiKey.isNullOrBlank()) header(HttpHeaders.Authorization, "Bearer $apiKey")
                 contentType(ContentType.Application.Json)
                 setBody(
                     ChatRequest(

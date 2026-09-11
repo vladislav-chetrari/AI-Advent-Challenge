@@ -1,8 +1,10 @@
 package agent
 
+import agent.data.ModelStore
 import agent.data.db.SqliteChatRepository
 import agent.domain.ChatMessage
 import agent.domain.ChatRepository
+import agent.domain.LlmModel
 import java.nio.file.Files
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
@@ -188,5 +190,81 @@ class AgentTest {
     fun `token pricing formats to 10 decimals`() {
         assertEquals("0.0000056000", agent.domain.formatCostUsd(agent.domain.TokenPricing.outputCostUsd(20)))
         assertEquals("0.0000042000", agent.domain.formatCostUsd(agent.domain.TokenPricing.inputCostUsd(30)))
+    }
+
+    @Test
+    fun `switchModel wipes history and stats`() {
+        val db = tempDb()
+        val seed: ChatRepository = SqliteChatRepository(db)
+        seed.replaceAll(
+            messages = listOf(
+                ChatMessage("user", "ping", tokens = 40, costUsd = 0.0000056),
+                ChatMessage("assistant", "pong", promptTokens = 50, completionTokens = 10, totalTokens = 60, tokens = 10, costUsd = 0.0000028),
+            ),
+        )
+        seed.close()
+
+        Agent.apiKeyOverride = ""
+        try {
+            val agent = Agent(dbFile = db)
+            try {
+                assertEquals(2, agent.historyWithTokens().size)
+                agent.switchModel(LlmModel.TINYLLAMA)
+                assertTrue(agent.historyWithTokens().isEmpty())
+                assertTrue(agent.historySnapshot().isEmpty())
+                val stats = agent.statsSnapshot()
+                assertEquals(0, stats.sessionTokens)
+                assertEquals(0.0, stats.sessionCostUsd)
+                assertEquals(0, stats.contextTokens)
+                assertEquals(LlmModel.TINYLLAMA.id, agent.currentModel.id)
+                // Выбор сохранился в файл рядом с БД.
+                assertEquals(
+                    LlmModel.TINYLLAMA.id,
+                    ModelStore.load(db.parentFile).id,
+                )
+            } finally {
+                runBlocking { agent.close() }
+            }
+        } finally {
+            Agent.apiKeyOverride = null
+        }
+    }
+
+    @Test
+    fun `local model does not require api key`() {
+        val db = tempDb()
+        Agent.apiKeyOverride = "" // пустой ключ
+        try {
+            val agent = Agent(dbFile = db)
+            try {
+                agent.switchModel(LlmModel.TINYLLAMA)
+                val result = runBlocking { agent.ask("ping") }
+                val failure = assertIs<AgentResult.Failure>(result)
+                // Ключ не требуется: любая ошибка, кроме MissingKey
+                // (обычно Network — Ollama не запущена; при запущенной может и Success).
+                assertTrue(failure.error !is AgentError.MissingKey)
+            } finally {
+                runBlocking { agent.close() }
+            }
+        } finally {
+            Agent.apiKeyOverride = null
+        }
+    }
+
+    @Test
+    fun `model choice survives restart via file`() {
+        val db = tempDb()
+        ModelStore.save(db.parentFile, LlmModel.TINYLLAMA)
+        Agent.apiKeyOverride = ""
+        try {
+            val agent = Agent(dbFile = db)
+            try {
+                assertEquals(LlmModel.TINYLLAMA.id, agent.currentModel.id)
+            } finally {
+                runBlocking { agent.close() }
+            }
+        } finally {
+            Agent.apiKeyOverride = null
+        }
     }
 }

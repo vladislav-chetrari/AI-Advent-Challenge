@@ -3,6 +3,7 @@ package app.ui
 import agent.Agent
 import agent.AgentError
 import agent.AgentResult
+import agent.domain.LlmModel
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -21,6 +22,7 @@ data class TokenStatsUi(
     val sessionTokens: Long = 0,
     val sessionCostUsd: Double = 0.0,
     val contextTokens: Int = 0,
+    val contextLimit: Int = 0,
 )
 
 data class ChatUiState(
@@ -30,6 +32,8 @@ data class ChatUiState(
     // Ошибка хранится типом, текст резолвится в Screen через ресурсы (локализация + plurals).
     val status: AgentError? = null,
     val tokens: TokenStatsUi = TokenStatsUi(),
+    val models: List<LlmModel> = LlmModel.ALL,
+    val selectedModelId: String = LlmModel.DEEPSEEK.id,
 )
 
 // MVVM: ViewModel владеет состоянием и юзкейсом ask(), Screen только рисует.
@@ -51,12 +55,21 @@ class ChatViewModel(
             UiMessage(it.role, it.content, it.tokens, it.costUsd)
         }
         val s = agent.statsSnapshot()
+        val model = agent.currentModel
         _state.update {
             it.copy(
                 messages = restored,
-                tokens = TokenStatsUi(s.sessionTokens, s.sessionCostUsd, s.contextTokens),
+                tokens = TokenStatsUi(s.sessionTokens, s.sessionCostUsd, s.contextTokens, model.contextLimit),
+                selectedModelId = model.id,
             )
         }
+    }
+
+    fun selectModel(id: String) {
+        if (_state.value.busy) return
+        agent.switchModel(LlmModel.byId(id))
+        refreshAll()
+        _state.update { it.copy(status = null) }
     }
 
     fun onInputChange(value: String) {
