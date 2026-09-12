@@ -13,4 +13,5 @@ object TokenPricing {
 }
 
 // Формат стоимости: до 10 знаков после запятой, как требуется в Task 3.
-fun formatCostUsd(cost: Double): String = "%.10f".format(cost)
+// Locale.US чтобы в русской локали не вылезала запятая (USD всегда с точкой).
+fun formatCostUsd(cost: Double): String = String.format(java.util.Locale.US, "%.10f", cost)

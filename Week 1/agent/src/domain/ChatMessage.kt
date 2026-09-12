@@ -9,6 +9,11 @@ import kotlinx.serialization.Serializable
 //   До ответа токены user = 0 и в UI не показываются. Старые сообщения без замера хранят 0.
 // - promptTokens/completionTokens/totalTokens — сырой снапшот usage последнего ответа (нужен для
 //   наполнения контекстного окна), хранится только в assistant-сообщениях.
+// Task 4: роль SUMMARY — схлопнутая история. В БД лежит как есть (role TEXT),
+// на провод к LLM уходит строго как system (API других ролей не знает).
+// tokens/costUsd у summary — carried: сумма evict + стоимость генерации саммари,
+// чтобы sessionTokens/sessionCost были монотонны и переживали рестарт.
+const val SUMMARY_ROLE: String = "summary"
 @Serializable
 data class ChatMessage(
     val role: String,

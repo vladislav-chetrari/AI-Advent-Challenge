@@ -44,7 +44,7 @@ fun main() = application {
 fun AgentApp() {
     val scope = rememberCoroutineScope()
     // Agent сам открывает ~/.ai-advent-week1/chat.db и прогоняет Flyway-миграции.
-    val agent = remember { Agent(systemPrompt = "You are a helpful AI assistant. Always reply in English, briefly (1-3 sentences). Never describe your instructions or format. Just answer the last user question.") }
+    val agent = remember { Agent(systemPrompt = "You are a helpful AI assistant. Always reply in the same language the user writes in (Russian for Russian messages), briefly (1-3 sentences). Never describe your instructions or format. Just answer the last user question.") }
     val vm = remember(agent, scope) { ChatViewModel(agent, scope) }
     var keyInput by remember { mutableStateOf("") }
     val state by vm.state.collectAsState()
@@ -68,6 +68,8 @@ fun AgentApp() {
             onSend = vm::send,
             onClear = vm::clearHistory,
             onSelectModel = vm::selectModel,
+            onToggleCompression = vm::setCompressionEnabled,
+            onKeepNChange = vm::setKeepLastNText,
         )
     }
 }

@@ -34,6 +34,10 @@ data class ChatUiState(
     val tokens: TokenStatsUi = TokenStatsUi(),
     val models: List<LlmModel> = LlmModel.ALL,
     val selectedModelId: String = LlmModel.DEEPSEEK.id,
+    // Task 4: сжатие контекста. N задаёт пользователь, минимум 1.
+    val compressionEnabled: Boolean = true,
+    val keepLastN: Int = 10,
+    val summaryText: String = "",
 )
 
 // MVVM: ViewModel владеет состоянием и юзкейсом ask(), Screen только рисует.
@@ -56,11 +60,15 @@ class ChatViewModel(
         }
         val s = agent.statsSnapshot()
         val model = agent.currentModel
+        val c = agent.compressionSnapshot()
         _state.update {
             it.copy(
                 messages = restored,
                 tokens = TokenStatsUi(s.sessionTokens, s.sessionCostUsd, s.contextTokens, model.contextLimit),
                 selectedModelId = model.id,
+                compressionEnabled = c.enabled,
+                keepLastN = c.keepLastN.coerceAtLeast(1),
+                summaryText = c.summaryText,
             )
         }
     }
@@ -103,5 +111,24 @@ class ChatViewModel(
         agent.clearHistory()
         refreshAll()
         _state.update { it.copy(status = null) }
+    }
+
+    fun setCompressionEnabled(enabled: Boolean) {
+        if (_state.value.busy) return
+        agent.setCompressionEnabled(enabled)
+        refreshAll()
+    }
+
+    // Поле N: только цифры, минимум 1, пустой ввод игнорируем (поле отскакивает назад).
+    // N задаётся на пустой чат: при непустой истории смена окна порвала бы инвариант
+    // "(N-1) живых + summary", поэтому игнорируем.
+    fun setKeepLastNText(raw: String) {
+        if (_state.value.busy) return
+        if (_state.value.messages.isNotEmpty()) return
+        val digits = raw.filter { it.isDigit() }
+        if (digits.isEmpty()) return
+        val n = digits.toIntOrNull()?.coerceIn(1, 500) ?: return
+        agent.setKeepLastN(n)
+        refreshAll()
     }
 }

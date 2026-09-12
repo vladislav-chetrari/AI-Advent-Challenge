@@ -1,11 +1,14 @@
 package agent
 
+import agent.data.CompressionSettings
+import agent.data.CompressionStore
 import agent.data.ModelStore
 import agent.data.db.DatabaseFactory
 import agent.data.db.SqliteChatRepository
 import agent.domain.ChatMessage
 import agent.domain.ChatRepository
 import agent.domain.LlmModel
+import agent.domain.SUMMARY_ROLE
 import agent.network.ApiKeyProvider
 import agent.network.LlmClient
 import agent.network.LlmResult
@@ -50,7 +53,16 @@ data class AgentStats(
     val contextTokens: Int = 0,
 )
 
+// Снапшот сжатия для UI (Task 4): флаг, окно N и текст summary (без system).
+data class CompressionSnapshot(
+    val enabled: Boolean = true,
+    val keepLastN: Int = CompressionSettings.DEFAULT_KEEP_LAST_N,
+    val summaryText: String = "",
+)
+
 // --- Агент: фасад Clean Architecture. HTTP — в LlmClient, история — в ChatRepository (SQLite+Flyway).
+// Task 4: summary хранится отдельным сообщением role="summary" сразу после system.
+// В БД лежит как есть, на провод к LLM уходит строго как system (см. effectiveHistoryLocked).
 // Публичный API (ask/reset/historySnapshot/close/resolveApiKey) сохранён для UI и тестов. ---
 class Agent(
     private var llmModel: LlmModel = LlmModel.DEEPSEEK,
@@ -60,6 +72,7 @@ class Agent(
     private val conversationId: String = ChatRepository.DEFAULT_CONVERSATION,
     private var llm: LlmClient = LlmClient(model = llmModel.apiId, temperature = temperature, baseUrl = llmModel.baseUrl),
     private val modelDir: File? = null,
+    compression: CompressionSettings = CompressionSettings(),
 ) {
     constructor(
         systemPrompt: String? = null,
@@ -73,6 +86,7 @@ class Agent(
         repository = SqliteChatRepository(dbFile),
         conversationId = conversationId,
         modelDir = dbFile.parentFile,
+        compression = CompressionStore.load(dbFile.parentFile),
     )
 
     val currentModel: LlmModel
@@ -87,6 +101,10 @@ class Agent(
     private var sessionTokens: Long = 0
     private var sessionCostUsd: Double = 0.0
 
+    // Task 4: окно памяти N задаёт пользователь (>= 1), хранится как ModelStore.
+    private var compressionEnabled: Boolean = compression.enabled
+    private var keepLastN: Int = compression.keepLastN.coerceAtLeast(1)
+
     init {
         val stored = try {
             repository.load(conversationId)
@@ -95,9 +113,25 @@ class Agent(
         }
         synchronized(lock) {
             history += stored
-            if (history.isEmpty() && systemPrompt != null) {
-                history += ChatMessage("system", systemPrompt)
-                persistLocked()
+            // Синхронизация system-промпта: у старых БД лежит прошлый текст
+            // (например "reply in English") — обновляем на актуальный из кода.
+            // Summary при этом не трогаем, он отдельным сообщением.
+            if (systemPrompt != null) {
+                val first = history.firstOrNull()
+                when {
+                    first == null -> {
+                        history += ChatMessage("system", systemPrompt)
+                        persistLocked()
+                    }
+                    first.role == SUMMARY_ROLE -> {
+                        history.add(0, ChatMessage("system", systemPrompt))
+                        persistLocked()
+                    }
+                    first.role == "system" && first.content != systemPrompt -> {
+                        history[0] = first.copy(content = systemPrompt)
+                        persistLocked()
+                    }
+                }
             }
             // Гидратация статистики из SQLite: переживает рестарт (Task 2+3).
             val assistants = history.filter { it.role == "assistant" }
@@ -159,13 +193,14 @@ class Agent(
 
     fun historySnapshot(): List<Pair<String, String>> =
         synchronized(lock) {
-            history.filter { it.role != "system" }.map { it.role to it.content }.toList()
+            history.filter { it.role != "system" && it.role != SUMMARY_ROLE }.map { it.role to it.content }.toList()
         }
 
     // Полный снапшот с токенами для UI (Task 3). Старые сообщения без замера имеют 0.
+    // Summary скрыто — UI показывает его отдельно через compressionSnapshot().
     fun historyWithTokens(): List<ChatMessage> =
         synchronized(lock) {
-            history.filter { it.role != "system" }.toList()
+            history.filter { it.role != "system" && it.role != SUMMARY_ROLE }.toList()
         }
 
     fun statsSnapshot(): AgentStats =
@@ -176,6 +211,30 @@ class Agent(
                 contextTokens = lastUsage.promptTokens,
             )
         }
+
+    // Task 4: настройки + текст summary для UI.
+    fun compressionSnapshot(): CompressionSnapshot =
+        synchronized(lock) {
+            CompressionSnapshot(
+                enabled = compressionEnabled,
+                keepLastN = keepLastN,
+                summaryText = history.firstOrNull { it.role == SUMMARY_ROLE }?.content.orEmpty(),
+            )
+        }
+
+    fun setCompressionEnabled(enabled: Boolean) {
+        synchronized(lock) {
+            compressionEnabled = enabled
+            CompressionStore.save(modelDir, CompressionSettings(enabled, keepLastN))
+        }
+    }
+
+    fun setKeepLastN(n: Int) {
+        synchronized(lock) {
+            keepLastN = n.coerceAtLeast(1)
+            CompressionStore.save(modelDir, CompressionSettings(compressionEnabled, keepLastN))
+        }
+    }
 
     suspend fun ask(prompt: String): AgentResult {
         val clean = prompt.trim()
@@ -189,7 +248,7 @@ class Agent(
         val toSend: List<ChatMessage> = synchronized(lock) {
             history += ChatMessage("user", clean)
             persistLocked()
-            history.toList()
+            effectiveHistoryLocked()
         }
 
         return when (val r = llm.complete(toSend, apiKey)) {
@@ -199,6 +258,7 @@ class Agent(
                     // Токены user-сообщения знаем только ПОСЛЕ ответа: дельта prompt_tokens
                     // минус предыдущий контекст и предыдущий ответ. Включает system/oверхед
                     // на первом витке — это ограничение API, а не оценка до отправки.
+                    // Со сжатием summary уже сидит в system, дельта корректна как есть.
                     val userTokens =
                         (r.usage.promptTokens - lastUsage.promptTokens - lastUsage.completionTokens)
                             .coerceAtLeast(0)
@@ -222,6 +282,11 @@ class Agent(
                     lastUsage = r.usage
                     sessionTokens += (userTokens + r.usage.completionTokens).toLong()
                     sessionCostUsd += (userCost + assistantCost)
+                }
+                // Task 4: схлопывание старых сообщений в summary (не роняет ответ при фейле).
+                try {
+                    maybeCompress(apiKey)
+                } catch (_: Exception) {
                 }
                 AgentResult.Success(r.text, r.usage)
             }
@@ -254,6 +319,104 @@ class Agent(
         synchronized(lock) {
             if (history.lastOrNull()?.role == "user") history.removeLastOrNull()
             persistLocked()
+        }
+    }
+
+    // Task 4: summary на провод уходит как system — API других ролей не знает.
+    // Вызывать под lock'ом.
+    private fun effectiveHistoryLocked(): List<ChatMessage> {
+        val out = ArrayList<ChatMessage>(history.size)
+        for (m in history) {
+            if (m.role == SUMMARY_ROLE) out += ChatMessage("system", SUMMARY_PREFIX + m.content)
+            else out += m
+        }
+        return out
+    }
+
+    // Task 4: если живых сообщений больше N — схлопнуть старые в summary.
+    // Держим (N-1) последних живых + 1 summary = N в памяти. N >= 1 всегда.
+    // carried-токены/стоимость переезжают в summary, поэтому sessionTokens/Cost
+    // монотонны и переживают рестарт через обычный sumOf(history).
+    private suspend fun maybeCompress(apiKey: String?) {
+        val enabled: Boolean
+        val n: Int
+        synchronized(lock) {
+            enabled = compressionEnabled
+            n = keepLastN.coerceAtLeast(1)
+        }
+        if (!enabled) return
+
+        // Снапшот работы под lock'ом, сеть — без lock'а. Без nullable чтобы не спотыкаться о smart-cast.
+        var evict: List<ChatMessage> = emptyList()
+        var oldSummaryText: String = ""
+        var needCompress = false
+        synchronized(lock) {
+            val liveIdx = history.indices.filter { history[it].role != "system" && history[it].role != SUMMARY_ROLE }
+            val keepLive = (n - 1).coerceAtLeast(1)
+            if (liveIdx.size > n) {
+                val evictCount = liveIdx.size - keepLive
+                evict = liveIdx.take(evictCount).map { history[it] }
+                oldSummaryText = history.firstOrNull { it.role == SUMMARY_ROLE }?.content.orEmpty()
+                needCompress = true
+            }
+        }
+        if (!needCompress) return
+        val evictSnapshot: List<ChatMessage> = evict.toList()
+
+        val batchText = evictSnapshot.joinToString("\n") { "${it.role}: ${it.content}" }.take(6000)
+        val prompt = buildList {
+            add(ChatMessage("system", SUMMARIZER_SYSTEM))
+            add(
+                ChatMessage(
+                    "user",
+                    (if (oldSummaryText.isNotBlank()) "Previous summary:\n${oldSummaryText.take(2000)}\n\n" else "") +
+                        "New messages to fold into the summary:\n$batchText",
+                ),
+            )
+        }
+        val r = try {
+            llm.complete(prompt, apiKey)
+        } catch (_: Exception) {
+            return
+        }
+        val ok = r as? LlmResult.Ok ?: return
+        val summaryText = ok.text.trim().take(2000).takeIf { it.isNotBlank() } ?: return
+        val usage = ok.usage
+        val model = currentModel
+
+        synchronized(lock) {
+            // Перепроверка: историю могли сбросить/очистить пока шла сеть.
+            val liveNow = history.indices.filter { history[it].role != "system" && history[it].role != SUMMARY_ROLE }
+            val keepLive = keepLastN.coerceAtLeast(1).let { (it - 1).coerceAtLeast(1) }
+            if (liveNow.size <= keepLastN.coerceAtLeast(1)) return
+            val evictCount = liveNow.size - keepLive
+            val evictIdx = liveNow.take(evictCount)
+            // Защита от гонки: схлопываем только если начало окна совпало.
+            val evictMsgs = evictIdx.map { history[it] }
+            if (evictMsgs.map { it.role to it.content } != evictSnapshot.map { it.role to it.content }) return
+            val oldSummary = history.firstOrNull { it.role == SUMMARY_ROLE }
+            val carriedTokens = evictMsgs.sumOf { it.tokens.toLong() } + (oldSummary?.tokens?.toLong() ?: 0)
+            val carriedCost = evictMsgs.sumOf { it.costUsd } + (oldSummary?.costUsd ?: 0.0)
+            val summCost = model.inputCostUsd(usage.promptTokens) + model.outputCostUsd(usage.completionTokens)
+            val merged = ChatMessage(
+                role = SUMMARY_ROLE,
+                content = summaryText,
+                promptTokens = usage.promptTokens,
+                completionTokens = usage.completionTokens,
+                totalTokens = usage.totalTokens,
+                tokens = (carriedTokens + usage.promptTokens + usage.completionTokens).coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+                costUsd = carriedCost + summCost,
+            )
+            // Удаляем evict с конца к началу чтобы не поплыли индексы.
+            for (i in evictIdx.sortedDescending()) history.removeAt(i)
+            val sysIdx = history.indexOfFirst { it.role == "system" }
+            val sumIdx = history.indexOfFirst { it.role == SUMMARY_ROLE }
+            if (sumIdx >= 0) history[sumIdx] = merged
+            else if (sysIdx >= 0) history.add(sysIdx + 1, merged)
+            else history.add(0, merged)
+            persistLocked()
+            sessionTokens += (usage.promptTokens + usage.completionTokens).toLong()
+            sessionCostUsd += summCost
         }
     }
 
@@ -309,6 +472,11 @@ class Agent(
     }
 
     companion object {
+        const val SUMMARY_PREFIX: String = "Previous conversation summary (use as context, it replaces earlier messages):\n"
+        const val SUMMARIZER_SYSTEM: String =
+            "You are a concise dialogue summarizer. Summarize in Russian, keep names, facts, decisions and open questions. " +
+                "Max ~200 tokens. Output only the summary, no preamble."
+
         var apiKeyOverride: String?
             get() = ApiKeyProvider.override
             set(value) {

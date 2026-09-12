@@ -10,8 +10,11 @@
     <string name="send">Отправить</string>
     <string name="model_label">Модель:</string>
     <string name="tokens_spent">Потрачено: %1$s (~$%2$s)</string>
-    <string name="context_fill">Контекст: %1$d / %2$d (%3$d%%)</string>
+    <string name="context_fill">Контекст: %1$d / %2$d (%3$s)</string>
     <string name="message_tokens">%1$s · $%2$s</string>
+    <string name="compression_label">Сжатие истории</string>
+    <string name="keep_n_label">N (держать):</string>
+    <string name="summary_label">Саммари:</string>
     <string name="err_missing_key">DEEPSEEK_API_KEY не найден. Задайте env-переменную или положите .env с DEEPSEEK_API_KEY рядом с проектом.</string>
     <string name="err_unauthorized">DeepSeek отклонил ключ (401). Проверьте DEEPSEEK_API_KEY.</string>
     <string name="err_overflow">Контекст переполнен: история + запрос превысили лимит модели. Очистите историю и попробуйте снова.</string>

@@ -1,6 +1,7 @@
 package app.ui
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -9,14 +10,18 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -39,12 +44,14 @@ import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
 import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import agent.AgentError
 import agent.domain.formatCostUsd
 import ai.advent.week1.resources.Res
 import ai.advent.week1.resources.clear
+import ai.advent.week1.resources.compression_label
 import ai.advent.week1.resources.context_fill
 import ai.advent.week1.resources.err_api
 import ai.advent.week1.resources.err_empty_prompt
@@ -55,11 +62,13 @@ import ai.advent.week1.resources.err_overflow
 import ai.advent.week1.resources.err_unauthorized
 import ai.advent.week1.resources.history_hint
 import ai.advent.week1.resources.input_label
+import ai.advent.week1.resources.keep_n_label
 import ai.advent.week1.resources.message_tokens
 import ai.advent.week1.resources.model_label
 import ai.advent.week1.resources.role_agent
 import ai.advent.week1.resources.role_user
 import ai.advent.week1.resources.send
+import ai.advent.week1.resources.summary_label
 import ai.advent.week1.resources.tokens
 import ai.advent.week1.resources.tokens_spent
 import com.mikepenz.markdown.m3.Markdown
@@ -77,6 +86,8 @@ fun ChatScreen(
     onSend: () -> Unit,
     onClear: () -> Unit,
     onSelectModel: (String) -> Unit,
+    onToggleCompression: (Boolean) -> Unit = {},
+    onKeepNChange: (String) -> Unit = {},
 ) {
     val listState = rememberLazyListState()
 
@@ -97,6 +108,8 @@ fun ChatScreen(
         ModelSelector(state, onSelectModel)
         Spacer(Modifier.height(4.dp))
         TokenPanel(state)
+        Spacer(Modifier.height(4.dp))
+        CompressionPanel(state, onToggleCompression, onKeepNChange)
         Spacer(Modifier.height(8.dp))
         LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = listState, verticalArrangement = Arrangement.spacedBy(8.dp)) {
             items(state.messages) { m ->
@@ -152,7 +165,10 @@ fun ChatScreen(
                 label = { Text(stringResource(Res.string.input_label)) },
                 modifier = Modifier.weight(1f)
                     .onPreviewKeyEvent { event ->
-                        if (event.key == Key.Enter && event.type == KeyEventType.KeyDown && !event.isShiftPressed) {
+                        // Enter с основной клавиатуры и с numpad — разные клавиши.
+                        if ((event.key == Key.Enter || event.key == Key.NumPadEnter) &&
+                            event.type == KeyEventType.KeyDown && !event.isShiftPressed
+                        ) {
                             onSend()
                             true
                         } else {
@@ -215,10 +231,60 @@ private fun TokenPanel(state: ChatUiState) {
         ),
         color = color,
     )
+    // Процент собираем в коде ("%3$s"), а не %% в ресурсах — иначе Compose рендерит "%%".
     Text(
-        stringResource(Res.string.context_fill, t.contextTokens, t.contextLimit, pct),
+        stringResource(Res.string.context_fill, t.contextTokens, t.contextLimit, "$pct%"),
         color = color,
     )
+}
+
+@Composable
+private fun CompressionPanel(
+    state: ChatUiState,
+    onToggle: (Boolean) -> Unit,
+    onNChange: (String) -> Unit,
+) {
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Checkbox(
+            checked = state.compressionEnabled,
+            onCheckedChange = onToggle,
+            enabled = !state.busy,
+        )
+        Text(stringResource(Res.string.compression_label), color = Color.Gray)
+        Spacer(Modifier.width(8.dp))
+        Text(stringResource(Res.string.keep_n_label), color = Color.Gray)
+        Spacer(Modifier.width(4.dp))
+        OutlinedTextField(
+            value = state.keepLastN.toString(),
+            onValueChange = onNChange,
+            // N задаётся на пустой чат; при непустой истории поле залочено.
+            enabled = !state.busy && state.messages.isEmpty(),
+            singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+            modifier = Modifier.width(90.dp),
+        )
+    }
+    if (state.summaryText.isNotBlank()) {
+        Spacer(Modifier.height(2.dp))
+        // Схлопнуто при смене саммари. Клик по обрезанному раскрывает полностью со скроллом.
+        var expanded by remember(state.summaryText) { mutableStateOf(false) }
+        val limit = 300
+        val isTruncated = state.summaryText.length > limit
+        val shown = if (expanded || !isTruncated) state.summaryText
+        else state.summaryText.take(limit).trimEnd() + "..."
+        Column(
+            Modifier.fillMaxWidth()
+                .clickable(enabled = isTruncated) { expanded = !expanded },
+        ) {
+            Text(
+                stringResource(Res.string.summary_label) + " " + shown,
+                color = Color.Gray,
+                maxLines = if (expanded) Int.MAX_VALUE else 3,
+                modifier = if (expanded) Modifier.heightIn(max = 200.dp).verticalScroll(rememberScrollState())
+                else Modifier,
+            )
+        }
+    }
 }
 
 @Composable

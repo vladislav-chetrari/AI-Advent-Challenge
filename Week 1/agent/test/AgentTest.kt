@@ -1,16 +1,44 @@
 package agent
 
+import agent.data.CompressionSettings
+import agent.data.CompressionStore
 import agent.data.ModelStore
 import agent.data.db.SqliteChatRepository
 import agent.domain.ChatMessage
 import agent.domain.ChatRepository
 import agent.domain.LlmModel
+import agent.domain.SUMMARY_ROLE
+import agent.network.LlmClient
+import agent.network.LlmResult
+import agent.network.TokenUsage
 import java.nio.file.Files
 import kotlinx.coroutines.runBlocking
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
+
+// Fake для Task 4: скриптованные ответы, пишет wire-роли для проверки маппинга summary->system.
+private class FakeLlmClient : LlmClient(model = "fake", temperature = 0.0, baseUrl = "http://localhost:1") {
+    var calls: Int = 0
+    var lastRoles: List<String> = emptyList()
+    var lastContents: List<String> = emptyList()
+    // Все вызовы: ask сам перезаписывается follow-up суммаризацией, поэтому ищем по всем.
+    val allContents: MutableList<List<String>> = mutableListOf()
+
+    override suspend fun complete(history: List<ChatMessage>, apiKey: String?): LlmResult {
+        calls++
+        lastRoles = history.map { it.role }
+        lastContents = history.map { it.content }
+        allContents += lastContents.toList()
+        val isSummary = history.any { it.content.contains("fold into the summary") }
+        return if (isSummary) {
+            LlmResult.Ok("test-summary", TokenUsage(promptTokens = 50, completionTokens = 20, totalTokens = 70))
+        } else {
+            LlmResult.Ok("reply-$calls", TokenUsage(promptTokens = 100 * calls, completionTokens = 10, totalTokens = 100 * calls + 10))
+        }
+    }
+}
 
 class AgentTest {
     private fun tempDb(): java.io.File {
@@ -265,6 +293,127 @@ class AgentTest {
             }
         } finally {
             Agent.apiKeyOverride = null
+        }
+    }
+
+    // --- Task 4: сжатие истории ---
+
+    private fun compressionAgent(
+        db: java.io.File,
+        fake: FakeLlmClient,
+        n: Int,
+        enabled: Boolean = true,
+    ): Agent = Agent(
+        llmModel = LlmModel.TINYLLAMA,
+        repository = SqliteChatRepository(db),
+        conversationId = ChatRepository.DEFAULT_CONVERSATION,
+        llm = fake,
+        modelDir = db.parentFile,
+        compression = CompressionSettings(enabled = enabled, keepLastN = n),
+    )
+
+    @Test
+    fun `compression collapses old messages keeping last N-1 live`() {
+        val db = tempDb()
+        val fake = FakeLlmClient()
+        val agent = compressionAgent(db, fake, n = 4)
+        try {
+            runBlocking {
+                repeat(3) { i ->
+                    assertIs<AgentResult.Success>(agent.ask("q$i"))
+                }
+            }
+            // 3 витка = 6 живых; N=4 -> держим 3 последних + 1 summary.
+            assertEquals(3, agent.historyWithTokens().size)
+            val snap = agent.compressionSnapshot()
+            assertTrue(snap.summaryText.isNotBlank())
+            assertEquals("test-summary", snap.summaryText)
+            // Summary скрыто из снапшотов, в БД лежит ровно одно.
+            val raw: ChatRepository = SqliteChatRepository(db)
+            try {
+                val all = raw.load()
+                assertEquals(1, all.count { it.role == SUMMARY_ROLE })
+            } finally {
+                raw.close()
+            }
+            // На провод summary уходит как system, роль summary наружу не течёт.
+            assertTrue(fake.lastRoles.none { it == SUMMARY_ROLE })
+            // Счётчики монотонны: суммарно больше нуля и не упали после схлопывания.
+            assertTrue(agent.statsSnapshot().sessionTokens > 0)
+        } finally {
+            runBlocking { agent.close() }
+        }
+    }
+
+    @Test
+    fun `summary survives restart and stays hidden`() {
+        val db = tempDb()
+        val fake1 = FakeLlmClient()
+        val agent1 = compressionAgent(db, fake1, n = 4)
+        runBlocking {
+            repeat(3) { i -> agent1.ask("q$i") }
+            agent1.close()
+        }
+        val summaryBefore = agent1.compressionSnapshot().summaryText
+
+        val fake2 = FakeLlmClient()
+        val agent2 = compressionAgent(db, fake2, n = 4)
+        try {
+            assertEquals(summaryBefore, agent2.compressionSnapshot().summaryText)
+            assertEquals(3, agent2.historyWithTokens().size)
+            assertTrue(agent2.historySnapshot().none { it.first == SUMMARY_ROLE })
+            // Следующий запрос подмешивает summary как system (ищем по всем вызовам:
+            // follow-up суммаризация перезаписывает lastContents).
+            runBlocking { agent2.ask("next") }
+            assertTrue(fake2.lastRoles.none { it == SUMMARY_ROLE })
+            assertTrue(fake2.allContents.any { call -> call.any { it.contains("Previous conversation summary") } })
+        } finally {
+            runBlocking { agent2.close() }
+        }
+    }
+
+    @Test
+    fun `disabled compression never summarizes`() {
+        val db = tempDb()
+        val fake = FakeLlmClient()
+        val agent = compressionAgent(db, fake, n = 4, enabled = false)
+        try {
+            runBlocking {
+                repeat(3) { i ->
+                    assertIs<AgentResult.Success>(agent.ask("q$i"))
+                }
+            }
+            assertEquals(6, agent.historyWithTokens().size)
+            assertEquals("", agent.compressionSnapshot().summaryText)
+        } finally {
+            runBlocking { agent.close() }
+        }
+    }
+
+    @Test
+    fun `keepLastN never below 1 and survives restart via file`() {
+        val db = tempDb()
+        val fake = FakeLlmClient()
+        val agent = compressionAgent(db, fake, n = 10)
+        try {
+            agent.setKeepLastN(0)
+            assertEquals(1, agent.compressionSnapshot().keepLastN)
+            agent.setKeepLastN(-5)
+            assertEquals(1, agent.compressionSnapshot().keepLastN)
+            agent.setKeepLastN(7)
+            assertEquals(7, agent.compressionSnapshot().keepLastN)
+            assertEquals(7, CompressionStore.load(db.parentFile).keepLastN)
+            agent.setCompressionEnabled(false)
+            assertEquals(false, CompressionStore.load(db.parentFile).enabled)
+        } finally {
+            runBlocking { agent.close() }
+        }
+        // Перезапуск читает N из файла.
+        val agent2 = Agent(dbFile = db)
+        try {
+            assertEquals(7, agent2.compressionSnapshot().keepLastN)
+        } finally {
+            runBlocking { agent2.close() }
         }
     }
 }

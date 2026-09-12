@@ -98,7 +98,8 @@ sealed interface LlmResult {
 // SRP: только HTTP (DeepSeek через OpenAI-совместимый endpoint, локальная Ollama
 // через нативный /api/chat с truncate=false/shift=false чтобы переполнение давало
 // HTTP 400 вместо молчаливого sliding window). Про историю и SQLite ничего не знает.
-class LlmClient(
+// open для тестов Task 4 (FakeLlmClient переопределяет complete).
+open class LlmClient(
     private val model: String = "deepseek-chat",
     private val temperature: Double = 0.7,
     private val baseUrl: String = "https://api.deepseek.com",
@@ -123,7 +124,7 @@ class LlmClient(
         }
     }
 
-    suspend fun complete(history: List<ChatMessage>, apiKey: String?): LlmResult {
+    suspend open fun complete(history: List<ChatMessage>, apiKey: String?): LlmResult {
         return try {
             if (useNativeOllama) completeNative(history) else completeOpenAi(history, apiKey)
         } catch (e: Exception) {
