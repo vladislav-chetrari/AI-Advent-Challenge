@@ -13,6 +13,11 @@ import agent.network.TokenUsage
 import java.io.File
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
 
 // --- Публичные ошибки агента (UI показывает только userMessage) ---
 sealed class AgentError(val userMessage: String) {
@@ -20,7 +25,9 @@ sealed class AgentError(val userMessage: String) {
         "DEEPSEEK_API_KEY не найден. Задайте env-переменную или положите .env с DEEPSEEK_API_KEY рядом с проектом."
     )
     data object Unauthorized : AgentError("DeepSeek отклонил ключ (401). Проверьте DEEPSEEK_API_KEY.")
-    data object ContextOverflow : AgentError(
+    // detail — текст ошибки как его дала модель (для Ollama извлекается внутренний
+    // message из двойного JSON), UI показывает его как есть.
+    data class ContextOverflow(val detail: String = "") : AgentError(
         "Контекст переполнен: история + запрос превысили лимит модели. Очистите историю и попробуйте снова."
     )
     data class Network(val detail: String) : AgentError("Сеть/запрос не удался: $detail")
@@ -73,6 +80,7 @@ class Agent(
 
     private val history: MutableList<ChatMessage> = mutableListOf()
     private val lock = Any()
+    private val errorJson: Json = Json { ignoreUnknownKeys = true }
 
     // Токен-статистика сессии — только по факту ответов API.
     private var lastUsage: TokenUsage = TokenUsage()
@@ -221,7 +229,7 @@ class Agent(
                 rollbackLastUser()
                 val err = when {
                     r.code == 401 -> AgentError.Unauthorized
-                    isContextOverflow(r.code, r.detail) -> AgentError.ContextOverflow
+                    isContextOverflow(r.code, r.detail) -> AgentError.ContextOverflow(extractModelError(r.detail))
                     else -> AgentError.Api("HTTP ${r.code}${if (r.detail.isNotBlank()) ": ${r.detail}" else ""}")
                 }
                 AgentResult.Failure(err)
@@ -253,11 +261,42 @@ class Agent(
         if (code != 400 && code != 413 && code != 422) return false
         val d = detail.lowercase()
         return d.contains("context") ||
+            d.contains("exceed_context_size_error") ||
+            d.contains("exceeds the available context") ||
             d.contains("maximum context length") ||
             d.contains("too many tokens") ||
             d.contains("token limit") ||
             d.contains("contextwindow") ||
             d.contains("insufficient_system_resource")
+    }
+
+    // Текст ошибки как его дала модель. Формы:
+    // - Ollama /api/chat: {"error":"{\"error\":{...\"message\":\"request (3555 tokens) exceeds...\"}}"}
+    // - DeepSeek/OpenAI: {"error":{"message":"...","type":...}} или простой текст.
+    private fun extractModelError(detail: String): String {
+        try {
+            val err = errorJson.parseToJsonElement(detail).jsonObject["error"]
+                ?: return detail.take(500)
+            if (err is JsonPrimitive) {
+                val outer = err.contentOrNull
+                if (outer.isNullOrBlank()) return detail.take(500)
+                try {
+                    errorJson.parseToJsonElement(outer).jsonObject["message"]
+                        ?.let { it as? JsonPrimitive }?.contentOrNull
+                        ?.takeIf { it.isNotBlank() }?.let { return it }
+                } catch (_: Exception) {
+                    // outer — уже готовый текст, а не вложенный JSON.
+                }
+                return outer.take(500)
+            }
+            if (err is JsonObject) {
+                err["message"]?.let { it as? JsonPrimitive }?.contentOrNull
+                    ?.takeIf { it.isNotBlank() }?.let { return it }
+            }
+        } catch (_: Exception) {
+            // detail — не JSON, вернём как есть ниже.
+        }
+        return detail.take(500)
     }
 
     private fun persistLocked() {

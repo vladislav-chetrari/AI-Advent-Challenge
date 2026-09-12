@@ -53,6 +53,31 @@ private data class ChatResponse(
     val usage: UsageDto? = null,
 )
 
+// Нативный Ollama /api/chat: truncate/shift=false превращают молчаливое
+// обрезание в честный HTTP 400 exceed_context_size_error (иначе /v1 всегда 200).
+@Serializable
+private data class OllamaOptions(val temperature: Double = 0.7)
+
+@Serializable
+private data class OllamaChatRequest(
+    val model: String,
+    val messages: List<WireMessage>,
+    val stream: Boolean = false,
+    val truncate: Boolean = false,
+    val shift: Boolean = false,
+    val options: OllamaOptions,
+)
+
+@Serializable
+private data class OllamaMessage(val role: String? = null, val content: String? = null)
+
+@Serializable
+private data class OllamaChatResponse(
+    val message: OllamaMessage? = null,
+    val prompt_eval_count: Int = 0,
+    val eval_count: Int = 0,
+)
+
 // Публичные токены ответа — только по факту ответа API. Оценка до отправки не делается (Task 3).
 data class TokenUsage(
     val promptTokens: Int = 0,
@@ -70,8 +95,9 @@ sealed interface LlmResult {
     data object Empty : LlmResult
 }
 
-// SRP: только HTTP к OpenAI-совместимому endpoint (DeepSeek или локальная Ollama).
-// Про историю и SQLite ничего не знает.
+// SRP: только HTTP (DeepSeek через OpenAI-совместимый endpoint, локальная Ollama
+// через нативный /api/chat с truncate=false/shift=false чтобы переполнение давало
+// HTTP 400 вместо молчаливого sliding window). Про историю и SQLite ничего не знает.
 class LlmClient(
     private val model: String = "deepseek-chat",
     private val temperature: Double = 0.7,
@@ -79,15 +105,33 @@ class LlmClient(
 ) {
     val modelName: String get() = model
 
+    // Локалка определяется по порту Ollama; облако — всё остальное.
+    private val useNativeOllama: Boolean =
+        baseUrl.contains("localhost:11434") || baseUrl.contains("127.0.0.1:11434")
+
+    private val nativeBase: String = baseUrl.substringBefore("/v1").trimEnd('/')
+
+    // Важно: encodeDefaults=true — иначе kotlinx.serialization выкидывает
+    // truncate=false/shift=false с провода и Ollama молча режет историю.
+    private val lenientJson: Json = Json { ignoreUnknownKeys = true; encodeDefaults = true; explicitNulls = true }
+
     private val client: HttpClient by lazy {
         HttpClient(CIO) {
             install(ContentNegotiation) {
-                json(Json { ignoreUnknownKeys = true })
+                json(lenientJson)
             }
         }
     }
 
     suspend fun complete(history: List<ChatMessage>, apiKey: String?): LlmResult {
+        return try {
+            if (useNativeOllama) completeNative(history) else completeOpenAi(history, apiKey)
+        } catch (e: Exception) {
+            LlmResult.NetworkError(e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private suspend fun completeOpenAi(history: List<ChatMessage>, apiKey: String?): LlmResult {
         return try {
             val http = client.post("${baseUrl.trimEnd('/')}/chat/completions") {
                 if (!apiKey.isNullOrBlank()) header(HttpHeaders.Authorization, "Bearer $apiKey")
@@ -121,6 +165,81 @@ class LlmClient(
                         cacheHitTokens = u?.prompt_cache_hit_tokens ?: 0,
                         cacheMissTokens = u?.prompt_cache_miss_tokens ?: 0,
                         reasoningTokens = u?.completion_tokens_details?.reasoning_tokens ?: 0,
+                    ),
+                )
+            }
+        } catch (e: Exception) {
+            LlmResult.NetworkError(e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    private suspend fun completeNative(history: List<ChatMessage>): LlmResult {
+        return try {
+            val payload = OllamaChatRequest(
+                model = model,
+                messages = history.map { WireMessage(it.role, it.content) },
+                stream = false,
+                truncate = false,
+                shift = false,
+                options = OllamaOptions(temperature = temperature),
+            )
+            val http = client.post("$nativeBase/api/chat") {
+                contentType(ContentType.Application.Json)
+                setBody(payload)
+            }
+            if (!http.status.isSuccess()) {
+                val detail = try {
+                    http.bodyAsText().take(500)
+                } catch (_: Exception) {
+                    ""
+                }
+                return LlmResult.HttpError(http.status.value, detail)
+            }
+            val raw = try {
+                // Ollama отдает application/x-ndjson даже при stream=false —
+                // ContentNegotiation его не берет, парсим текст вручную.
+                // На всякий случай терпим и NDJSON-поток (несколько JSON-строк).
+                http.bodyAsText()
+            } catch (_: Exception) {
+                return LlmResult.Empty
+            }
+            var textAcc = StringBuilder()
+            var promptCount = 0
+            var evalCount = 0
+            var decodedAny = false
+            for (line in raw.lines()) {
+                val t = line.trim()
+                if (t.isEmpty()) continue
+                try {
+                    val part = lenientJson.decodeFromString<OllamaChatResponse>(t)
+                    decodedAny = true
+                    part.message?.content?.let { textAcc.append(it) }
+                    if (part.prompt_eval_count != 0) promptCount = part.prompt_eval_count
+                    if (part.eval_count != 0) evalCount = part.eval_count
+                } catch (_: Exception) {
+                    // Игнорируем битую строку, пробуем остальные.
+                }
+            }
+            // Фолбэк: вдруг пришел один JSON с переносами строк внутри content.
+            if (!decodedAny) {
+                try {
+                    val part = lenientJson.decodeFromString<OllamaChatResponse>(raw)
+                    decodedAny = true
+                    textAcc = StringBuilder(part.message?.content.orEmpty())
+                    promptCount = part.prompt_eval_count
+                    evalCount = part.eval_count
+                } catch (_: Exception) {
+                    return LlmResult.Empty
+                }
+            }
+            val text = textAcc.toString().trim()
+            if (text.isEmpty()) LlmResult.Empty else {
+                LlmResult.Ok(
+                    text,
+                    TokenUsage(
+                        promptTokens = promptCount,
+                        completionTokens = evalCount,
+                        totalTokens = promptCount + evalCount,
                     ),
                 )
             }

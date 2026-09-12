@@ -225,7 +225,9 @@ private fun TokenPanel(state: ChatUiState) {
 private fun errorMessage(error: AgentError): String = when (error) {
     AgentError.MissingKey -> stringResource(Res.string.err_missing_key)
     AgentError.Unauthorized -> stringResource(Res.string.err_unauthorized)
-    AgentError.ContextOverflow -> stringResource(Res.string.err_overflow)
+    is AgentError.ContextOverflow ->
+        if (error.detail.isBlank()) stringResource(Res.string.err_overflow)
+        else stringResource(Res.string.err_overflow) + "\n" + error.detail
     AgentError.EmptyResponse -> stringResource(Res.string.err_empty_response)
     AgentError.EmptyPrompt -> stringResource(Res.string.err_empty_prompt)
     is AgentError.Network -> stringResource(Res.string.err_network, error.detail)
