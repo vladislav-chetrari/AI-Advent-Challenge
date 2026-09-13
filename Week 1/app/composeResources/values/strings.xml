@@ -1,9 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_title">Первый агент — DeepSeek + SQLite</string>
-    <string name="api_key_label">DEEPSEEK_API_KEY (опционально, иначе env/.env)</string>
-    <string name="history_hint">История сохраняется в SQLite и переживает рестарт</string>
-    <string name="clear">Очистить</string>
     <string name="role_user">Вы</string>
     <string name="role_agent">Агент</string>
     <string name="input_label">Запрос агенту… (Enter — отправить, Shift+Enter — перенос)</string>
@@ -13,8 +10,21 @@
     <string name="context_fill">Контекст: %1$d / %2$d (%3$s)</string>
     <string name="message_tokens">%1$s · $%2$s</string>
     <string name="compression_label">Сжатие истории</string>
-    <string name="keep_n_label">N (держать):</string>
+    <string name="keep_n_label">N (окно):</string>
+    <string name="keep_n_hint_window">Сколько последних сообщений уйдёт в запрос к модели</string>
+    <string name="keep_n_hint_memory">Сколько держать в памяти: последние N−1 сообщений + саммари</string>
     <string name="summary_label">Саммари:</string>
+    <string name="strategy_label">Стратегия:</string>
+    <string name="strategy_sliding">Sliding Window</string>
+    <string name="strategy_facts">Sticky Facts</string>
+    <string name="strategy_branching">Branching</string>
+    <string name="strategy_summary">Summary (Task 4)</string>
+    <string name="facts_label">Facts:</string>
+    <string name="facts_empty">пока пусто — появятся после ответов агента</string>
+    <string name="branches_label">Ветки:</string>
+    <string name="branch_main">main</string>
+    <string name="branch_create">Форкнуть</string>
+    <string name="branch_name_hint">имя ветки…</string>
     <string name="err_missing_key">DEEPSEEK_API_KEY не найден. Задайте env-переменную или положите .env с DEEPSEEK_API_KEY рядом с проектом.</string>
     <string name="err_unauthorized">DeepSeek отклонил ключ (401). Проверьте DEEPSEEK_API_KEY.</string>
     <string name="err_overflow">Контекст переполнен: история + запрос превысили лимит модели. Очистите историю и попробуйте снова.</string>

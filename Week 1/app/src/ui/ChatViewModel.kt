@@ -3,7 +3,9 @@ package app.ui
 import agent.Agent
 import agent.AgentError
 import agent.AgentResult
+import agent.domain.Branch
 import agent.domain.LlmModel
+import agent.domain.StrategyType
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -38,6 +40,11 @@ data class ChatUiState(
     val compressionEnabled: Boolean = true,
     val keepLastN: Int = 10,
     val summaryText: String = "",
+    // Task 5: стратегии контекста + facts + ветки.
+    val strategy: StrategyType = StrategyType.SLIDING,
+    val facts: Map<String, String> = emptyMap(),
+    val branches: List<Branch> = emptyList(),
+    val activeBranchId: String? = null,
 )
 
 // MVVM: ViewModel владеет состоянием и юзкейсом ask(), Screen только рисует.
@@ -61,6 +68,7 @@ class ChatViewModel(
         val s = agent.statsSnapshot()
         val model = agent.currentModel
         val c = agent.compressionSnapshot()
+        val t5 = agent.strategySnapshot()
         _state.update {
             it.copy(
                 messages = restored,
@@ -69,6 +77,10 @@ class ChatViewModel(
                 compressionEnabled = c.enabled,
                 keepLastN = c.keepLastN.coerceAtLeast(1),
                 summaryText = c.summaryText,
+                strategy = t5.strategy,
+                facts = t5.facts,
+                branches = t5.branches,
+                activeBranchId = t5.activeBranchId,
             )
         }
     }
@@ -116,6 +128,43 @@ class ChatViewModel(
     fun setCompressionEnabled(enabled: Boolean) {
         if (_state.value.busy) return
         agent.setCompressionEnabled(enabled)
+        refreshAll()
+    }
+
+    // --- Task 5 ---
+
+    fun selectStrategy(strategy: StrategyType) {
+        if (_state.value.busy) return
+        agent.setStrategy(strategy)
+        refreshAll()
+        _state.update { it.copy(status = null) }
+    }
+
+    fun createBranch(name: String) {
+        if (_state.value.busy) return
+        // Пустое имя — автогенерация уникального имени на стороне Agent.
+        agent.createBranch(name)
+        refreshAll()
+        _state.update { it.copy(status = null) }
+    }
+
+    fun deleteBranch(branchId: String) {
+        if (_state.value.busy) return
+        agent.deleteBranch(branchId)
+        refreshAll()
+        _state.update { it.copy(status = null) }
+    }
+
+    fun switchBranch(branchId: String?) {
+        if (_state.value.busy) return
+        agent.switchBranch(branchId)
+        refreshAll()
+        _state.update { it.copy(status = null) }
+    }
+
+    fun removeFact(key: String) {
+        if (_state.value.busy) return
+        agent.removeFact(key)
         refreshAll()
     }
 

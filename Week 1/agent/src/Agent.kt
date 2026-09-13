@@ -1,14 +1,24 @@
 package agent
 
+import agent.data.BranchStore
 import agent.data.CompressionSettings
 import agent.data.CompressionStore
+import agent.data.FactsStore
 import agent.data.ModelStore
+import agent.data.StrategyStore
 import agent.data.db.DatabaseFactory
+import agent.data.db.SqliteBranchRepository
 import agent.data.db.SqliteChatRepository
+import agent.domain.Branch
+import agent.domain.BranchRepository
 import agent.domain.ChatMessage
 import agent.domain.ChatRepository
+import agent.domain.FACTS_EXTRACTOR_SYSTEM
 import agent.domain.LlmModel
+import agent.domain.StrategyType
 import agent.domain.SUMMARY_ROLE
+import agent.domain.buildFactsBlock
+import agent.domain.parseFactsJson
 import agent.network.ApiKeyProvider
 import agent.network.LlmClient
 import agent.network.LlmResult
@@ -53,6 +63,15 @@ data class AgentStats(
     val contextTokens: Int = 0,
 )
 
+// Снапшот Task 5: стратегия + facts активной ветки + ветки.
+data class StrategySnapshot(
+    val strategy: StrategyType = StrategyType.SLIDING,
+    val facts: Map<String, String> = emptyMap(),
+    val branches: List<Branch> = emptyList(),
+    val activeBranchId: String? = null,
+    val activeConversationId: String = ChatRepository.DEFAULT_CONVERSATION,
+)
+
 // Снапшот сжатия для UI (Task 4): флаг, окно N и текст summary (без system).
 data class CompressionSnapshot(
     val enabled: Boolean = true,
@@ -63,7 +82,7 @@ data class CompressionSnapshot(
 // --- Агент: фасад Clean Architecture. HTTP — в LlmClient, история — в ChatRepository (SQLite+Flyway).
 // Task 4: summary хранится отдельным сообщением role="summary" сразу после system.
 // В БД лежит как есть, на провод к LLM уходит строго как system (см. effectiveHistoryLocked).
-// Публичный API (ask/reset/historySnapshot/close/resolveApiKey) сохранён для UI и тестов. ---
+// Публичный API (ask/clearHistory/historySnapshot/close/resolveApiKey) сохранён для UI и тестов. ---
 class Agent(
     private var llmModel: LlmModel = LlmModel.DEEPSEEK,
     private val systemPrompt: String? = null,
@@ -73,6 +92,8 @@ class Agent(
     private var llm: LlmClient = LlmClient(model = llmModel.apiId, temperature = temperature, baseUrl = llmModel.baseUrl),
     private val modelDir: File? = null,
     compression: CompressionSettings = CompressionSettings(),
+    strategy: StrategyType? = null,
+    branchRepository: BranchRepository? = null,
 ) {
     constructor(
         systemPrompt: String? = null,
@@ -87,6 +108,7 @@ class Agent(
         conversationId = conversationId,
         modelDir = dbFile.parentFile,
         compression = CompressionStore.load(dbFile.parentFile),
+        branchRepository = SqliteBranchRepository(dbFile),
     )
 
     val currentModel: LlmModel
@@ -105,9 +127,36 @@ class Agent(
     private var compressionEnabled: Boolean = compression.enabled
     private var keepLastN: Int = compression.keepLastN.coerceAtLeast(1)
 
+    // Task 5: стратегия контекста + ветки + facts. Ветки — отдельные
+    // conversationId в той же SQLite (main=default, ветки=branch:<id>),
+    // реестр — в таблице branch с parent_id (граф), сообщения ссылаются через conversation_id.
+    private var strategy: StrategyType = strategy ?: StrategyStore.load(modelDir)
+    private var activeConversationId: String = conversationId
+    private val branches: MutableList<Branch> = mutableListOf()
+    private val factsByConv: MutableMap<String, MutableMap<String, String>> = mutableMapOf()
+    private val branchRepo: BranchRepository =
+        branchRepository ?: modelDir?.let { SqliteBranchRepository(File(it, "chat.db")) }
+            ?: throw IllegalArgumentException("Agent needs branchRepository or modelDir")
+
     init {
+        synchronized(lock) {
+            // Реестр из БД; разовый импорт legacy branches.json, если таблица пуста.
+            // Файл после этого удаляется всегда: иначе очистка реестра воскресала
+            // бы из json на следующем рестарте (ветки-зомби).
+            val fromDb = try { branchRepo.list() } catch (_: Exception) { emptyList() }
+            if (fromDb.isEmpty()) {
+                val legacy = try { BranchStore.load(modelDir) } catch (_: Exception) { emptyList() }
+                branches += legacy.map { it.copy(parentId = null) }
+                for (b in branches) {
+                    try { branchRepo.upsert(b) } catch (_: Exception) { }
+                }
+            } else {
+                branches += fromDb
+            }
+            try { BranchStore.fileFor(modelDir).delete() } catch (_: Exception) { }
+        }
         val stored = try {
-            repository.load(conversationId)
+            repository.load(activeConversationId)
         } catch (_: Exception) {
             emptyList()
         }
@@ -144,34 +193,68 @@ class Agent(
                     totalTokens = it.totalTokens,
                 )
             } ?: TokenUsage()
-        }
-    }
-
-    fun reset() {
-        synchronized(lock) {
-            val system = history.firstOrNull()?.takeIf { it.role == "system" }
-            history.clear()
-            if (system != null) history += system
-            persistLocked()
-            lastUsage = TokenUsage()
-            sessionTokens = 0
-            sessionCostUsd = 0.0
+            // Task 5: facts активной ветки с диска.
+            factsByConv.getOrPut(activeConversationId) {
+                FactsStore.load(modelDir, activeConversationId).toMutableMap()
+            }
         }
     }
 
     fun clearHistory() {
         synchronized(lock) {
-            history.clear()
-            if (systemPrompt != null) history += ChatMessage("system", systemPrompt)
-            persistLocked()
-            lastUsage = TokenUsage()
-            sessionTokens = 0
-            sessionCostUsd = 0.0
+            val activeBranch = branches.firstOrNull { it.conversationId == activeConversationId }
+            if (activeBranch == null) {
+                // Очистка на main: текущий диалог + ВСЕ ветки (сообщения, facts, реестр).
+                history.clear()
+                if (systemPrompt != null) history += ChatMessage("system", systemPrompt)
+                persistLocked()
+                for (b in branches) {
+                    try { repository.clear(b.conversationId) } catch (_: Exception) { }
+                    factsByConv.remove(b.conversationId)
+                    FactsStore.save(modelDir, b.conversationId, emptyMap())
+                    try { branchRepo.delete(b.id) } catch (_: Exception) { }
+                }
+                branches.clear()
+                factsByConv[activeConversationId]?.clear()
+                FactsStore.save(modelDir, activeConversationId, emptyMap())
+            } else {
+                // Очистка в ветке: откат к моменту форка — system + summary + первые fromSize живых.
+                // Всё, что сказано в ветке после форка, удаляется; facts ветки тоже сбрасываются.
+                val system = history.firstOrNull { it.role == "system" }
+                val summaries = history.filter { it.role == SUMMARY_ROLE }
+                val live = history.filter { it.role != "system" && it.role != SUMMARY_ROLE }
+                    .take(activeBranch.fromSize.coerceAtLeast(0))
+                history.clear()
+                if (system != null) history += system
+                else if (systemPrompt != null) history += ChatMessage("system", systemPrompt)
+                history += summaries
+                history += live
+                persistLocked()
+                factsByConv.remove(activeConversationId)
+                FactsStore.save(modelDir, activeConversationId, emptyMap())
+            }
+            rehydrateStatsLocked()
         }
+    }
+
+    // Пересчёт статистики из текущей history (после switch/create/clear в ветках).
+    // Вызывать под lock'ом.
+    private fun rehydrateStatsLocked() {
+        val assistants = history.filter { it.role == "assistant" }
+        sessionTokens = history.sumOf { it.tokens.toLong() }
+        sessionCostUsd = history.sumOf { it.costUsd }
+        lastUsage = assistants.lastOrNull()?.let {
+            TokenUsage(
+                promptTokens = it.promptTokens,
+                completionTokens = it.completionTokens,
+                totalTokens = it.totalTokens,
+            )
+        } ?: TokenUsage()
     }
 
     // Смена модели: чат стирается чтобы было проще (история другой модели
     // бессмысленна — токены и лимиты разные). Выбор сохраняется в файл.
+    // Task 5: ветки и facts тоже сбрасываются.
     fun switchModel(next: LlmModel, temperature: Double = 0.7) {
         synchronized(lock) {
             if (next.id == llmModel.id) return
@@ -181,9 +264,22 @@ class Agent(
             }
             llmModel = next
             llm = LlmClient(model = next.apiId, temperature = temperature, baseUrl = next.baseUrl)
+            for (b in branches) {
+                try {
+                    repository.clear(b.conversationId)
+                } catch (_: Exception) {
+                }
+                FactsStore.save(modelDir, b.conversationId, emptyMap())
+            }
+            branches.clear()
+            try { branchRepo.clear() } catch (_: Exception) { }
+            factsByConv.clear()
+            activeConversationId = ChatRepository.DEFAULT_CONVERSATION
             history.clear()
             if (systemPrompt != null) history += ChatMessage("system", systemPrompt)
             persistLocked()
+            FactsStore.save(modelDir, activeConversationId, emptyMap())
+            factsByConv[activeConversationId] = mutableMapOf()
             lastUsage = TokenUsage()
             sessionTokens = 0
             sessionCostUsd = 0.0
@@ -236,6 +332,177 @@ class Agent(
         }
     }
 
+    // --- Task 5: стратегии / facts / ветки ---
+
+    fun strategySnapshot(): StrategySnapshot =
+        synchronized(lock) {
+            StrategySnapshot(
+                strategy = strategy,
+                facts = factsByConv.getOrPut(activeConversationId) {
+                    FactsStore.load(modelDir, activeConversationId).toMutableMap()
+                }.toSortedMap(),
+                branches = branches.toList(),
+                activeBranchId = branches.firstOrNull { it.conversationId == activeConversationId }?.id,
+                activeConversationId = activeConversationId,
+            )
+        }
+
+    fun setStrategy(next: StrategyType) {
+        synchronized(lock) {
+            if (next == strategy) return
+            strategy = next
+            StrategyStore.save(modelDir, next)
+        }
+    }
+
+    fun setFact(key: String, value: String) {
+        val k = key.trim().take(80)
+        val v = value.trim().take(500)
+        if (k.isEmpty() || v.isEmpty()) return
+        synchronized(lock) {
+            val m = factsByConv.getOrPut(activeConversationId) { mutableMapOf() }
+            m[k] = v
+            FactsStore.save(modelDir, activeConversationId, m)
+        }
+    }
+
+    fun removeFact(key: String) {
+        synchronized(lock) {
+            val m = factsByConv.getOrPut(activeConversationId) { mutableMapOf() }
+            if (m.remove(key.trim()) != null) {
+                FactsStore.save(modelDir, activeConversationId, m)
+            }
+        }
+    }
+
+    // Создать ветку от текущего места (checkpoint = размер живой истории).
+    // Родитель — активная ветка (или null для main): так строится граф, ветка от ветки работает.
+    // Пустое имя автогенерируется уникальным (branch-xxxx). Снапшот копируется в новый
+    // conversationId, затем переключаемся на него.
+    fun createBranch(name: String): Branch {
+        val siblings = synchronized(lock) { branches.map { it.name }.toSet() }
+        var clean = name.trim().take(60)
+        if (clean.isEmpty()) {
+            var i = 0
+            do {
+                clean = "branch-" + java.util.UUID.randomUUID().toString().take(4)
+                i++
+            } while (clean in siblings && i < 100)
+        }
+        synchronized(lock) {
+            val id = java.util.UUID.randomUUID().toString().take(8)
+            val conv = Branch.convId(id)
+            val parentId = branches.firstOrNull { it.conversationId == activeConversationId }?.id
+            val snapshot = history.toList()
+            try {
+                repository.replaceAll(conv, snapshot)
+            } catch (_: Exception) {
+            }
+            val b = Branch(
+                id = id,
+                name = clean,
+                conversationId = conv,
+                parentId = parentId,
+                fromSize = snapshot.count { it.role != "system" && it.role != SUMMARY_ROLE },
+                createdAt = System.currentTimeMillis(),
+            )
+            // Facts наследуются от родителя на момент форка.
+            val parentFacts = factsByConv.getOrPut(activeConversationId) {
+                FactsStore.load(modelDir, activeConversationId).toMutableMap()
+            }.toMap()
+            factsByConv[conv] = parentFacts.toMutableMap()
+            FactsStore.save(modelDir, conv, parentFacts)
+            branches += b
+            try { branchRepo.upsert(b) } catch (_: Exception) { }
+            // Переключение на новую ветку.
+            activeConversationId = conv
+            history.clear()
+            history += try {
+                repository.load(conv)
+            } catch (_: Exception) {
+                snapshot
+            }
+            ensureSystemLocked()
+            persistLocked()
+            rehydrateStatsLocked()
+            return b
+        }
+    }
+
+    /**
+     * Удалить ветку (сообщения, facts, запись реестра). Main удалить нельзя.
+     * Дети удаляемой переподвешиваются на её родителя (граф не рвётся).
+     * При удалении активной ветки переключаемся на main. Возвращает false если ветка не найдена.
+     */
+    fun deleteBranch(branchId: String): Boolean {
+        synchronized(lock) {
+            val target = branches.firstOrNull { it.id == branchId } ?: return false
+            for (child in branches.filter { it.parentId == branchId }) {
+                val reparented = child.copy(parentId = target.parentId)
+                branches[branches.indexOf(child)] = reparented
+                try { branchRepo.upsert(reparented) } catch (_: Exception) { }
+            }
+            try { repository.clear(target.conversationId) } catch (_: Exception) { }
+            factsByConv.remove(target.conversationId)
+            FactsStore.save(modelDir, target.conversationId, emptyMap())
+            branches.remove(target)
+            try { branchRepo.delete(branchId) } catch (_: Exception) { }
+            if (activeConversationId == target.conversationId) {
+                activeConversationId = ChatRepository.DEFAULT_CONVERSATION
+                history.clear()
+                history += try {
+                    repository.load(activeConversationId)
+                } catch (_: Exception) {
+                    emptyList()
+                }
+                ensureSystemLocked()
+                persistLocked()
+                rehydrateStatsLocked()
+                factsByConv.getOrPut(activeConversationId) {
+                    FactsStore.load(modelDir, activeConversationId).toMutableMap()
+                }
+            }
+            return true
+        }
+    }
+
+    /** Переключение между main (branchId=null) и ветками. Возвращает false если ветка не найдена. */
+    fun switchBranch(branchId: String?): Boolean {
+        synchronized(lock) {
+            val target = if (branchId == null) {
+                ChatRepository.DEFAULT_CONVERSATION
+            } else {
+                branches.firstOrNull { it.id == branchId }?.conversationId ?: return false
+            }
+            if (target == activeConversationId) return true
+            activeConversationId = target
+            history.clear()
+            history += try {
+                repository.load(target)
+            } catch (_: Exception) {
+                emptyList()
+            }
+            ensureSystemLocked()
+            persistLocked()
+            factsByConv.getOrPut(target) {
+                FactsStore.load(modelDir, target).toMutableMap()
+            }
+            rehydrateStatsLocked()
+            return true
+        }
+    }
+
+    private fun ensureSystemLocked() {
+        if (systemPrompt == null) return
+        val first = history.firstOrNull()
+        when {
+            first == null -> history += ChatMessage("system", systemPrompt)
+            first.role == SUMMARY_ROLE -> history.add(0, ChatMessage("system", systemPrompt))
+            first.role == "system" && first.content != systemPrompt ->
+                history[0] = first.copy(content = systemPrompt)
+        }
+    }
+
     suspend fun ask(prompt: String): AgentResult {
         val clean = prompt.trim()
         if (clean.isEmpty()) return AgentResult.Failure(AgentError.EmptyPrompt)
@@ -283,9 +550,15 @@ class Agent(
                     sessionTokens += (userTokens + r.usage.completionTokens).toLong()
                     sessionCostUsd += (userCost + assistantCost)
                 }
-                // Task 4: схлопывание старых сообщений в summary (не роняет ответ при фейле).
+                // Task 5: пост-обработка по стратегии (не роняет ответ при фейле).
+                // SUMMARY_LEGACY — схлопывание Task 4; FACTS — LLM-экстрактор; остальные — ничего.
                 try {
-                    maybeCompress(apiKey)
+                    val s = synchronized(lock) { strategy }
+                    if (s == StrategyType.SUMMARY_LEGACY) {
+                        maybeCompress(apiKey)
+                    } else if (s == StrategyType.FACTS) {
+                        maybeUpdateFacts(apiKey, clean)
+                    }
                 } catch (_: Exception) {
                 }
                 AgentResult.Success(r.text, r.usage)
@@ -322,15 +595,104 @@ class Agent(
         }
     }
 
+    // Task 5: сборка эффективного контекста по стратегии. Вызывать под lock'ом.
+    // - SLIDING: system + последние N живых, остальное отбрасывается (не отправляется).
+    // - FACTS: system + блок facts-as-system + последние N живых (окно режет историю,
+    //   факты без лимита пишутся экстрактором и переживают обрезку).
+    // - BRANCHING: system + вся живая история активной ветки (ветвление вместо окна).
+    // - SUMMARY_LEGACY: поведение Task 4 (summary-as-system + вся живая история,
+    //   окно поддерживается удалением через maybeCompress).
     // Task 4: summary на провод уходит как system — API других ролей не знает.
-    // Вызывать под lock'ом.
     private fun effectiveHistoryLocked(): List<ChatMessage> {
-        val out = ArrayList<ChatMessage>(history.size)
-        for (m in history) {
-            if (m.role == SUMMARY_ROLE) out += ChatMessage("system", SUMMARY_PREFIX + m.content)
-            else out += m
+        return when (strategy) {
+            StrategyType.SLIDING -> {
+                val n = keepLastN.coerceAtLeast(1)
+                val system = history.firstOrNull { it.role == "system" }
+                val live = history.filter { it.role != "system" && it.role != SUMMARY_ROLE }.takeLast(n)
+                buildList {
+                    if (system != null) add(system)
+                    addAll(live)
+                }
+            }
+            StrategyType.FACTS -> {
+                val n = keepLastN.coerceAtLeast(1)
+                val system = history.firstOrNull { it.role == "system" }
+                val live = history.filter { it.role != "system" && it.role != SUMMARY_ROLE }.takeLast(n)
+                val facts = factsByConv[activeConversationId].orEmpty()
+                val block = buildFactsBlock(facts)
+                buildList {
+                    if (system != null) add(system)
+                    if (block.isNotBlank()) add(ChatMessage("system", block))
+                    addAll(live)
+                }
+            }
+            StrategyType.BRANCHING -> {
+                val system = history.firstOrNull { it.role == "system" }
+                val live = history.filter { it.role != "system" && it.role != SUMMARY_ROLE }
+                buildList {
+                    if (system != null) add(system)
+                    addAll(live)
+                }
+            }
+            StrategyType.SUMMARY_LEGACY -> {
+                val out = ArrayList<ChatMessage>(history.size)
+                for (m in history) {
+                    if (m.role == SUMMARY_ROLE) out += ChatMessage("system", SUMMARY_PREFIX + m.content)
+                    else out += m
+                }
+                out
+            }
         }
-        return out
+    }
+
+    // Task 5, стратегия 2: LLM-экстрактор facts после каждого ответа.
+    // Old facts + последнее user-сообщение + хвост диалога -> JSON -> merge без лимита.
+    // Токены экстрактора плюсуются в сессию, чтобы сравнение расхода было честным.
+    private suspend fun maybeUpdateFacts(apiKey: String?, lastUser: String) {
+        val conv: String
+        val oldFacts: Map<String, String>
+        val tail: List<ChatMessage>
+        synchronized(lock) {
+            if (strategy != StrategyType.FACTS) return
+            conv = activeConversationId
+            oldFacts = factsByConv.getOrPut(conv) {
+                FactsStore.load(modelDir, conv).toMutableMap()
+            }.toMap()
+            tail = history.filter { it.role != "system" && it.role != SUMMARY_ROLE }.takeLast(6)
+        }
+        val tailText = tail.joinToString("\n") { "${it.role}: ${it.content}" }.take(3000)
+        val oldText = if (oldFacts.isEmpty()) "{}" else oldFacts.entries
+            .sortedBy { it.key }
+            .joinToString("\n", prefix = "{\n", postfix = "\n}") { "\"${it.key}\": \"${it.value}\"" }
+            .take(2000)
+        val prompt = buildList {
+            add(ChatMessage("system", FACTS_EXTRACTOR_SYSTEM))
+            add(
+                ChatMessage(
+                    "user",
+                    "Old facts:\n$oldText\n\nRecent dialogue:\n$tailText\n\nLast user message:\n$lastUser\n\n" +
+                        "Return merged JSON of all durable facts.",
+                ),
+            )
+        }
+        val r = try {
+            llm.complete(prompt, apiKey)
+        } catch (_: Exception) {
+            return
+        }
+        val ok = r as? LlmResult.Ok ?: return
+        val parsed = parseFactsJson(ok.text)
+        if (parsed.isEmpty()) return
+        val model = currentModel
+        synchronized(lock) {
+            if (strategy != StrategyType.FACTS || conv != activeConversationId) return
+            val m = factsByConv.getOrPut(conv) { mutableMapOf() }
+            for ((k, v) in parsed) m[k] = v
+            FactsStore.save(modelDir, conv, m)
+            val summCost = model.inputCostUsd(ok.usage.promptTokens) + model.outputCostUsd(ok.usage.completionTokens)
+            sessionTokens += (ok.usage.promptTokens + ok.usage.completionTokens).toLong()
+            sessionCostUsd += summCost
+        }
     }
 
     // Task 4: если живых сообщений больше N — схлопнуть старые в summary.
@@ -341,6 +703,8 @@ class Agent(
         val enabled: Boolean
         val n: Int
         synchronized(lock) {
+            // Task 5: сжатие Task 4 работает только в legacy-режиме.
+            if (strategy != StrategyType.SUMMARY_LEGACY) return
             enabled = compressionEnabled
             n = keepLastN.coerceAtLeast(1)
         }
@@ -464,7 +828,7 @@ class Agent(
 
     private fun persistLocked() {
         try {
-            repository.replaceAll(conversationId, history.toList())
+            repository.replaceAll(activeConversationId, history.toList())
         } catch (_: Exception) {
             // Историю в памяти не теряем; SQLite/Flyway ошибки не должны ронять чат.
             // UI всё равно покажет ошибку сети/БД при следующем рестарте через пустой load.

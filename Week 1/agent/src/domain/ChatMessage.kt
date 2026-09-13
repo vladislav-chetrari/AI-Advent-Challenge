@@ -14,6 +14,11 @@ import kotlinx.serialization.Serializable
 // tokens/costUsd у summary — carried: сумма evict + стоимость генерации саммари,
 // чтобы sessionTokens/sessionCost были монотонны и переживали рестарт.
 const val SUMMARY_ROLE: String = "summary"
+
+// Sticky facts: по одному факту на строку, БЕЗ лимита — агент пишет все факты разговора.
+// Как summary: в БД как есть, на провод к LLM уходят одним system-блоком,
+// из снапшотов UI скрыты (показываются отдельной панелью).
+const val STICKY_ROLE: String = "sticky"
 @Serializable
 data class ChatMessage(
     val role: String,

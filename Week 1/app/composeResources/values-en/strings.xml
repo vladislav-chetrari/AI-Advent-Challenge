@@ -1,9 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="app_title">First agent — DeepSeek + SQLite</string>
-    <string name="api_key_label">DEEPSEEK_API_KEY (optional, otherwise env/.env)</string>
-    <string name="history_hint">History is stored in SQLite and survives restart</string>
-    <string name="clear">Clear</string>
     <string name="role_user">You</string>
     <string name="role_agent">Agent</string>
     <string name="input_label">Ask the agent… (Enter to send, Shift+Enter for newline)</string>
@@ -13,8 +10,21 @@
     <string name="context_fill">Context: %1$d / %2$d (%3$s)</string>
     <string name="message_tokens">%1$s · $%2$s</string>
     <string name="compression_label">History compression</string>
-    <string name="keep_n_label">N (keep):</string>
+    <string name="keep_n_label">N (window):</string>
+    <string name="keep_n_hint_window">How many recent messages go into the model request</string>
+    <string name="keep_n_hint_memory">How many messages to keep in memory: last N−1 + summary</string>
     <string name="summary_label">Summary:</string>
+    <string name="strategy_label">Strategy:</string>
+    <string name="strategy_sliding">Sliding Window</string>
+    <string name="strategy_facts">Sticky Facts</string>
+    <string name="strategy_branching">Branching</string>
+    <string name="strategy_summary">Summary (Task 4)</string>
+    <string name="facts_label">Facts:</string>
+    <string name="facts_empty">empty yet — appear after agent replies</string>
+    <string name="branches_label">Branches:</string>
+    <string name="branch_main">main</string>
+    <string name="branch_create">Fork</string>
+    <string name="branch_name_hint">branch name…</string>
     <string name="err_missing_key">DEEPSEEK_API_KEY not found. Set the env variable or put a .env with DEEPSEEK_API_KEY next to the project.</string>
     <string name="err_unauthorized">DeepSeek rejected the key (401). Check DEEPSEEK_API_KEY.</string>
     <string name="err_overflow">Context overflow: history + request exceeded the model limit. Clear history and try again.</string>
