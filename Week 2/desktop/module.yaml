@@ -1,0 +1,12 @@
+product: jvm/app
+
+dependencies:
+  - //core
+  - $compose.desktop.currentOs
+  - $compose.foundation
+  - $compose.material3
+  - org.jetbrains.kotlinx:kotlinx-coroutines-swing:1.10.2
+
+settings:
+  compose:
+    enabled: true

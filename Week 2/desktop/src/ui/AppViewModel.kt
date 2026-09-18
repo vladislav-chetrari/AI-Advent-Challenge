@@ -1,0 +1,247 @@
+package desktop.ui
+
+import core.ChatService
+import core.domain.Chat
+import core.domain.ChatMessage
+import core.domain.MemoryDoc
+import core.domain.Project
+import core.domain.Scope
+import core.domain.Task
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+
+sealed interface Selection {
+    data class ChatSel(val chatId: String) : Selection
+    data class DocSel(val docId: String) : Selection
+}
+
+enum class CreateKind(val title: String) {
+    GENERAL_CHAT("Общий чат"),
+    PROJECT("Проект"),
+    PROJECT_CHAT("Чат в проекте"),
+    TASK("Задача"),
+    TASK_CHAT("Чат в задаче"),
+}
+
+data class SaveDialog(
+    val rawText: String,
+    val candidates: List<String> = emptyList(),
+    val busy: Boolean = false,
+    val editedFact: String = "",
+    val targetScope: Scope = Scope.GENERAL,
+    val targetParentId: String? = null,
+    val targetDocId: String? = null,
+    val newDocTitle: String = "",
+    val useNewDoc: Boolean = false,
+)
+
+data class UiState(
+    val projects: List<Project> = emptyList(),
+    val tasks: List<Task> = emptyList(),
+    val chats: List<Chat> = emptyList(),
+    val docs: List<MemoryDoc> = emptyList(),
+    val docContents: Map<String, String> = emptyMap(),
+    val selection: Selection? = null,
+    val input: String = "",
+    val busy: Boolean = false,
+    val status: String? = null,
+    val systemPrompt: String = "",
+    val systemExpanded: Boolean = false,
+    val promptTokens: Int = 0,
+    val showCreate: Boolean = false,
+    val createKind: CreateKind = CreateKind.GENERAL_CHAT,
+    val createName: String = "",
+    val createParentId: String? = null,
+    val saveDialog: SaveDialog? = null,
+)
+
+class AppViewModel(
+    val service: ChatService = ChatService(),
+    private val scope: CoroutineScope,
+) {
+    private val _state = MutableStateFlow(UiState())
+    val state: StateFlow<UiState> = _state.asStateFlow()
+
+    init { refresh(null) }
+
+    fun refresh(sel: Selection? = _state.value.selection) {
+        val s = service.state()
+        val contents = s.memoryDocs.associate { it.id to service.docContent(it) }
+        // system prompt для выбранного чата
+        var sys = ""
+        val selChat = (sel as? Selection.ChatSel)?.chatId?.let { id -> s.chats.firstOrNull { it.id == id } }
+        if (selChat != null) sys = service.buildSystemPrompt(selChat)
+        _state.update {
+            it.copy(
+                projects = s.projects, tasks = s.tasks, chats = s.chats,
+                docs = s.memoryDocs, docContents = contents,
+                selection = sel ?: selChat?.let { c -> Selection.ChatSel(c.id) },
+                systemPrompt = sys.ifBlank { it.systemPrompt },
+            )
+        }
+    }
+
+    fun select(sel: Selection) = refresh(sel)
+
+    fun onInput(v: String) = _state.update { it.copy(input = v) }
+
+    fun toggleSystem() = _state.update { it.copy(systemExpanded = !it.systemExpanded) }
+
+    fun send() {
+        val st = _state.value
+        val sel = st.selection as? Selection.ChatSel ?: return
+        val q = st.input.trim()
+        if (q.isEmpty() || st.busy) return
+        val chat = service.state().chats.firstOrNull { it.id == sel.chatId } ?: return
+        _state.update { it.copy(input = "", busy = true, status = null) }
+        scope.launch {
+            when (val r = service.ask(chat, q)) {
+                is core.AskResult.Success -> {
+                    refresh(sel)
+                    _state.update {
+                        it.copy(busy = false, promptTokens = r.promptTokens, systemPrompt = service.buildSystemPrompt(chat))
+                    }
+                }
+                is core.AskResult.Failure -> {
+                    refresh(sel)
+                    _state.update { it.copy(busy = false, status = r.message) }
+                }
+            }
+        }
+    }
+
+    fun clearChat() {
+        val sel = _state.value.selection as? Selection.ChatSel ?: return
+        service.clearChat(sel.chatId)
+        refresh(sel)
+    }
+
+    // --- create dialog ---
+
+    fun openCreate() = _state.update { it.copy(showCreate = true, createName = "", createParentId = null) }
+    fun closeCreate() = _state.update { it.copy(showCreate = false) }
+    fun setCreateKind(k: CreateKind) = _state.update { it.copy(createKind = k, createParentId = null) }
+    fun setCreateName(v: String) = _state.update { it.copy(createName = v) }
+    fun setCreateParent(id: String?) = _state.update { it.copy(createParentId = id) }
+
+    fun commitCreate() {
+        val st = _state.value
+        val name = st.createName.trim().ifBlank { "untitled" }
+        var sel: Selection? = st.selection
+        when (st.createKind) {
+            CreateKind.GENERAL_CHAT -> {
+                val c = service.createChat(name, Scope.GENERAL, null)
+                sel = Selection.ChatSel(c.id)
+            }
+            CreateKind.PROJECT -> {
+                val p = service.createProject(name)
+                // сразу чат в проекте для удобства
+                val c = service.createChat("$name chat 1", Scope.PROJECT, p.id)
+                sel = Selection.ChatSel(c.id)
+            }
+            CreateKind.PROJECT_CHAT -> {
+                val pid = st.createParentId ?: return
+                val c = service.createChat(name, Scope.PROJECT, pid)
+                sel = Selection.ChatSel(c.id)
+            }
+            CreateKind.TASK -> {
+                val pid = st.createParentId ?: return
+                val t = service.createTask(pid, name)
+                val c = service.createChat("$name chat 1", Scope.TASK, t.id)
+                sel = Selection.ChatSel(c.id)
+            }
+            CreateKind.TASK_CHAT -> {
+                val tid = st.createParentId ?: return
+                val c = service.createChat(name, Scope.TASK, tid)
+                sel = Selection.ChatSel(c.id)
+            }
+        }
+        _state.update { it.copy(showCreate = false) }
+        refresh(sel)
+    }
+
+    fun toggleDoc(docId: String) {
+        service.toggleDocActive(docId)
+        refresh()
+    }
+
+    fun deleteDoc(docId: String) {
+        service.deleteDoc(docId)
+        val sel = _state.value.selection
+        refresh(if (sel is Selection.DocSel && sel.docId == docId) null else sel)
+    }
+
+    // --- ПКМ save flow: distill -> диалог -> commit ---
+
+    fun startSave(raw: String, chatScope: Scope, chatParentId: String?) {
+        val st = _state.value
+        // дефолтная цель = текущий scope чата
+        val defaultParent: String? = when (chatScope) {
+            Scope.GENERAL -> null
+            Scope.PROJECT -> chatParentId
+            Scope.TASK -> chatParentId
+        }
+        _state.update {
+            it.copy(
+                saveDialog = SaveDialog(
+                    rawText = raw.trim().take(2000),
+                    busy = true,
+                    targetScope = chatScope,
+                    targetParentId = defaultParent,
+                )
+            )
+        }
+        scope.launch {
+            val facts = try { service.distill(raw) } catch (_: Exception) { listOf(raw.trim().take(500)) }
+            _state.update {
+                it.copy(
+                    saveDialog = it.saveDialog?.copy(
+                        busy = false,
+                        candidates = facts.ifEmpty { listOf(raw.trim().take(500)) },
+                        editedFact = facts.firstOrNull().orEmpty(),
+                    )
+                )
+            }
+        }
+    }
+
+    fun closeSave() = _state.update { it.copy(saveDialog = null) }
+
+    fun setSaveEdited(v: String) = _state.update { it.copy(saveDialog = it.saveDialog?.copy(editedFact = v)) }
+    fun setSaveScope(s: Scope) = _state.update {
+        it.copy(saveDialog = it.saveDialog?.copy(targetScope = s, targetParentId = null, targetDocId = null, useNewDoc = false))
+    }
+    fun setSaveParent(id: String?) = _state.update {
+        it.copy(saveDialog = it.saveDialog?.copy(targetParentId = id, targetDocId = null))
+    }
+    fun setSaveDoc(id: String?) = _state.update {
+        it.copy(saveDialog = it.saveDialog?.copy(targetDocId = id, useNewDoc = false))
+    }
+    fun setSaveNewDoc(use: Boolean, title: String = _state.value.saveDialog?.newDocTitle.orEmpty()) = _state.update {
+        it.copy(saveDialog = it.saveDialog?.copy(useNewDoc = use, newDocTitle = title))
+    }
+    fun pickCandidate(i: Int) = _state.update {
+        val c = it.saveDialog?.candidates?.getOrNull(i) ?: return@update it
+        it.copy(saveDialog = it.saveDialog?.copy(editedFact = c))
+    }
+
+    fun commitSave() {
+        val d = _state.value.saveDialog ?: return
+        val fact = d.editedFact.trim().take(500)
+        if (fact.isEmpty()) return
+        val docId: String = if (d.useNewDoc || d.targetDocId == null) {
+            val title = d.newDocTitle.trim().take(60).ifBlank { "memory" }
+            service.createMemoryDoc(title, d.targetScope, d.targetParentId).id
+        } else d.targetDocId
+        service.commitFact(docId, fact)
+        _state.update { it.copy(saveDialog = null) }
+        refresh()
+    }
+
+    fun messagesOf(chatId: String): List<ChatMessage> =
+        service.state().messages[chatId].orEmpty()
+}

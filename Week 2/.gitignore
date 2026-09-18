@@ -1,0 +1,7 @@
+# Week 2 — Kotlin Toolchain + Compose Desktop
+build/
+*.class
+*.jar
+.DS_Store
+.idea/
+out/
