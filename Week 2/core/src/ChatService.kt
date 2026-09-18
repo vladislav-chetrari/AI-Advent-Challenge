@@ -119,17 +119,34 @@ class ChatService(
     }
 
     // --- ask: sliding window + facts injection ---
+    // Разбит на два шага, чтобы UI мог показать user-сообщение мгновенно (optimistic echo),
+    // а не после ответа LLM: сначала appendUserMessage (sync) + refresh, потом completeAsk.
 
-    suspend fun ask(chat: Chat, prompt: String): AskResult {
-        val clean = prompt.trim()
-        if (clean.isEmpty()) return AskResult.Failure("Пустой запрос.")
+    fun appendUserMessage(chat: Chat, text: String) {
+        val clean = text.trim()
+        if (clean.isEmpty()) return
+        val live = store.state.messages[chat.id].orEmpty() + ChatMessage("user", clean)
+        store.update { it.copy(messages = it.messages + (chat.id to live)) }
+    }
+
+    private fun rollbackUserMessage(chatId: String) {
+        val cur = store.state.messages[chatId].orEmpty()
+        if (cur.lastOrNull()?.role == "user") {
+            store.update { it.copy(messages = it.messages + (chatId to cur.dropLast(1))) }
+        }
+    }
+
+    suspend fun completeAsk(chat: Chat): AskResult {
         val apiKey = ApiKeyProvider.resolve()
-        if (apiKey.isNullOrBlank()) return AskResult.Failure("DEEPSEEK_API_KEY не найден (env или .env).")
+        if (apiKey.isNullOrBlank()) {
+            rollbackUserMessage(chat.id)
+            return AskResult.Failure("DEEPSEEK_API_KEY не найден (env или .env).")
+        }
 
         val system = buildSystemPrompt(chat)
         lastSystemPrompt = system
-        val live = store.state.messages[chat.id].orEmpty() + ChatMessage("user", clean)
-        store.update { it.copy(messages = it.messages + (chat.id to live)) }
+        val live = store.state.messages[chat.id].orEmpty()
+        if (live.lastOrNull()?.role != "user") return AskResult.Failure("Пустой запрос.")
 
         val toSend = PromptBuilder.effectiveHistory(system, live)
         return when (val r = llm.complete(toSend, apiKey)) {
@@ -141,10 +158,7 @@ class ChatService(
             }
             is LlmResult.HttpError -> {
                 // откат user-сообщения
-                val cur = store.state.messages[chat.id].orEmpty()
-                if (cur.lastOrNull()?.role == "user") {
-                    store.update { it.copy(messages = it.messages + (chat.id to cur.dropLast(1))) }
-                }
+                rollbackUserMessage(chat.id)
                 AskResult.Failure(
                     if (r.code == 401) "DeepSeek отклонил ключ (401)."
                     else "DeepSeek API: HTTP ${r.code} ${r.detail.take(200)}"
@@ -152,13 +166,17 @@ class ChatService(
             }
             is LlmResult.Empty -> AskResult.Failure("Пустой ответ модели.")
             is LlmResult.NetworkError -> {
-                val cur = store.state.messages[chat.id].orEmpty()
-                if (cur.lastOrNull()?.role == "user") {
-                    store.update { it.copy(messages = it.messages + (chat.id to cur.dropLast(1))) }
-                }
+                rollbackUserMessage(chat.id)
                 AskResult.Failure("Сеть: ${r.detail.take(200)}")
             }
         }
+    }
+
+    suspend fun ask(chat: Chat, prompt: String): AskResult {
+        val clean = prompt.trim()
+        if (clean.isEmpty()) return AskResult.Failure("Пустой запрос.")
+        appendUserMessage(chat, clean)
+        return completeAsk(chat)
     }
 
     // --- distill + commit (ПКМ "сохранить в память") ---

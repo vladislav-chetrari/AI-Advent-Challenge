@@ -45,6 +45,7 @@ data class UiState(
     val chats: List<Chat> = emptyList(),
     val docs: List<MemoryDoc> = emptyList(),
     val docContents: Map<String, String> = emptyMap(),
+    val messages: Map<String, List<ChatMessage>> = emptyMap(),
     val selection: Selection? = null,
     val input: String = "",
     val busy: Boolean = false,
@@ -79,6 +80,7 @@ class AppViewModel(
             it.copy(
                 projects = s.projects, tasks = s.tasks, chats = s.chats,
                 docs = s.memoryDocs, docContents = contents,
+                messages = s.messages,
                 selection = sel ?: selChat?.let { c -> Selection.ChatSel(c.id) },
                 systemPrompt = sys.ifBlank { it.systemPrompt },
             )
@@ -97,9 +99,13 @@ class AppViewModel(
         val q = st.input.trim()
         if (q.isEmpty() || st.busy) return
         val chat = service.state().chats.firstOrNull { it.id == sel.chatId } ?: return
+        // Optimistic echo: user-сообщение в стор синхронно + refresh,
+        // чтобы оно и индикатор "печатает…" появились мгновенно, до ответа LLM
+        service.appendUserMessage(chat, q)
         _state.update { it.copy(input = "", busy = true, status = null) }
+        refresh(sel)
         scope.launch {
-            when (val r = service.ask(chat, q)) {
+            when (val r = service.completeAsk(chat)) {
                 is core.AskResult.Success -> {
                     refresh(sel)
                     _state.update {
@@ -226,7 +232,7 @@ class AppViewModel(
     }
     fun pickCandidate(i: Int) = _state.update {
         val c = it.saveDialog?.candidates?.getOrNull(i) ?: return@update it
-        it.copy(saveDialog = it.saveDialog?.copy(editedFact = c))
+        it.copy(saveDialog = it.saveDialog.copy(editedFact = c))
     }
 
     fun commitSave() {

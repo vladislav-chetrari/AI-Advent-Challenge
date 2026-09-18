@@ -39,7 +39,7 @@ BASE ("Ты coding-агент...")
 
 ## Save-flow (явное сохранение — требование «вы явно выбираете, что и куда»)
 
-1. `⋯ → Сохранить в память` на реплике (`desktop/src/main.kt: MessageBubble`).
+1. ПКМ по реплике → `Сохранить в память` (`desktop/src/main.kt: MessageBubble`).
 2. `AppViewModel.startSave` → `ChatService.distill(raw)`:
    system `DISTILL_SYSTEM` → JSON-массив `["факт1", ...]` (1–3 шт, ≤200 симв),
    парсинг `parseDistillJson`. Без ключа/API — fallback: сырой текст ≤500 симв.

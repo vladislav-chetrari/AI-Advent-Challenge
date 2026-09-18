@@ -5,6 +5,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -15,6 +16,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -24,9 +27,11 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -35,13 +40,35 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isShiftPressed
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.isSecondaryPressed
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalClipboardManager
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.IntRect
+import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.window.Popup
+import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import kotlin.math.roundToInt
 import core.domain.Chat
 import core.domain.MemoryDoc
 import core.domain.Scope
@@ -184,16 +211,41 @@ fun ChatPane(vm: AppViewModel, chat: Chat) {
         Text("~${st.systemPrompt.length / 4} tok (оценка) · last prompt_tokens=${st.promptTokens}", fontSize = 11.sp, color = Color.Gray)
     }
     Spacer(Modifier.height(6.dp))
-    val messages = remember(st.chats, st.docs, st.docContents, chat.id) { vm.messagesOf(chat.id) }
-    LazyColumn(Modifier.weight(1f).fillMaxWidth(), reverseLayout = false) {
+    // Сообщения — прямо из стейта (обновляются каждым refresh), без remember:
+    // иначе лента не перерисовывалась до смены чата и обратно
+    val messages = st.messages[chat.id].orEmpty()
+    val listState = rememberLazyListState()
+    LaunchedEffect(chat.id, messages.size, st.busy) {
+        if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
+    }
+    LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth()) {
         items(messages, key = { it.hashCode().toString() + it.content.take(20) }) { m ->
             MessageBubble(vm, chat, m.role, m.content)
+        }
+        if (st.busy) {
+            item(key = "typing") {
+                Box(
+                    Modifier.fillMaxWidth().padding(vertical = 3.dp)
+                        .background(Color(0xFFF1F1F1)).padding(8.dp)
+                ) {
+                    Text("Печатает…", fontSize = 14.sp, color = Color.Gray)
+                }
+            }
         }
     }
     Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
         OutlinedTextField(
             value = st.input, onValueChange = vm::onInput,
-            modifier = Modifier.weight(1f), placeholder = { Text("сообщение...") },
+            modifier = Modifier.weight(1f).onPreviewKeyEvent { event ->
+                // Enter / NumpadEnter без Shift — отправка, Shift+Enter — новая строка
+                if (event.key == Key.Enter || event.key == Key.NumPadEnter) {
+                    if (event.isShiftPressed) false
+                    else {
+                        if (event.type == KeyEventType.KeyDown) vm.send()
+                        true
+                    }
+                } else false
+            }, placeholder = { Text("сообщение...") },
             enabled = !st.busy, maxLines = 4,
         )
         Spacer(Modifier.width(8.dp))
@@ -206,24 +258,69 @@ fun ChatPane(vm: AppViewModel, chat: Chat) {
 
 @Composable
 fun MessageBubble(vm: AppViewModel, chat: Chat, role: String, text: String) {
-    var menu by remember { mutableStateOf(false) }
+    @Suppress("DEPRECATION")
+    val clipboard = LocalClipboardManager.current
     val bg = if (role == "user") Color(0xFFE3F2FD) else Color(0xFFF1F1F1)
+    var menu by remember { mutableStateOf(false) }
+    var cursor by remember { mutableStateOf(IntOffset.Zero) }
+    var coords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    fun copy() {
+        @Suppress("DEPRECATION")
+        clipboard.setText(AnnotatedString(text))
+        menu = false
+    }
+    fun save() {
+        menu = false
+        vm.startSave(text, chat.scope, chat.parentId)
+    }
     Box(
         Modifier.fillMaxWidth().padding(vertical = 3.dp)
             .background(bg).padding(8.dp)
+            .onGloballyPositioned { coords = it }
+            .pointerInput(Unit) {
+                awaitPointerEventScope {
+                    while (true) {
+                        // Initial-проход: ловим ПКМ раньше SelectionContainer и гасим событие,
+                        // иначе всплывает его дефолтное меню "Copy" вместо нашего
+                        val event = awaitPointerEvent(PointerEventPass.Initial)
+                        if (event.type == PointerEventType.Press && event.buttons.isSecondaryPressed) {
+                            val local = event.changes.firstOrNull()?.position ?: Offset.Zero
+                            val win = coords?.localToWindow(local) ?: local
+                            cursor = IntOffset(win.x.roundToInt(), win.y.roundToInt())
+                            event.changes.forEach { it.consume() }
+                            menu = true
+                        }
+                    }
+                }
+            }
     ) {
         Column {
             Text(role, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
             SelectionContainer { Text(text, fontSize = 14.sp) }
-            Row {
-                TextButton(onClick = { menu = true }) { Text("⋯", fontSize = 12.sp) }
+        }
+    }
+    // Своё меню строго в позиции курсора (PopupPositionProvider возвращает window-координаты клика)
+    if (menu) {
+        val positionProvider = remember(cursor) {
+            object : PopupPositionProvider {
+                override fun calculatePosition(
+                    anchorBounds: IntRect,
+                    windowSize: IntSize,
+                    layoutDirection: LayoutDirection,
+                    popupContentSize: IntSize,
+                ): IntOffset = cursor
             }
         }
-        DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-            DropdownMenuItem(text = { Text("Сохранить в память") }, onClick = {
-                menu = false
-                vm.startSave(text, chat.scope, chat.parentId)
-            })
+        Popup(
+            popupPositionProvider = positionProvider,
+            onDismissRequest = { menu = false },
+        ) {
+            Surface(shape = RoundedCornerShape(4.dp), shadowElevation = 8.dp) {
+                Column(Modifier.width(IntrinsicSize.Max)) {
+                    DropdownMenuItem(text = { Text("Копировать") }, onClick = ::copy)
+                    DropdownMenuItem(text = { Text("Сохранить в память") }, onClick = ::save)
+                }
+            }
         }
     }
 }

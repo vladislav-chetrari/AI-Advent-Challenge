@@ -17,9 +17,16 @@
 - `lastSystemPrompt`, `lastPromptTokens` — для UI/отладки
 
 Диалог:
-- `ask(chat, prompt): AskResult` (`Success(text, promptTokens)` / `Failure(message)`).
-  Пишет user → шлёт `system + tail(N=12)` → пишет assistant; при HTTP/сетевой
-  ошибке user-сообщение откатывается. Без ключа — `Failure` с подсказкой.
+- `appendUserMessage(chat, text)` (sync) — дописать user-сообщение в стор.
+- `completeAsk(chat): AskResult` (suspend) — ключ → system prompt → LLM →
+  дописать assistant; при HTTP/сетевой ошибке или отсутствии ключа user-сообщение
+  откатывается. `Success(text, promptTokens)` / `Failure(message)`.
+- `ask(chat, prompt): AskResult` — тонкая обёртка: `appendUserMessage` + `completeAsk`
+  (эквивалент старого поведения одним вызовом).
+  Разбиение нужно UI для optimistic echo: `AppViewModel.send` кладёт сообщение
+  синхронно и делает `refresh` до ответа LLM, поэтому своё сообщение и `busy`
+  видны мгновенно.
+- `clearChat(chatId)` — стереть историю чата (память не трогает).
 - `clearChat(chatId)` — стереть историю чата (память не трогает).
 - `distill(raw): List<String>` — сырец → 1–3 факта (см. `docs/MEMORY.md`).
 
@@ -50,5 +57,5 @@
 
 ## `ApiKeyProvider` (`core/src/network/ApiKeyProvider.kt`)
 
-`override` → `env DEEPSEEK_API_KEY` → `.env` (`Week 2/.env`, `.env`,
-`~/.ai-advent-week2/.env`). `resolve(): String?`.
+`override` → `env DEEPSEEK_API_KEY` → `.env` вверх от рабочей директории
+(6 уровней, как в Week 1) → `~/.ai-advent-week2/.env`. `resolve(): String?`.
