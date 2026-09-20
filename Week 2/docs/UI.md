@@ -24,6 +24,7 @@
 - Подсказки режима: в EXECUTION-ACTIVE — `🤖 EXECUTION автоматический: код выдаётся шаг за шагом через API`; в EXECUTION-PAUSED — `⏸ Остановлено на невыполненном шаге i/N: title` (`desktop/src/main.kt:755`).
 - В VALIDATION — результат автопроверки инвариантов (`ts.lastValidation`): `✅ Инварианты соблюдены — ждём твоего подтверждения` + `↻ Проверить`; либо `❌ Нарушены инварианты (N)` с карточками `• rule / ↳ "evidence" / ✎ fix` + `↻ Retry EXECUTION` / `Проверить снова` (`desktop/src/main.kt:764`).
 - `actions`-слот первой строки: кнопки шапки чата (system prompt / invariants / clear) рисуются внутри бара для TASK-чатов.
+- День 15: отказы гардов (`Denied(reason)`) показываются красной строкой статуса (`lastDeniedReason`); `VALIDATION → DONE` идёт через `completeTask` (при `FAILURE` — отказ, нужен Retry); под баром — строка `Переходы: A→B → ...`; в DONE — `✅ Задача завершена`, отправка сообщений блокируется.
 
 ## Чат (`ChatPane`, `desktop/src/main.kt:403`)
 

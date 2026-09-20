@@ -47,6 +47,9 @@ class ChatService(
         private set
     var lastSystemPrompt: String = PromptBuilder.BASE
         private set
+    // Task 5: причина последнего отказа в переходе/запросе — UI показывает в статусе.
+    var lastDeniedReason: String? = null
+        private set
 
     fun state(): AppState = store.state
 
@@ -268,6 +271,13 @@ class ChatService(
     }
 
     suspend fun completeAsk(chat: Chat): AskResult {
+        // Task 5: программный гард стадии — отказ без вызова LLM, но с видимой реакцией.
+        // user-сообщение уже в сторе (optimistic echo), дописываем отказ ассистента.
+        checkStageRefusal(chat)?.let { refusal ->
+            val updated = store.state.messages[chat.id].orEmpty() + ChatMessage("assistant", refusal)
+            store.update { it.copy(messages = it.messages + (chat.id to updated)) }
+            return AskResult.Success(refusal)
+        }
         val apiKey = ApiKeyProvider.resolve()
         if (apiKey.isNullOrBlank()) {
             rollbackUserMessage(chat.id)
@@ -345,6 +355,85 @@ class ChatService(
         val cur = getTaskState(taskId) ?: TaskState(taskId = taskId, steps = defaultStepsFor(TaskStage.PLANNING))
         val next = fn(cur).copy(updatedAt = System.currentTimeMillis())
         store.update { it.copy(taskStates = it.taskStates + (taskId to next)) }
+    }
+
+    // --- Task 5 (День 15): контролируемые переходы ---
+
+    /** Контекст гардов для requestTransition: план утверждён? шаги готовы? валидация успешна? */
+    fun transitionContext(taskId: String): TaskStateMachine.TransitionContext {
+        val ts = getTaskState(taskId) ?: return TaskStateMachine.TransitionContext()
+        val planOk = ts.steps.size >= 2 &&
+            (planDoc(taskId)?.let { store.readDocContent(it).trim().isNotBlank() } == true ||
+                ts.stage != TaskStage.PLANNING)
+        return TaskStateMachine.TransitionContext(
+            status = ts.status,
+            hasApprovedPlan = planOk,
+            allStepsDone = ts.steps.isNotEmpty() && ts.steps.all { it.done },
+            validation = ts.lastValidation,
+        )
+    }
+
+    /** Единая попытка перехода с объяснимой причиной. Успех — выполняет переход, отказ — пишет lastDeniedReason. */
+    fun tryTransition(taskId: String, to: TaskStage, reason: String = ""): TaskStateMachine.TransitionResult {
+        val cur = getTaskState(taskId)
+            ?: return TaskStateMachine.TransitionResult.Denied("Нет состояния задачи").also { lastDeniedReason = it.reason }
+        val r = TaskStateMachine.requestTransition(cur.stage, to, transitionContext(taskId))
+        if (r is TaskStateMachine.TransitionResult.Denied) lastDeniedReason = r.reason
+        else lastDeniedReason = null
+        return r
+    }
+
+    private val codeRequestRe = Regex("давай код|напиши код|реализуй|имплемент|сделай реализацию|write (the )?code|implement", RegexOption.IGNORE_CASE)
+    private val finalRequestRe = Regex("финал|заверши|готово|done|подтверди завершение|finish", RegexOption.IGNORE_CASE)
+
+    /**
+     * Task 5: проверка запроса юзера против стадии. Возвращает текст отказа или null если можно дальше.
+     * Консервативно: срабатывает только на явные маркеры, обычный диалог не блокируется.
+     */
+    fun checkStageRefusal(chat: Chat): String? {
+        if (chat.scope != Scope.TASK) return null
+        val taskId = chat.parentId ?: return null
+        val ts = getTaskState(taskId) ?: return null
+        if (ts.status == TaskStatus.PAUSED) return "⏸ Задача на паузе (этап ${ts.stage.name}). Нажми «▶ Продолжить» — продолжим с шага ${ts.stepIndex + 1}/${ts.steps.size} без повторов."
+        val lastUser = store.state.messages[chat.id].orEmpty().lastOrNull { it.role == "user" }?.content.orEmpty()
+        if (lastUser.isBlank()) return null
+        return when (ts.stage) {
+            TaskStage.PLANNING ->
+                if (codeRequestRe.containsMatchIn(lastUser))
+                    "Не могу писать код на этапе PLANNING — сначала утвердим план. ${ts.nextAction}. Нажми «→ Execution», затем код пойдёт по шагам."
+                else null
+            TaskStage.EXECUTION ->
+                if (finalRequestRe.containsMatchIn(lastUser) && !(ts.steps.isNotEmpty() && ts.steps.all { it.done }))
+                    "Не могу завершить: EXECUTION не готов — выполнено ${ts.steps.count { it.done }}/${ts.steps.size}. Доведи шаги до конца, затем VALIDATION."
+                else null
+            TaskStage.VALIDATION ->
+                if (codeRequestRe.containsMatchIn(lastUser))
+                    "На этапе VALIDATION новый код запрещён — только проверка. Если нужно менять код — нажми «↻ Retry», вернёмся в EXECUTION."
+                else null
+            TaskStage.DONE -> "Задача завершена (DONE) — новая работа запрещена. Создай новую задачу."
+        }?.also { lastDeniedReason = it }
+    }
+
+    /** Task 5: завершение задачи — только VALIDATION→DONE при SUCCESS-валидации. */
+    fun completeTask(taskId: String, reason: String = ""): TaskStateMachine.TransitionResult {
+        val cur = getTaskState(taskId)
+            ?: return TaskStateMachine.TransitionResult.Denied("Нет состояния задачи")
+        val r = TaskStateMachine.requestTransition(cur.stage, TaskStage.DONE, transitionContext(taskId))
+        if (r is TaskStateMachine.TransitionResult.Denied) {
+            lastDeniedReason = r.reason
+            return r
+        }
+        lastDeniedReason = null
+        val trans = StateTransition(cur.stage, TaskStage.DONE, reason = reason.take(200))
+        updateTaskState(taskId) {
+            it.copy(
+                stage = TaskStage.DONE,
+                status = TaskStatus.DONE,
+                nextAction = defaultNextAction(TaskStage.DONE, 0, emptyList()),
+                history = it.history + trans,
+            )
+        }
+        return TaskStateMachine.TransitionResult.Allowed
     }
 
     // --- План в отдельный документ + авто-выполнение (Task 3, расширение) ---
@@ -491,9 +580,21 @@ class ChatService(
 
     fun advanceTask(taskId: String, reason: String = "", rawPlan: String? = null): Boolean {
         val cur = getTaskState(taskId) ?: return false
-        if (!TaskStateMachine.canAdvance(cur.status, cur.stage)) return false
+        if (!TaskStateMachine.canAdvance(cur.status, cur.stage)) {
+            lastDeniedReason = if (cur.status == TaskStatus.PAUSED) "Задача на паузе — сначала нажми «Продолжить»" else "Переход невозможен в статусе ${cur.status.name}"
+            return false
+        }
         val nextStage = TaskStateMachine.nextStage(cur.stage) ?: return false
-        if (!TaskStateMachine.canTransition(cur.stage, nextStage)) return false
+        // Task 5: гарды перед топологией — отказ с причиной вместо молчаливого false.
+        // Исключение: PLANNING→EXECUTION проверяется ПОСЛЕ сохранения плана ниже
+        // (иначе hasApprovedPlan всегда false на первом проходе).
+        if (cur.stage != TaskStage.PLANNING) {
+            val gate = TaskStateMachine.requestTransition(cur.stage, nextStage, transitionContext(taskId))
+            if (gate is TaskStateMachine.TransitionResult.Denied) {
+                lastDeniedReason = gate.reason
+                return false
+            }
+        }
         // Этап плана: шаги НЕ затираем дефолтом — они уже чистые
         // (дистилляция всего разговора делается в finalizePlanAndAdvance).
         // Здесь только страховка: сохранить текущий чистый план в документ.
@@ -517,9 +618,15 @@ class ChatService(
             if (planSteps.isEmpty()) planSteps = defaultStepsFor(nextStage)
             // сбросить done при входе в execution, т.к. это новый цикл выполнения
             planSteps = planSteps.map { it.copy(done = false) }
+            // Task 5: гард PLANNING→EXECUTION после фиксации плана (шаги + док «план» уже на месте)
+            if (planSteps.size < 2) {
+                lastDeniedReason = "Нельзя в EXECUTION без утверждённого плана: нужно ≥2 шагов и док «план»"
+                return false
+            }
         }
         val newSteps = if (cur.stage == TaskStage.PLANNING) planSteps else defaultStepsFor(nextStage)
         val trans = StateTransition(cur.stage, nextStage, reason = reason.take(200))
+        lastDeniedReason = null
         updateTaskState(taskId) {
             it.copy(
                 stage = nextStage,
@@ -565,9 +672,13 @@ class ChatService(
     fun setTaskStage(taskId: String, stage: TaskStage): Boolean {
         val cur = getTaskState(taskId) ?: return false
         if (cur.stage == stage) return true
-        if (cur.stage == TaskStage.DONE) return false
-        // allow direct jump only via valid transition
-        if (!TaskStateMachine.canTransition(cur.stage, stage) && stage != TaskStage.DONE) return false
+        // Task 5: фикс дырки «любой этап → DONE»: только через requestTransition с гардами.
+        val gate = TaskStateMachine.requestTransition(cur.stage, stage, transitionContext(taskId))
+        if (gate is TaskStateMachine.TransitionResult.Denied) {
+            lastDeniedReason = gate.reason
+            return false
+        }
+        lastDeniedReason = null
         val trans = StateTransition(cur.stage, stage)
         val newSteps = defaultStepsFor(stage)
         updateTaskState(taskId) {

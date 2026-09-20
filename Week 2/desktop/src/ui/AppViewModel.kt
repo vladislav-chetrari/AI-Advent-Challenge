@@ -193,6 +193,11 @@ class AppViewModel(
         val q = st.input.trim()
         if (q.isEmpty() || st.busy) return
         val chat = service.state().chats.firstOrNull { it.id == sel.chatId } ?: return
+        // Task 5: DONE-задача — отправка запрещена, только чтение истории
+        if (chat.scope == Scope.TASK && service.getTaskState(chat.parentId ?: "")?.stage == TaskStage.DONE) {
+            _state.update { it.copy(status = "Задача завершена (DONE) — новые сообщения запрещены, создай новую задачу") }
+            return
+        }
         // Optimistic echo: user-сообщение в стор синхронно + refresh,
         // чтобы оно и индикатор "печатает…" появились мгновенно, до ответа LLM
         service.appendUserMessage(chat, q)
@@ -508,7 +513,8 @@ class AppViewModel(
                     // не сбрасываем busy — startAutoExecution продолжит с тем же индикатором
                     startAutoExecutionLocked(taskId, chat.id)
                 } else {
-                    _state.update { it.copy(busy = false) }
+                    // Task 5: отказ гарда (нет плана) — показать причину вместо молчания
+                    _state.update { it.copy(busy = false, status = service.lastDeniedReason) }
                     refresh()
                 }
             }
@@ -521,7 +527,7 @@ class AppViewModel(
             if (chatForCheck == null) {
                 autoJob?.cancel()
                 service.advanceTask(taskId)
-                _state.update { it.copy(busy = false, status = null) }
+                _state.update { it.copy(busy = false, status = service.lastDeniedReason) }
                 refresh()
                 return
             }
@@ -535,15 +541,30 @@ class AppViewModel(
                 } catch (_: Exception) {
                     service.advanceTask(taskId)
                 }
-                _state.update { it.copy(busy = false) }
+                _state.update { it.copy(busy = false, status = service.lastDeniedReason) }
                 refresh(Selection.ChatSel(chatForCheck.id))
             }
+            return
+        }
+        // Task 5: VALIDATION → DONE только через completeTask (гард SUCCESS-валидации).
+        if (stageBefore == TaskStage.VALIDATION) {
+            autoJob?.cancel()
+            service.completeTask(taskId, reason = "manual: validation approved")
+            _state.update { it.copy(busy = false, status = service.lastDeniedReason) }
+            refresh()
             return
         }
         // остальные переходы — синхронно без дистилляции (VALIDATION → DONE = подтверждение юзера)
         autoJob?.cancel()
         service.advanceTask(taskId)
-        _state.update { it.copy(busy = false) }
+        _state.update { it.copy(busy = false, status = service.lastDeniedReason) }
+        refresh()
+    }
+
+    /** Task 5: явное завершение из UI с показом причины отказа. */
+    fun completeTask(taskId: String) {
+        service.completeTask(taskId, reason = "manual: validation approved")
+        _state.update { it.copy(status = service.lastDeniedReason) }
         refresh()
     }
 
@@ -664,6 +685,8 @@ class AppViewModel(
 
     fun setTaskStage(taskId: String, stage: TaskStage) {
         service.setTaskStage(taskId, stage)
+        // Task 5: прямой прыжок с отказом — показать причину (демо недопустимого перехода)
+        _state.update { it.copy(status = service.lastDeniedReason) }
         refresh()
     }
 

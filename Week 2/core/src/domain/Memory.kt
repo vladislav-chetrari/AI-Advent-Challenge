@@ -167,6 +167,9 @@ object PromptBuilder {
                 append("Шаг: ").append(state.stepIndex + 1).append("\n")
             }
             append("Ожидаемое действие: ").append(state.nextAction.take(200)).append("\n")
+            // Task 5 (День 15): явные запреты этапа — ассистент не перепрыгивает этап даже по просьбе.
+            append("Запреты этапа: ").append(core.domain.TaskStateMachine.stageRules(state.stage).take(400)).append("\n")
+            append("Перепрыгивать этапы запрещено: только PLANNING→EXECUTION→VALIDATION→DONE. На просьбу нарушить порядок — откажи со ссылкой на этап.").append("\n")
             if (state.history.isNotEmpty()) {
                 val hist = state.history.takeLast(5).joinToString(" → ") { "${it.from.name}→${it.to.name}" }
                 append("История переходов: ").append(hist)

@@ -26,7 +26,7 @@
    cap `~800` токенов (`3200` символов) на док (`PromptBuilder.PER_SCOPE_CAP_CHARS`).
    Суммаризации нет — старое молча отбрасывается, важное живёт в фактах / профиле.
 6. **Инварианты принадлежат scope, но GENERAL-чатам не инжектятся** (`relevantInvariants`, `core/src/ChatService.kt:163`): `PROJECT`-чат → инварианты проекта, `TASK(T in P)`-чат → инварианты проекта `P` + задачи `T`. Только `active=true`. Хранятся отдельно от диалога (`invariants/*.md`), правятся текстом напрямую без дистилляции.
-7. **Состояние задачи — отдельно от диалога** (`taskStates` в `state.json`): этап/статус/шаги/`nextAction`/история переходов. Переходы только вперёд `PLANNING→EXECUTION→VALIDATION→DONE` + `canRetry VALIDATION→EXECUTION` + возврат `REPLAN →PLANNING` (`TaskStateMachine`, `core/src/domain/TaskState.kt:77`). Пауза возможна на любом этапе кроме DONE.
+7. **Состояние задачи — отдельно от диалога** (`taskStates` в `state.json`): этап/статус/шаги/`nextAction`/история переходов. Переходы только через `requestTransition` с гардами (День 15): `PLANNING→EXECUTION` с утверждённым планом, `EXECUTION→VALIDATION` при всех `done`, `VALIDATION→DONE` при `SUCCESS`-валидации + `canRetry VALIDATION→EXECUTION` + возврат `REPLAN →PLANNING` (`TaskStateMachine`, `core/src/domain/TaskState.kt:77`). Пауза возможна на любом этапе кроме DONE. Блок `[Задача]` содержит «Запреты этапа» — LLM отказывает на просьбу перепрыгнуть этап.
 
 ## Сборка system prompt
 

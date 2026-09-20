@@ -751,6 +751,8 @@ fun TaskStateBar(
         Spacer(Modifier.height(4.dp))
         if (ts.stage != TaskStage.DONE) {
             Text("Ожидается: ${ts.nextAction}", fontSize = 11.sp, color = Color(0xFF616161))
+        } else {
+            Text("✅ Задача завершена — новые сообщения и переходы запрещены", fontSize = 11.sp, color = Color(0xFF2E7D32))
         }
         if (ts.stage == TaskStage.EXECUTION && ts.status == TaskStatus.ACTIVE) {
             Text("🤖 EXECUTION автоматический: код выдаётся шаг за шагом через API", fontSize = 11.sp, color = Color(0xFF1565C0))
@@ -802,6 +804,13 @@ fun TaskStateBar(
         }
         if (st.busy) {
             Text("⚙️ ИИ работает через API…", fontSize = 11.sp, color = Color(0xFF1565C0), fontWeight = FontWeight.SemiBold)
+        }
+        // Task 5: явная история переходов — видно что пропусков не было
+        if (ts.history.isNotEmpty()) {
+            Text(
+                "Переходы: " + ts.history.takeLast(5).joinToString(" → ") { "${it.from.name}→${it.to.name}" },
+                fontSize = 10.sp, color = Color.Gray
+            )
         }
         // Кнопки промпта — внизу шапки, слева, компактные
         actions?.let { acts ->
