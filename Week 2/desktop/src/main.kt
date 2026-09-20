@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
@@ -235,8 +236,8 @@ fun Root() {
                 }
             }
         }
-        // Справа: чат или память
-        Column(Modifier.weight(1f).fillMaxHeight().padding(12.dp)) {
+        // Справа: чат или память (без внешних отступов — шапка встык, падинги внутри панелей)
+        Column(Modifier.weight(1f).fillMaxHeight()) {
             val sel = st.selection
             when (sel) {
                 is Selection.ChatSel -> {
@@ -254,9 +255,9 @@ fun Root() {
                     if (doc == null) Text("Документ удалён")
                     else InvariantPane(vm, doc, st.invariantContents[doc.id].orEmpty())
                 }
-                null -> Text("Выбери чат слева или создай новый (+)")
+                null -> Text("Выбери чат слева или создай новый (+)", modifier = Modifier.padding(12.dp))
             }
-            st.status?.let { Text(it, color = Color(0xFFB00020), fontSize = 12.sp) }
+            st.status?.let { Text(it, color = Color(0xFFB00020), fontSize = 12.sp, modifier = Modifier.padding(horizontal = 12.dp)) }
         }
     }
 
@@ -344,16 +345,64 @@ private fun TreeRow(
 }
 
 @Composable
+fun InvariantsPanel(vm: AppViewModel, chat: Chat) {
+    val st by vm.state.collectAsState()
+    // действующие в этом чате инварианты: та же логика наследования что и в промпте
+    val relevant = when (chat.scope) {
+        Scope.GENERAL -> emptyList()
+        Scope.PROJECT -> st.invariants.filter { it.scope == Scope.PROJECT && it.parentId == chat.parentId }
+        Scope.TASK -> {
+            val task = st.tasks.firstOrNull { it.id == chat.parentId }
+            st.invariants.filter {
+                (it.scope == Scope.TASK && it.parentId == chat.parentId) ||
+                    (it.scope == Scope.PROJECT && task != null && it.parentId == task.projectId)
+            }
+        }
+    }.sortedWith(compareBy({ it.scope.ordinal }, { it.title }))
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val half = maxHeight / 3
+        Column(
+            Modifier.fillMaxWidth()
+                .heightIn(max = half)
+                .verticalScroll(rememberScrollState())
+                .background(Color(0xFFFFF8E1)).padding(8.dp)
+        ) {
+            if (relevant.isEmpty()) {
+                Text("Инвариантов для этого чата нет — создай через + → Инварианты", fontSize = 11.sp, color = Color.Gray)
+            } else {
+                relevant.forEach { d ->
+                    val content = st.invariantContents[d.id].orEmpty()
+                    Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                        Text(
+                            if (d.active) "🛡" else "🛡✕",
+                            fontSize = 12.sp,
+                            modifier = Modifier.padding(end = 4.dp).clickable(onClick = { vm.toggleInvariant(d.id) })
+                        )
+                        Text(
+                            "🛡 ${d.title}.md",
+                            fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                            color = if (d.active) Color(0xFFE65100) else Color.Gray,
+                            modifier = Modifier.weight(1f).clickable(onClick = { vm.select(Selection.InvariantSel(d.id)) })
+                        )
+                        Text(
+                            if (d.active) "active" else "выкл",
+                            fontSize = 10.sp, color = Color.Gray
+                        )
+                    }
+                    if (content.isNotBlank()) {
+                        Text(content.take(300), fontSize = 11.sp, color = Color(0xFF5D4037), maxLines = 3)
+                    }
+                    Spacer(Modifier.height(4.dp))
+                }
+            }
+        }
+    }
+}
+
+@Composable
 fun ChatPane(vm: AppViewModel, chat: Chat) {
     val st by vm.state.collectAsState()
     Column(Modifier.fillMaxHeight()) {
-    // Task 3: бар состояния задачи — виден только для TASK-чатов
-    val tid = chat.parentId
-    if (chat.scope == Scope.TASK && tid != null) {
-        TaskStateBar(vm, tid)
-        Spacer(Modifier.height(6.dp))
-    }
-    // Шапка: системный промпт collapse/extend
     // Заголовок — хлебные крошки по уровню: general — имя, project — "проект / имя", task — "проект / задача / имя"
     val title = when (chat.scope) {
         Scope.GENERAL -> chat.name
@@ -364,20 +413,53 @@ fun ChatPane(vm: AppViewModel, chat: Chat) {
             "${project?.name ?: "?"} / ${task?.name ?: "?"} / ${chat.name}"
         }
     }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(title, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, modifier = Modifier.weight(1f))
-        TextButton(onClick = vm::toggleSystem) { Text(if (st.systemExpanded) "▲ system prompt" else "▼ system prompt") }
-        TextButton(onClick = vm::clearChat) { Text("🗑", fontSize = 16.sp) }
+    // TASK-чаты: один заголовок внутри бара (верхний короткий убран, нижний дубль убран).
+    // Кнопки управления промптом живут в шапке бара. DONE — неактивна, без кнопок вообще.
+    val tid = chat.parentId
+    if (chat.scope == Scope.TASK && tid != null) {
+        val isDone = st.taskStates[tid]?.stage == TaskStage.DONE
+        if (isDone) {
+            TaskStateBar(vm, tid, titleOverride = title)
+        } else {
+            TaskStateBar(vm, tid, titleOverride = title) {
+                TextButton(
+                    onClick = vm::toggleSystem,
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                ) { Text(if (st.systemExpanded) "▲ system prompt" else "▼ system prompt", fontSize = 11.sp) }
+                TextButton(
+                    onClick = vm::toggleInvariants,
+                    contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+                ) { Text(if (st.invariantsExpanded) "▲ invariants" else "▼ invariants", fontSize = 11.sp) }
+            }
+        }
+    } else {
+        Text(
+            title, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1,
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp)
+        )
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+            horizontalArrangement = Arrangement.Start,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            TextButton(
+                onClick = vm::toggleSystem,
+                contentPadding = PaddingValues(horizontal = 6.dp, vertical = 2.dp)
+            ) { Text(if (st.systemExpanded) "▲ system prompt" else "▼ system prompt", fontSize = 11.sp) }
+        }
+    }
+    if (st.invariantsExpanded && chat.scope != Scope.GENERAL) {
+        InvariantsPanel(vm, chat)
     }
     if (st.systemExpanded) {
         // Развёрнутый промпт: максимум пол окна, внутри скролл
-        BoxWithConstraints(Modifier.fillMaxWidth()) {
+        BoxWithConstraints(Modifier.fillMaxWidth().padding(horizontal = 12.dp)) {
             val half = maxHeight / 2
             Box(
                 Modifier.fillMaxWidth()
                     .heightIn(max = half)
                     .verticalScroll(rememberScrollState())
-                    .background(Color(0xFFF5F5F5)).padding(8.dp)
+                    .background(Color(0xFFF1EBFF)).padding(8.dp)
             ) {
                 SelectionContainer {
                     Text(
@@ -387,9 +469,8 @@ fun ChatPane(vm: AppViewModel, chat: Chat) {
                 }
             }
         }
-        Text("~${st.systemPrompt.length / 4} tok (оценка) · last prompt_tokens=${st.promptTokens}", fontSize = 11.sp, color = Color.Gray)
+        Text("~${st.systemPrompt.length / 4} tok (оценка) · last prompt_tokens=${st.promptTokens}", fontSize = 11.sp, color = Color.Gray, modifier = Modifier.padding(horizontal = 12.dp))
     }
-    Spacer(Modifier.height(6.dp))
     // Сообщения — прямо из стейта (обновляются каждым refresh), без remember:
     // иначе лента не перерисовывалась до смены чата и обратно
     val messages = st.messages[chat.id].orEmpty()
@@ -397,8 +478,8 @@ fun ChatPane(vm: AppViewModel, chat: Chat) {
     LaunchedEffect(chat.id, messages.size, st.busy) {
         if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
     }
-    LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth()) {
-        items(messages, key = { it.hashCode().toString() + it.content.take(20) }) { m ->
+    LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp)) {
+        items(messages, key = { it.id }) { m ->
             MessageBubble(vm, chat, m.role, m.content)
         }
         if (st.busy) {
@@ -412,7 +493,7 @@ fun ChatPane(vm: AppViewModel, chat: Chat) {
             }
         }
     }
-    Row(Modifier.fillMaxWidth().padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().padding(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
         OutlinedTextField(
             value = st.input, onValueChange = vm::onInput,
             modifier = Modifier.weight(1f).onPreviewKeyEvent { event ->
@@ -518,8 +599,8 @@ fun InvariantPane(vm: AppViewModel, doc: InvariantDoc, content: String) {
     val docTaskId = doc.parentId
     if (doc.scope == Scope.TASK && docTaskId != null) {
         TaskStateBar(vm, docTaskId)
-        Spacer(Modifier.height(6.dp))
     }
+    Column(Modifier.fillMaxWidth().padding(12.dp)) {
     Text("🛡 " + doc.title + ".md", fontWeight = FontWeight.Bold, fontSize = 16.sp)
     Text(
         "${doc.scope} ${doc.parentId ?: ""} · ${if (doc.active) "active (инжектится в system prompt)" else "выключен"} · автосейв",
@@ -541,6 +622,7 @@ fun InvariantPane(vm: AppViewModel, doc: InvariantDoc, content: String) {
     )
     Spacer(Modifier.height(4.dp))
     Text("💾 сохраняется автоматически (~${content.length} симв)", fontSize = 11.sp, color = Color.Gray)
+    }
 }
 
 @Composable
@@ -549,8 +631,8 @@ fun MemoryPane(vm: AppViewModel, doc: MemoryDoc, content: String) {
     val docTaskId = doc.parentId
     if (doc.scope == Scope.TASK && docTaskId != null) {
         TaskStateBar(vm, docTaskId)
-        Spacer(Modifier.height(6.dp))
     }
+    Column(Modifier.fillMaxWidth().padding(12.dp)) {
     Text(doc.title + ".md", fontWeight = FontWeight.Bold, fontSize = 16.sp)
     Text("${doc.scope} ${doc.parentId ?: ""} · ${if (doc.active) "active (инжектится)" else "выключен"}", fontSize = 12.sp, color = Color.Gray)
     Row { TextButton(onClick = { vm.toggleDoc(doc.id) }) { Text(if (doc.active) "выключить" else "включить") }
@@ -568,10 +650,19 @@ fun MemoryPane(vm: AppViewModel, doc: MemoryDoc, content: String) {
             )
         }
     }
+    }
 }
 
 @Composable
-fun TaskStateBar(vm: AppViewModel, taskId: String) {
+fun TaskStateBar(
+    vm: AppViewModel,
+    taskId: String,
+    // Полный заголовок (напр. "проект / задача / чат") — заменяет короткий "▸ имя задачи".
+    // Если null — показать короткий (для MemoryPane/InvariantPane).
+    titleOverride: String? = null,
+    // Кнопки шапки чата (system prompt / invariants / clear) — рисуются в первой строке бара.
+    actions: (@Composable RowScope.() -> Unit)? = null,
+) {
     val st by vm.state.collectAsState()
     val ts = st.taskStates[taskId]
     if (ts == null) {
@@ -584,20 +675,65 @@ fun TaskStateBar(vm: AppViewModel, taskId: String) {
     }
     val taskName = st.tasks.firstOrNull { it.id == taskId }?.name ?: taskId.take(8)
     Column(
-        Modifier.fillMaxWidth().background(Color(0xFFF5F5F5), RoundedCornerShape(6.dp)).padding(8.dp)
+        Modifier.fillMaxWidth().background(Color(0xFFF5F5F5)).padding(horizontal = 12.dp, vertical = 8.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Text("▸ $taskName", fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.weight(1f))
-            val stageLabel = "${ts.stage.name} · ${ts.stage.label}"
-            val statusColor = when {
-                ts.status == TaskStatus.PAUSED -> Color(0xFFFFA726)
-                ts.stage == TaskStage.DONE -> Color(0xFF2E7D32)
-                else -> Color(0xFF555555)
+            Text(
+                titleOverride ?: "▸ $taskName",
+                fontWeight = FontWeight.Bold, fontSize = 13.sp, maxLines = 1,
+                modifier = Modifier.weight(1f)
+            )
+            // Кнопки управления состоянием — слева от чипов этапов, компактные с подписями.
+            // Заливка только у кнопки на следующий шаг, остальные — контурные.
+            if (ts.stage != TaskStage.DONE) {
+                Row(
+                    horizontalArrangement = Arrangement.spacedBy(4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.padding(end = 8.dp)
+                ) {
+                    val miniPad = PaddingValues(horizontal = 4.dp, vertical = 0.dp)
+                    if (ts.status == TaskStatus.PAUSED) {
+                        OutlinedButton(onClick = { vm.resumeTask(taskId) }, enabled = !st.busy, contentPadding = miniPad) { Text("▶ Продолжить", fontSize = 11.sp) }
+                    } else when (ts.stage) {
+                        TaskStage.PLANNING -> {
+                            Button(onClick = { vm.advanceTask(taskId) }, enabled = !st.busy, contentPadding = miniPad) { Text("→ Execution", fontSize = 11.sp) }
+                            OutlinedButton(onClick = { vm.replanTask(taskId) }, enabled = !st.busy, contentPadding = miniPad) { Text("↺ Replan", fontSize = 11.sp) }
+                        }
+                        TaskStage.EXECUTION -> {
+                            OutlinedButton(onClick = { vm.toggleAuto(taskId) }, contentPadding = miniPad) { Text(if (st.busy) "⏸ Пауза" else "▶ Авто", fontSize = 11.sp) }
+                            OutlinedButton(onClick = { vm.replanTask(taskId) }, enabled = !st.busy, contentPadding = miniPad) { Text("↺ Replan", fontSize = 11.sp) }
+                        }
+                        TaskStage.VALIDATION -> {
+                            Button(onClick = { vm.advanceTask(taskId) }, enabled = !st.busy, contentPadding = miniPad) { Text("✓ Done", fontSize = 11.sp) }
+                            OutlinedButton(onClick = { vm.retryExecution(taskId) }, enabled = !st.busy, contentPadding = miniPad) { Text("↻ Retry", fontSize = 11.sp) }
+                            OutlinedButton(onClick = { vm.replanTask(taskId) }, enabled = !st.busy, contentPadding = miniPad) { Text("↺ Replan", fontSize = 11.sp) }
+                        }
+                        TaskStage.DONE -> Unit
+                    }
+                }
             }
-            Text(stageLabel, fontSize = 11.sp, color = statusColor, fontWeight = FontWeight.SemiBold)
+            // 4 некликабельных чипа этапов, выделен текущий
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TaskStage.entries.forEach { s ->
+                    val selected = ts.stage == s
+                    val bg = when {
+                        !selected -> Color(0xFFE0E0E0)
+                        ts.status == TaskStatus.PAUSED -> Color(0xFFFFA726)
+                        s == TaskStage.DONE -> Color(0xFF66BB6A)
+                        s == TaskStage.PLANNING -> Color(0xFF42A5F5)
+                        s == TaskStage.EXECUTION -> Color(0xFFAB47BC)
+                        else -> Color(0xFF78909C)
+                    }
+                    Box(
+                        Modifier.background(bg, RoundedCornerShape(8.dp)).padding(horizontal = 6.dp, vertical = 2.dp)
+                    ) {
+                        Text(s.name.lowercase(), color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+                    }
+                }
+            }
             if (ts.status == TaskStatus.PAUSED) {
                 Spacer(Modifier.width(6.dp))
-                Text("⏸ пауза", fontSize = 11.sp, color = Color(0xFFE65100), fontWeight = FontWeight.Bold)
+                Text("⏸", fontSize = 11.sp, color = Color(0xFFE65100), fontWeight = FontWeight.Bold)
             }
         }
         Spacer(Modifier.height(4.dp))
@@ -611,32 +747,10 @@ fun TaskStateBar(vm: AppViewModel, taskId: String) {
                 )
                 if (curStep?.done == true) Text(" ✓", color = Color(0xFF2E7D32), fontSize = 12.sp)
             }
-            // прогресс шагов точками
-            Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(top = 4.dp)) {
-                ts.steps.forEachIndexed { idx, s ->
-                    val c = when {
-                        s.done -> Color(0xFF66BB6A)
-                        idx == ts.stepIndex -> Color(0xFF42A5F5)
-                        else -> Color(0xFFCCCCCC)
-                    }
-                    Box(Modifier.size(8.dp).background(c, CircleShape))
-                }
-            }
         }
         Spacer(Modifier.height(4.dp))
-        Text("Ожидается: ${ts.nextAction}", fontSize = 11.sp, color = Color(0xFF616161))
-        // План-док: виден если planning→execution уже сохранил план
-        val planDoc = st.docs.firstOrNull {
-            it.scope == Scope.TASK && it.parentId == taskId && it.title == "план"
-        }
-        if (planDoc != null) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("📄 план: ${planDoc.title}.md", fontSize = 11.sp, color = Color(0xFF2E7D32),
-                    modifier = Modifier.weight(1f))
-                TextButton(onClick = { vm.select(Selection.DocSel(planDoc.id)) }) { Text("открыть", fontSize = 11.sp) }
-            }
-        } else if (ts.stage == TaskStage.PLANNING) {
-            Text("План ещё не зафиксирован — нажми «→ Execution» чтобы сохранить в план.md", fontSize = 10.sp, color = Color.Gray)
+        if (ts.stage != TaskStage.DONE) {
+            Text("Ожидается: ${ts.nextAction}", fontSize = 11.sp, color = Color(0xFF616161))
         }
         if (ts.stage == TaskStage.EXECUTION && ts.status == TaskStatus.ACTIVE) {
             Text("🤖 EXECUTION автоматический: код выдаётся шаг за шагом через API", fontSize = 11.sp, color = Color(0xFF1565C0))
@@ -645,25 +759,10 @@ fun TaskStateBar(vm: AppViewModel, taskId: String) {
             val cur = ts.steps.getOrNull(ts.stepIndex)?.title.orEmpty()
             Text("⏸ Остановлено на невыполненном шаге ${ts.stepIndex + 1}/${ts.steps.size}: $cur", fontSize = 11.sp, color = Color(0xFFE65100), fontWeight = FontWeight.SemiBold)
         }
-        if (ts.stage == TaskStage.VALIDATION) {
-            Text("🔍 Валидация: проверь результат, продолжи чат по исправлениям или подтверди ниже", fontSize = 11.sp, color = Color(0xFF6A1B9A), fontWeight = FontWeight.SemiBold)
-        }
         // Task 4: результат автопроверки инвариантов (success — ждём юзера, failure — ошибки + Retry)
+        // Ссылки на инварианты живут в шапке чата (кнопка invariants), здесь только результат.
         if (ts.stage == TaskStage.VALIDATION) {
             val v = ts.lastValidation
-            // ссылка на инварианты задачи/проекта
-            val invDocs = st.invariants.filter {
-                (it.scope == Scope.TASK && it.parentId == taskId) ||
-                    (it.scope == Scope.PROJECT && it.parentId == (st.tasks.firstOrNull { t -> t.id == taskId }?.projectId))
-            }
-            if (invDocs.isNotEmpty()) {
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Text("🛡 инварианты: ${invDocs.size} док.", fontSize = 11.sp, color = Color(0xFF6A1B9A), modifier = Modifier.weight(1f))
-                    invDocs.firstOrNull()?.let { d ->
-                        TextButton(onClick = { vm.select(Selection.InvariantSel(d.id)) }) { Text("открыть", fontSize = 11.sp) }
-                    }
-                }
-            }
             if (v == null && !st.busy) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Text("Проверка инвариантов ещё не запускалась.", fontSize = 11.sp, color = Color.Gray, modifier = Modifier.weight(1f))
@@ -671,10 +770,17 @@ fun TaskStateBar(vm: AppViewModel, taskId: String) {
                 }
             }
             if (v != null && v.verdict == ValidationVerdict.SUCCESS) {
-                Text("✅ Инварианты соблюдены${if (v.note.isNotBlank()) ": ${v.note}" else ""} — ждём твоего подтверждения ниже", fontSize = 11.sp, color = Color(0xFF2E7D32), fontWeight = FontWeight.SemiBold)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Spacer(Modifier.weight(1f))
-                    TextButton(onClick = { vm.runValidation(taskId) }, enabled = !st.busy) { Text("Проверить снова", fontSize = 11.sp) }
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "✅ Инварианты соблюдены${if (v.note.isNotBlank()) ": ${v.note}" else ""} — ждём твоего подтверждения ниже",
+                        fontSize = 11.sp, color = Color(0xFF2E7D32), fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.weight(1f)
+                    )
+                    OutlinedButton(
+                        onClick = { vm.runValidation(taskId) },
+                        enabled = !st.busy,
+                        contentPadding = PaddingValues(horizontal = 8.dp, vertical = 2.dp)
+                    ) { Text("↻ Проверить", fontSize = 11.sp) }
                 }
             }
             if (v != null && v.verdict == ValidationVerdict.FAILURE) {
@@ -697,75 +803,13 @@ fun TaskStateBar(vm: AppViewModel, taskId: String) {
         if (st.busy) {
             Text("⚙️ ИИ работает через API…", fontSize = 11.sp, color = Color(0xFF1565C0), fontWeight = FontWeight.SemiBold)
         }
-        if (ts.history.isNotEmpty()) {
-            Text(
-                "История: " + ts.history.takeLast(4).joinToString(" → ") { "${it.from.name}→${it.to.name}" },
-                fontSize = 10.sp, color = Color.Gray
-            )
-        }
-        Spacer(Modifier.height(6.dp))
-        // Управление — FlowRow чтобы влезало на узких окнах
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
-            // EXECUTION автоматический: только Пауза / Продолжить, ручных шагов нет
-            if (ts.stage == TaskStage.EXECUTION) {
-                if (ts.status == TaskStatus.ACTIVE) {
-                    OutlinedButton(onClick = { vm.pauseTask(taskId) }) { Text("⏸ Пауза авто", fontSize = 12.sp) }
-                }
-                if (ts.status == TaskStatus.PAUSED) {
-                    Button(onClick = { vm.resumeTask(taskId) }) { Text("▶ Продолжить авто", fontSize = 12.sp) }
-                }
-                // Досрочный выход в валидацию (остаток шагов сгорит)
-                Button(
-                    onClick = { vm.advanceTask(taskId) },
-                    enabled = ts.status == TaskStatus.ACTIVE && !st.busy
-                ) { Text("→ Validation", fontSize = 12.sp) }
-            } else {
-                // PLANNING / VALIDATION / DONE — ручное управление
-                if (ts.status == TaskStatus.ACTIVE && ts.stage != TaskStage.DONE) {
-                    OutlinedButton(onClick = { vm.pauseTask(taskId) }) { Text("⏸ Пауза", fontSize = 12.sp) }
-                }
-                if (ts.status == TaskStatus.PAUSED) {
-                    Button(onClick = { vm.resumeTask(taskId) }) { Text("▶ Продолжить", fontSize = 12.sp) }
-                }
-                if (ts.stage == TaskStage.PLANNING) {
-                    OutlinedButton(
-                        onClick = { vm.prevStep(taskId) },
-                        enabled = ts.status == TaskStatus.ACTIVE && ts.stepIndex > 0 && !st.busy
-                    ) { Text("‹ Шаг", fontSize = 12.sp) }
-                    OutlinedButton(
-                        onClick = { vm.completeStep(taskId) },
-                        enabled = ts.status == TaskStatus.ACTIVE && ts.steps.getOrNull(ts.stepIndex)?.done == false && !st.busy
-                    ) { Text("✓ Готов", fontSize = 12.sp) }
-                    OutlinedButton(
-                        onClick = { vm.nextStep(taskId) },
-                        enabled = ts.status == TaskStatus.ACTIVE && ts.stepIndex < ts.steps.size - 1 && !st.busy
-                    ) { Text("Шаг ›", fontSize = 12.sp) }
-                }
-                // Этапы — planning → execution (авто) → validation (ждём юзера) → done
-                val canAdvance = ts.status == TaskStatus.ACTIVE && ts.stage != TaskStage.DONE && !st.busy
-                Button(
-                    onClick = { vm.advanceTask(taskId) },
-                    enabled = canAdvance
-                ) {
-                    val label = when (ts.stage) {
-                        TaskStage.PLANNING -> "→ Execution (план → авто-код)"
-                        TaskStage.EXECUTION -> "→ Validation"
-                        TaskStage.VALIDATION -> "✓ Подтверждаю → Done"
-                        TaskStage.DONE -> "Done"
-                    }
-                    Text(label, fontSize = 12.sp)
-                }
-            }
-        }
-        // Быстрый выбор этапа (для демо)
-        Row(horizontalArrangement = Arrangement.spacedBy(4.dp), modifier = Modifier.padding(top = 4.dp)) {
-            TaskStage.entries.forEach { s ->
-                FilterChip(
-                    selected = ts.stage == s,
-                    onClick = { if (ts.stage != s) vm.setTaskStage(taskId, s) },
-                    label = { Text(s.name.lowercase(), fontSize = 10.sp) },
-                )
-            }
+        // Кнопки промпта — внизу шапки, слева, компактные
+        actions?.let { acts ->
+            Row(
+                Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.Start,
+                verticalAlignment = Alignment.CenterVertically
+            ) { acts() }
         }
     }
 }

@@ -735,6 +735,74 @@ class ChatService(
         } catch (_: Exception) { getTaskState(taskId)?.lastValidation }
     }
 
+    /** Удалить ВСЕ реплики всех чатов задачи (для REPLAN). */
+    fun clearTaskChats(taskId: String) {
+        val chatIds = store.state.chats
+            .filter { it.scope == Scope.TASK && it.parentId == taskId }
+            .map { it.id }
+        if (chatIds.isEmpty()) return
+        store.update { s ->
+            s.copy(messages = s.messages + chatIds.associateWith { emptyList<ChatMessage>() })
+        }
+    }
+
+    /**
+     * Удалить только реплики EXECUTION: user-сообщения "[авто]..." + следующий за каждым ответ ассистента.
+     * Планировочный диалог сохраняется (для RETRY).
+     */
+    fun clearExecutionReplies(taskId: String) {
+        val chatIds = store.state.chats
+            .filter { it.scope == Scope.TASK && it.parentId == taskId }
+            .map { it.id }.toSet()
+        if (chatIds.isEmpty()) return
+        store.update { s ->
+            var msgs = s.messages
+            for (cid in chatIds) {
+                val cur = msgs[cid].orEmpty()
+                if (cur.isEmpty()) continue
+                val kept = mutableListOf<ChatMessage>()
+                var skipNextAssistant = false
+                for (m in cur) {
+                    if (m.role == "user" && m.content.trimStart().startsWith("[авто]")) {
+                        skipNextAssistant = true
+                        continue
+                    }
+                    if (skipNextAssistant && m.role == "assistant") {
+                        skipNextAssistant = false
+                        continue
+                    }
+                    kept.add(m)
+                }
+                msgs = msgs + (cid to kept)
+            }
+            s.copy(messages = msgs)
+        }
+    }
+
+    /**
+     * REPLAN: сбросить задачу в PLANNING с дефолтными шагами, очистить результат валидации.
+     * Реплики чистит вызывающий код (clearTaskChats) — здесь только состояние.
+     */
+    fun replanTask(taskId: String, reason: String = "replan"): Boolean {
+        val cur = getTaskState(taskId) ?: return false
+        if (cur.stage == TaskStage.DONE) return false
+        if (cur.stage == TaskStage.PLANNING) return true
+        val steps = defaultStepsFor(TaskStage.PLANNING)
+        val trans = StateTransition(cur.stage, TaskStage.PLANNING, reason = reason.take(200))
+        updateTaskState(taskId) {
+            it.copy(
+                stage = TaskStage.PLANNING,
+                status = TaskStatus.ACTIVE,
+                stepIndex = 0,
+                steps = steps,
+                nextAction = defaultNextAction(TaskStage.PLANNING, 0, steps),
+                history = it.history + trans,
+                lastValidation = null,
+            )
+        }
+        return true
+    }
+
     /** Retry EXECUTION после failure: VALIDATION -> EXECUTION, шаги сбрасываются в невыполненные. */
     fun retryExecution(taskId: String, reason: String = "retry after invariant failure"): Boolean {
         val cur = getTaskState(taskId) ?: return false

@@ -78,6 +78,8 @@ data class UiState(
     val status: String? = null,
     val systemPrompt: String = "",
     val systemExpanded: Boolean = false,
+    // Task 4: раскрыта ли панель инвариантов в шапке чата
+    val invariantsExpanded: Boolean = false,
     val promptTokens: Int = 0,
     val showCreate: Boolean = false,
     val createKind: CreateKind = CreateKind.GENERAL_CHAT,
@@ -175,6 +177,8 @@ class AppViewModel(
 
     fun toggleSystem() = _state.update { it.copy(systemExpanded = !it.systemExpanded) }
 
+    fun toggleInvariants() = _state.update { it.copy(invariantsExpanded = !it.invariantsExpanded) }
+
     fun toggleProject(id: String) = _state.update {
         it.copy(expandedProjects = if (id in it.expandedProjects) it.expandedProjects - id else it.expandedProjects + id)
     }
@@ -256,6 +260,11 @@ class AppViewModel(
             }
             CreateKind.TASK_CHAT -> {
                 val tid = st.createParentId ?: return
+                // DONE — неактивная задача: новые привязки запрещены
+                if (service.getTaskState(tid)?.stage == TaskStage.DONE) {
+                    _state.update { it.copy(status = "Задача завершена (DONE) — новые чаты запрещены") }
+                    return
+                }
                 val c = service.createChat(name, Scope.TASK, tid)
                 sel = Selection.ChatSel(c.id)
                 expandTasks = setOf(tid)
@@ -269,6 +278,11 @@ class AppViewModel(
                     sel = Selection.InvariantSel(d.id)
                     expandProjects = setOf(pid)
                 } else {
+                    // DONE — неактивная задача: новые привязки запрещены
+                    if (service.getTaskState(pid)?.stage == TaskStage.DONE) {
+                        _state.update { it.copy(status = "Задача завершена (DONE) — новые инварианты запрещены") }
+                        return
+                    }
                     val d = service.createInvariantDoc(name.ifBlank { "инварианты" }, Scope.TASK, pid)
                     sel = Selection.InvariantSel(d.id)
                     expandTasks = setOf(pid)
@@ -713,11 +727,12 @@ class AppViewModel(
         }
     }
 
-    /** failure → Retry EXECUTION: откат VALIDATION -> EXECUTION + рестарт авто-цикла. */
+    /** failure → Retry EXECUTION: удалить реплики прошлой execution, откат VALIDATION -> EXECUTION + рестарт авто. */
     fun retryExecution(taskId: String) {
         val chat = resolveTaskChat(taskId)
         autoJob?.cancel()
         autoJob = null
+        service.clearExecutionReplies(taskId)
         if (!service.retryExecution(taskId)) {
             _state.update { it.copy(status = "Retry невозможен (только из VALIDATION)") }
             refresh()
@@ -727,5 +742,33 @@ class AppViewModel(
         refresh(chat?.let { Selection.ChatSel(it.id) })
         // сразу рестарт авто-цикла с невыполненных шагов
         if (chat != null) startAutoExecution(taskId, chat.id)
+    }
+
+    /** Плей/пауза EXECUTION: плей = автоматический режим выдачи кода. */
+    fun toggleAuto(taskId: String) {
+        val ts = service.getTaskState(taskId) ?: return
+        if (ts.stage != TaskStage.EXECUTION) return
+        if (ts.status == TaskStatus.PAUSED) {
+            resumeTask(taskId)
+            return
+        }
+        // ACTIVE: если авто крутится — пауза, иначе старт авто с текущего шага
+        if (_state.value.busy) {
+            pauseTask(taskId)
+        } else {
+            val chat = resolveTaskChat(taskId) ?: return
+            startAutoExecution(taskId, chat.id)
+        }
+    }
+
+    /** REPLAN: остановить авто, почистить все реплики, вернуться в PLANNING и ждать планирования. */
+    fun replanTask(taskId: String) {
+        autoJob?.cancel()
+        autoJob = null
+        service.clearTaskChats(taskId)
+        service.replanTask(taskId)
+        _state.update { it.copy(busy = false, status = null) }
+        val chat = resolveTaskChat(taskId)
+        refresh(chat?.let { Selection.ChatSel(it.id) })
     }
 }

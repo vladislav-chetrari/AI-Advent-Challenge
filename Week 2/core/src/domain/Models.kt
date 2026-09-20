@@ -66,6 +66,9 @@ data class ValidationResult(
 data class ChatMessage(
     val role: String, // user | assistant
     val content: String,
+    // Стабильный ключ для списка реплик: одинаковые тексты больше не крашат LazyColumn.
+    // Старые записи без id декодятся с дефолтом (уникальный id на сообщение).
+    val id: String = newId(),
 )
 
 // Профиль пользователя (День 12). null activeProfileId = Аноним (по умолчанию),
