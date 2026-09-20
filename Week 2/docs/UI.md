@@ -1,49 +1,68 @@
 # UI (`desktop/`)
 
-Окно 1200×800, две зоны (`desktop/src/main.kt:98`, `Root`):
+Окно 1200×800, две зоны (`Root`):
 
 - **Слева (340px, тёмная):** дерево + кнопка `+` + профиль внизу.
-  - `general` (корень) → общие чаты (`☰`-строки) + `GENERAL` `.md` (`M↓`/`M✕` `title.md` + клик по иконке `M` — `toggleDocActive`) (`desktop/src/main.kt:116`).
-  - `▾ 📁 <проект>` → `PROJECT` `.md` + чаты проекта → `▾ 📋 <задача>` → `TASK` `.md` + чаты задачи (`desktop/src/main.kt:125`).
-  - Клик по чату → справа чат; клик по `.md` → справа viewer (`Selection.ChatSel` / `Selection.DocSel`, `desktop/src/ui/AppViewModel.kt:18`).
-  - Чекбокс-иконка включает/выключает инжект дока (`toggleDocActive`, `desktop/src/main.kt:228`).
-  - Низ древа: круглая кнопка профиля (`desktop/src/main.kt:168`). `?` = Аноним (без персонализации), иначе первая буква имени. Справа подпись `Аноним / без персонализации` или `<имя> / профиль инжектится`. Клик → `ProfileDialogView`.
-  - Свернутость: `expandedProjects` / `expandedTasks` (`desktop/src/ui/AppViewModel.kt:75`), авто-раскрытие предков при `select` (`desktop/src/ui/AppViewModel.kt:107`), toggle по клику на header (`desktop/src/main.kt:213`).
-- **Справа:** чат **или** viewer памяти.
+  - `general` (корень) → общие чаты (`☰`-строки) + `GENERAL` `.md` (`M↓`/`M✕` `title.md` + клик по иконке `M` — `toggleDocActive`).
+  - `▾ 📁 <проект>` → `PROJECT` `.md` + `🛡`-инварианты проекта + чаты проекта → `▾ 📋 <задача>` → бейдж этапа (`PLN`/`EXE`/`VAL`/`DONE`, цвет по stage, `⏸` при паузе, `desktop/src/main.kt:171`) → `TASK` `.md` + `🛡`-инварианты задачи + чаты задачи.
+  - Клик по чату → справа чат; клик по `.md` → справа viewer памяти (`MemoryPane`); клик по `🛡` → редактор инвариантов (`InvariantPane`) (`Selection.ChatSel` / `Selection.DocSel` / `Selection.InvariantSel`, `desktop/src/ui/AppViewModel.kt:27`).
+  - Чекбокс-иконка `M` включает/выключает инжект дока (`toggleDoc`), иконка `🛡`/`🛡✕` — инжект инварианта (`toggleInvariant`, `InvariantRow`, `desktop/src/main.kt:300`).
+  - Низ древа: круглая кнопка профиля. `?` = Аноним (без персонализации), иначе первая буква имени. Справа подпись `Аноним / без персонализации` или `<имя> / профиль инжектится`. Клик → `ProfileDialogView`.
+  - Свернутость: `expandedProjects` / `expandedTasks` (`desktop/src/ui/AppViewModel.kt:93`), авто-раскрытие предков при `select` (включая `InvariantSel`, `desktop/src/ui/AppViewModel.kt:130`), toggle по клику на header.
+- **Справа:** чат **или** viewer памяти **или** редактор инвариантов. Над TASK-чатом и TASK-viewer'ами — `TaskStateBar`.
 
-## Чат (`ChatPane`, `desktop/src/main.kt:277`)
+## TaskStateBar (`desktop/src/main.kt:657`)
 
-- Шапка: хлебные крошки по уровню — `GENERAL`: `имя`, `PROJECT`: `проект / имя`, `TASK`: `проект / задача / имя` (`desktop/src/main.kt:282`) + `▼/▲ system prompt` (collapse/extend собранного system prompt, `AppViewModel.systemPrompt`, обновляется при каждом `ask` и смене выбора/`profile`/`toggleDoc`) + `🗑 очистить` (только историю, `AppViewModel.clearChat`).
-  Под промптом: `~N tok (оценка chars/4) · last prompt_tokens=M` (`desktop/src/main.kt:314`). Развёрнутый промпт — `BoxWithConstraints` до пол-окна с вертикальным скроллом (`desktop/src/main.kt:298`).
-- Лента: `user` (голубой `0xFFE3F2FD`) / `assistant` (серый `0xFFF1F1F1`), текст в `SelectionContainer` (`desktop/src/main.kt:379`). Сообщения читаются прямо из `UiState.messages` (без `remember`), поэтому лента перерисовывается каждым `refresh`; автоскролл к последнему сообщению (`LaunchedEffect` на `messages.size`, `desktop/src/main.kt:321`).
-  Пока `busy` — в конце ленты пузырь `Печатает…`, поле ввода заблокировано (`desktop/src/main.kt:328`).
-  ПКМ по реплике → контекстное меню строго в позиции курсора: `Копировать` / `Сохранить в память` (`startSave` с `chat.scope/parentId`, `desktop/src/main.kt:363`). ПКМ перехватывается в `PointerEventPass.Initial` и `consume()`, чтобы не всплывало дефолтное меню `Copy` `SelectionContainer` (`desktop/src/main.kt:387`).
-  Меню — `Popup` с кастомным `PopupPositionProvider`, возвращающим window-координаты клика (`desktop/src/main.kt:415`).
-  `user`-реплики — `Text`, `assistant` — `Markdown` с `chatMarkdownTypography()` (`desktop/src/main.kt:405`, `desktop/src/ui/ChatMarkdown.kt:16`).
-- Ввод: поле + `➤`, `Enter`/`NumpadEnter` — отправка, `Shift+Enter` — новая строка, `busy`-блок, ошибки — красной строкой под панелью (`desktop/src/main.kt:339`, `desktop/src/main.kt:203`). `AppViewModel.send` делает optimistic echo: `appendUserMessage` sync + `refresh` до `completeAsk` (`desktop/src/ui/AppViewModel.kt:154`).
+Шапка состояния задачи (`taskId` из чата/дока, `titleOverride` — полный путь `проект / задача / чат` для чата, короткий `▸ имя` для viewer'ов):
 
-## Viewer памяти (`MemoryPane`, `desktop/src/main.kt:440`)
+- Строка 1: заголовок + кнопки управления (слева от чипов этапов) + 4 некликабельных чипа `planning/execution/validation/done` (текущий подсвечен цветом stage, при паузе — оранжевым) + `⏸` при `PAUSED`.
+  - `PLANNING`: `→ Execution` (финализация плана + старт авто) / `↺ Replan`.
+  - `EXECUTION`: `▶ Авто` / `⏸ Пауза` (`toggleAuto`, `desktop/src/ui/AppViewModel.kt:748`) / `↺ Replan`.
+  - `VALIDATION`: `✓ Done` (подтверждение юзера) / `↻ Retry` / `↺ Replan` (`desktop/src/main.kt:706`).
+  - `DONE`: кнопок нет, чипы только индикатор; новые чаты/инварианты запрещены (`AppViewModel.commitCreate`, `desktop/src/ui/AppViewModel.kt:262`).
+- Строка 2: `Шаг i/N: title` (+ `✓` у выполненного), ниже `Ожидается: nextAction`.
+- Подсказки режима: в EXECUTION-ACTIVE — `🤖 EXECUTION автоматический: код выдаётся шаг за шагом через API`; в EXECUTION-PAUSED — `⏸ Остановлено на невыполненном шаге i/N: title` (`desktop/src/main.kt:755`).
+- В VALIDATION — результат автопроверки инвариантов (`ts.lastValidation`): `✅ Инварианты соблюдены — ждём твоего подтверждения` + `↻ Проверить`; либо `❌ Нарушены инварианты (N)` с карточками `• rule / ↳ "evidence" / ✎ fix` + `↻ Retry EXECUTION` / `Проверить снова` (`desktop/src/main.kt:764`).
+- `actions`-слот первой строки: кнопки шапки чата (system prompt / invariants / clear) рисуются внутри бара для TASK-чатов.
 
-Title, `scope parentId · active/выключен`, кнопки `включить/выключить` (`toggleDoc`), `удалить` (`deleteDoc`), текст `.md` как есть (`Markdown` той же компактной типографикой, `desktop/src/ui/ChatMarkdown.kt:16`, фон `0xFFF9F9F9`).
+## Чат (`ChatPane`, `desktop/src/main.kt:403`)
 
-## Диалог создания (`CreateDialog`, кнопка `+`, `desktop/src/main.kt:462`)
+- Шапка: для TASK-чатов — `TaskStateBar` с полным заголовком + кнопками `▼/▲ system prompt`, `🛡 invariants` (collapse/extend `InvariantsPanel`, `invariantsExpanded`, `desktop/src/ui/AppViewModel.kt:180`), `🗑 очистить` (только историю, `AppViewModel.clearChat`). Для GENERAL/PROJECT — обычные хлебные крошки (`имя` / `проект / имя`) + те же кнопки без бара.
+  Под промптом: `~N tok (оценка chars/4) · last prompt_tokens=M`. Развёрнутый промпт — `BoxWithConstraints` до пол-окна с вертикальным скроллом.
+- `InvariantsPanel` (`desktop/src/main.kt:348`, collapse по кнопке `🛡`): действующие в этом чате инварианты по той же логике наследования что и в промпте (`PROJECT → проект`, `TASK → проект + задача`); GENERAL — заглушка `Инвариантов для этого чата нет`. Строка: `🛡/🛡✕` (toggle), `🛡 title.md` (переход в `InvariantSel`), `active/выкл`, первые 300 симв текста.
+- Лента: `user` (голубой `0xFFE3F2FD`) / `assistant` (серый `0xFFF1F1F1`), текст в `SelectionContainer`. Сообщения читаются прямо из `UiState.messages` (без `remember`), поэтому лента перерисовывается каждым `refresh`; автоскролл к последнему сообщению (`LaunchedEffect` на `messages.size`).
+  Пока `busy` — в конце ленты пузырь `Печатает…`, поле ввода заблокировано.
+  ПКМ по реплике → контекстное меню строго в позиции курсора: `Копировать` / `Сохранить в память` (`startSave` с `chat.scope/parentId`). ПКМ перехватывается в `PointerEventPass.Initial` и `consume()`, чтобы не всплывало дефолтное меню `Copy` `SelectionContainer`.
+  Меню — `Popup` с кастомным `PopupPositionProvider`, возвращающим window-координаты клика.
+  `user`-реплики — `Text`, `assistant` — `Markdown` с `chatMarkdownTypography()`.
+- Ввод: поле + `➤`, `Enter`/`NumpadEnter` — отправка, `Shift+Enter` — новая строка, `busy`-блок, ошибки — красной строкой под панелью. `AppViewModel.send` делает optimistic echo: `appendUserMessage` sync + `refresh` до `completeAsk` (`desktop/src/ui/AppViewModel.kt:190`).
 
-Тип (`CreateKind`, `desktop/src/ui/AppViewModel.kt:23`): `Общий чат` (имя) / `Проект` (имя; только папка) / `Чат в проекте` (имя + проект) / `Задача` (имя + проект; только папка) / `Чат в задаче` (имя + задача).
-Чипы `FilterChip` — клик сразу переключает `setCreateKind` (сбрасывает `parent`), родителя — второй ряд чипов (`desktop/src/main.kt:477`).
-`Enter` — создать, если `canConfirm` (`name.isNotBlank() && parent != null` если нужен). После создания — автовыбор нового чата и авто-раскрытие предков (`desktop/src/ui/AppViewModel.kt:195`).
+## Viewer памяти (`MemoryPane`, `desktop/src/main.kt:629`)
 
-## Диалог сохранения (`SaveDialogView`, `desktop/src/main.kt:536`)
+Title, `scope parentId · active/выключен`, кнопки `включить/выключить` (`toggleDoc`), `удалить` (`deleteDoc`), текст `.md` как есть (`Markdown` той же компактной типографикой, `desktop/src/ui/ChatMarkdown.kt:16`, фон `0xFFF9F9F9`). Для TASK-доков сверху — `TaskStateBar` (короткий заголовок).
 
-Сырец (первые 300 симв) → варианты дистилляции (клик подставляет в поле, `pickCandidate`) → редактируемое поле факта → scope (`GENERAL/PROJECT/TASK`, дефолт = scope чата) → родитель (проект/задача, если не `GENERAL`) → существующий `.md` **или** ☑ новый документ + title. `Сохранить` активна только при заполненных факте, родителе и доке (`enabled` check, `desktop/src/main.kt:619`). `busy` — `Дистиллирую...`.
+## Редактор инвариантов (`InvariantPane`, `desktop/src/main.kt:597`)
 
-## Диалог профиля (`ProfileDialogView`, `desktop/src/main.kt:631`)
+Заголовок `🛡 title.md` + `scope parentId · active/выкл`, кнопки `включить/выключить` (`toggleInvariant`), `удалить` (`deleteInvariant`). Текст — редактируемое многострочное поле (`TextField`, моноширинный, `minLines=12`) с автосейвом: мгновенно в `UiState.invariantContents`, на диск (`invariants/<id>.md`) с debounce 600мс (`onInvariantEdit`, `desktop/src/ui/AppViewModel.kt:330`). Дистилляции нет. Под полем — счётчик `N/8000 симв`. Для TASK-инвариантов сверху — `TaskStateBar`. Пустой док показывает плейсхолдер `Опиши правила...` (архитектура, стек, запреты).
 
-Круглая кнопка внизу дерева → `AppViewModel.openProfile` (`desktop/src/ui/AppViewModel.kt:325`).
+## Диалог создания (`CreateDialog`, кнопка `+`, `desktop/src/main.kt:819`)
 
-- Верх: выбор пользователя чипами — `Аноним` + все `profiles` (`desktop/src/main.kt:640`). Клик сразу вызывает `setProfileSelected(id)` (`desktop/src/ui/AppViewModel.kt:343`): `service.setActiveProfile(id)` + подставляет поля выбранного профиля + `refresh()` → следующий system prompt уже с новым профилем (или без него для Анонима). Под чипами подсказка: `Аноним: в system prompt ничего не добавляется` (`desktop/src/main.kt:656`).
-- Поля: `Имя` (singleLine, ≤60), `Стиль`, `Формат`, `Ограничения` (≤500, `desktop/src/main.kt:661`).
-- Кнопки: `Создать` (enabled `name.isNotBlank()`, `createProfile`, `desktop/src/ui/AppViewModel.kt:365`), `Сохранить` (enabled `selectedId != null`, `updateProfile`), `Удалить` (enabled `selectedId != null`, `deleteProfile` + сброс диалога в пустой `ProfileDialog`, `desktop/src/ui/AppViewModel.kt:380`).
-- `Готово` — `closeProfile` (`desktop/src/ui/AppViewModel.kt:341`).
+Тип (`CreateKind`, `desktop/src/ui/AppViewModel.kt:34`): `Общий чат` (имя) / `Проект` (имя; только папка) / `Чат в проекте` (имя + проект) / `Задача` (имя + проект; только папка + сразу `TaskState(PLANNING)`) / `Чат в задаче` (имя + задача) / `Инварианты` (имя + проект/задача, scope выводится по типу родителя).
+Чипы `FilterChip` — клик сразу переключает `setCreateKind` (сбрасывает `parent`), родителя — второй ряд чипов.
+`Enter` — создать, если `canConfirm` (`name.isNotBlank() && parent != null` если нужен). После создания — автовыбор нового чата/дока и авто-раскрытие предков (`desktop/src/ui/AppViewModel.kt:231`). В DONE-задаче новые чаты/инварианты запрещены со статусом `Задача завершена (DONE) — ...`.
+
+## Диалог сохранения (`SaveDialogView`, `desktop/src/main.kt:896`)
+
+Сырец (первые 300 симв) → варианты дистилляции (клик подставляет в поле, `pickCandidate`) → редактируемое поле факта → scope (`GENERAL/PROJECT/TASK`, дефолт = scope чата) → родитель (проект/задача, если не `GENERAL`) → существующий `.md` **или** ☑ новый документ + title. `Сохранить` активна только при заполненных факте, родителе и доке. `busy` — `Дистиллирую...`.
+
+## Диалог профиля (`ProfileDialogView`, `desktop/src/main.kt:992`)
+
+Круглая кнопка внизу дерева → `AppViewModel.openProfile` (`desktop/src/ui/AppViewModel.kt:414`).
+
+- Верх: выбор пользователя чипами — `Аноним` + все `profiles`. Клик сразу вызывает `setProfileSelected(id)` (`desktop/src/ui/AppViewModel.kt:432`): `service.setActiveProfile(id)` + подставляет поля выбранного профиля + `refresh()` → следующий system prompt уже с новым профилем (или без него для Анонима). Под чипами подсказка: `Аноним: в system prompt ничего не добавляется`.
+- Поля: `Имя` (singleLine, ≤60), `Стиль`, `Формат`, `Ограничения` (≤500).
+- Кнопки: `Создать` (enabled `name.isNotBlank()`, `createProfile`, `desktop/src/ui/AppViewModel.kt:454`), `Сохранить` (enabled `selectedId != null`, `updateProfile`), `Удалить` (enabled `selectedId != null`, `deleteProfile` + сброс диалога в пустой `ProfileDialog`, `desktop/src/ui/AppViewModel.kt:469`).
+- `Готово` — `closeProfile`.
 
 Типографика markdown (чат и viewer): `chatMarkdownTypography()` (`desktop/src/ui/ChatMarkdown.kt:16`) — база `14sp` (дефолт библиотеки `~57sp` для `h1`), шкала `h1 20 → h2 18 → h3 16 → h4 15 → h5 14 → h6 13` Bold, `code 13sp monospace`.
 
@@ -62,3 +81,17 @@ Title, `scope parentId · active/выключен`, кнопки `включит
 2. Открыть профиль → создать `Кратко` (`style=кратко, по делу`) и `Подробно` (`format=списки, примеры кода`) → переключение чипами `Аноним → Кратко → Подробно` без смены чата/памяти.
 3. Один и тот же вопрос при разных профилях — видимая разница ответов. Показать `▼ system prompt`: блок `[Профиль: ...]` появляется/меняется при переключении.
 4. Выключить профиль (Аноним) — блок исчезает, ответы возвращаются к базовым. Сохранение/удаление профиля через диалог.
+
+### День 13 — состояние задачи (`Task 3 demo.mp4`)
+
+1. Создать проект + задачу (сразу `PLANNING`, бейдж `PLN`) + TASK-чат; обсудить цель в чате — сверху `TaskStateBar` с шагом и `Ожидается`.
+2. Нажать `→ Execution`: весь разговор дистиллируется в чистый план (док `план`, scope=TASK), этап → `EXECUTION` (бейдж `EXE`), стартует авто-цикл — `[авто]`-запросы шаг за шагом, код в ленте.
+3. Нажать `⏸ Пауза` mid-EXECUTION: цикл встаёт на невыполненном шаге (`⏸ Остановлено на ...`), `▶ Продолжить`/`▶ Авто` продолжает с того же шага. Показать `▼ system prompt`: блок `[Задача]` с текущим шагом/`nextAction`/историей.
+4. После последнего шага — автопереход в `VALIDATION` (бейдж `VAL`), `✓ Done` → `DONE` (бейдж `DONE`, новые чаты запрещены). `↺ Replan` в любом этапе — чистка реплик + возврат в `PLANNING`.
+
+### День 14 — инварианты (демо Task 4)
+
+1. `+ → Инварианты` (проект или задача) → `🛡`-док в дереве → открыть `InvariantPane`, вписать правила (напр. `Стек: только X`, `Запрещено: ...`) — автосейв, без дистилляции.
+2. В TASK-чате раскрыть `🛡 invariants` — инварианты проекта+задачи видны; показать `▼ system prompt` — блок `[Инварианты — НЕ НАРУШАТЬ]`. Тумблер `🛡/🛡✕` выключает инжект без удаления текста.
+3. Прогнать задачу до `VALIDATION` (авто-цикл EXECUTION) — автопроверка `validateAgainstInvariants` показывает `✅ соблюдены` (ждём `✓ Done`) либо `❌ Нарушены (N)` с карточками `rule/evidence/fix`.
+4. При failure: `↻ Retry EXECUTION` — чистка только `[авто]`-реплик (планировочный диалог жив), откат в EXECUTION, рестарт авто. Конфликтный запрос (попросить нарушить стек) — ассистент отказывается со ссылкой на пункт инварианта.

@@ -44,9 +44,9 @@ Week 2/
 
 ## Ключевые решения
 
-- **Память shared по scope**, а не per-chat (`docs/MEMORY.md:15`): два чата одной задачи делят один `task`-док — дублей нет.
-- **Без суммаризации**: Sliding Window `N=12` + инжект фактов в system prompt (`core/src/domain/Memory.kt:42`). Cap `~800` токенов (`3200` символов) на док. Старое молча отбрасывается, важное живёт в фактах.
-- **Сохранение явное**: `ПКМ → Сохранить в память` → LLM-дистилляция (`DISTILL_SYSTEM`) → редактируемый факт → выбор цели (scope + parent + `.md`). Сырец не хранится (`docs/MEMORY.md:40`).
+- **Память shared по scope**, а не per-chat (`docs/MEMORY.md:16`): два чата одной задачи делят один `task`-док — дублей нет.
+- **Без суммаризации**: Sliding Window `N=12` + инжект фактов в system prompt (`core/src/domain/Memory.kt:116`). Cap `~800` токенов (`3200` символов) на док. Старое молча отбрасывается, важное живёт в фактах.
+- **Сохранение явное**: `ПКМ → Сохранить в память` → LLM-дистилляция (`DISTILL_SYSTEM`) → редактируемый факт → выбор цели (scope + parent + `.md`). Сырец не хранится (`docs/MEMORY.md:49`).
 - **Хранилища разделены**: сообщения чата — `state.json` (краткосрочная), память — `.md` файлы (рабочая/долговременная).
 - **Персонализация (День 12)** — `UserProfile(name, style, format, constraints)` в `state.json` (`core/src/domain/Models.kt:77`). `activeProfileId == null` → Аноним, в промпт ничего не добавляется (`core/src/domain/Memory.kt:121`, `core/src/ChatService.kt:203`). Активный профиль инжектится блоком `[Профиль: ...]` перед блоками памяти при каждом `buildSystemPrompt` (`core/src/ChatService.kt:187`). Переключение чипами в диалоге профиля мгновенно меняет следующий system prompt — на этом строится демо Task 2.
 - **Стартовые доки не создаются автоматически**: `createProject`/`createTask` создают только папки (`desktop/src/ui/AppViewModel.kt:239`); все `.md` — только через save-диалог (явный выбор). Исключение: `createTask` сразу инициализирует `TaskState(PLANNING)` (`core/src/ChatService.kt:61`), а документ `план` (scope=TASK, title=`план`) появляется только при финализации planning (`finalizePlanAndAdvance`, `core/src/ChatService.kt:459`).

@@ -48,22 +48,40 @@ BASE ("Ты coding-агент...")                          // core/src/domain/M
 
 ## Save-flow — явное сохранение (требование «вы явно выбираете, что и куда»)
 
-1. ПКМ по реплике → `Сохранить в память` (`desktop/src/main.kt:363`, `MessageBubble` — `PointerEventPass.Initial` гасит дефолтное меню `SelectionContainer`).
-2. `AppViewModel.startSave` (`desktop/src/ui/AppViewModel.kt:255`) → `ChatService.distill(raw)` (`core/src/ChatService.kt:228`):
+1. ПКМ по реплике → `Сохранить в память`.
+2. `AppViewModel.startSave` (`desktop/src/ui/AppViewModel.kt:344`) → `ChatService.distill(raw)` (`core/src/ChatService.kt:315`):
    system `DISTILL_SYSTEM` (`core/src/domain/Memory.kt:7`) → JSON-массив `["факт1", ...]` (1–3 шт, ≤200 симв каждый),
    парсинг `parseDistillJson`. Без ключа/API — fallback: сырой текст ≤500 симв.
 3. Диалог: факт **редактируемый**, цель — scope (дефолт = scope текущего чата) +
-   parent (проект/задача) + существующий `.md` **или** новый (title) (`desktop/src/main.kt:536`).
-4. `commitSave` → `Store.appendFact` (дописывает `- факт`, дедуп по строке, `core/src/data/Store.kt:67`).
+   parent (проект/задача) + существующий `.md` **или** новый (title).
+4. `commitSave` → `Store.appendFact` (дописывает `- факт`, дедуп по строке, `core/src/data/Store.kt:71`).
 
 ## Персонализация (День 12)
 
-- Создание/правка: круглая кнопка внизу дерева → диалог профиля (`desktop/src/main.kt:168`, `desktop/src/main.kt:630`).
-  Поля: `name` (до 60 симв), `style`, `format`, `constraints` (до 500 симв каждое, `core/src/domain/Models.kt:45`).
-- Выбор: чипы `Аноним` / `<профиль>` — клик сразу переключает `activeProfileId` (`AppViewModel.setProfileSelected`, `desktop/src/ui/AppViewModel.kt:343`) и вызывает `refresh()` → следующий `buildSystemPrompt` уже с новым блоком.
-- Инжект: `PromptBuilder.profileBlock` (`core/src/domain/Memory.kt:47`) возвращает `null`, если профиль `null` или все три поля пустые — промпт не меняется. Иначе блок `[Профиль: ...]` вставляется сразу после `BASE`, до памяти.
+- Создание/правка: круглая кнопка внизу дерева → диалог профиля.
+  Поля: `name` (до 60 симв), `style`, `format`, `constraints` (до 500 симв каждое, `core/src/domain/Models.kt:77`).
+- Выбор: чипы `Аноним` / `<профиль>` — клик сразу переключает `activeProfileId` (`AppViewModel.setProfileSelected`, `desktop/src/ui/AppViewModel.kt:432`) и вызывает `refresh()` → следующий `buildSystemPrompt` уже с новым блоком.
+- Инжект: `PromptBuilder.profileBlock` (`core/src/domain/Memory.kt:121`) возвращает `null`, если профиль `null` или все три поля пустые — промпт не меняется. Иначе блок `[Профиль: ...]` вставляется сразу после `BASE`, до памяти.
 - Проверка: один и тот же вопрос при `Аноним` vs `Кратко` vs `Подробно с примерами кода` даёт видимую разницу (демо Task 2 — переключение профиля без изменения чата/памяти).
+
+## Состояние задачи (День 13)
+
+- Создание: `createTask` сразу кладёт `TaskState(PLANNING, ACTIVE)` в `taskStates` (`core/src/ChatService.kt:61`). Старые задачи без состояния подтягиваются через `ensureTaskState` (`core/src/ChatService.kt:337`).
+- Этапы: `PLANNING → EXECUTION → VALIDATION → DONE` (`TaskStage`, `core/src/domain/TaskState.kt:5`). Прямые прыжки запрещены, `DONE` терминален (кроме `REPLAN`/`Retry`, см. ниже). Статус `PAUSED` — пауза на любом этапе кроме DONE (`TaskStatus`, `core/src/domain/TaskState.kt:12`).
+- План: переход `planning → execution` (`finalizePlanAndAdvance`, `core/src/ChatService.kt:459`) дистиллирует ВЕСЬ разговор (`distillPlanFromChat`, `PLAN_DISTILL_SYSTEM`, `core/src/domain/Memory.kt:27` → 3–7 шагов) и перезаписывает отдельный док `план` (scope=TASK, `buildPlanMarkdown/savePlanDoc`, `core/src/ChatService.kt:415`). Сырец диалога в док НЕ кладётся — документ = чистый план. Fallback без API — эвристика `parsePlanSteps` (`1./-•/Шаг N:`, `core/src/ChatService.kt:364`).
+- Выполнение: авто-цикл EXECUTION (`AppViewModel.startAutoExecutionLocked`, `desktop/src/ui/AppViewModel.kt:556`) — `[авто] Давай код — выполни шаг i/N` (`autoExecuteCurrentStep`, `core/src/ChatService.kt:540`) → ответ LLM → `nextStep` → следующий шаг. После последнего шага — автопереход в VALIDATION. Пауза (`pauseTask`) останавливает цикл на невыполненном шаге (in-flight шаг не помечается `done`), resume продолжает с него же.
+- Продолжение без повторов: каждый `ask` в TASK-чате несёт блок `[Задача]` (этап/шаг/`nextAction`/история переходов) — LLM видит где остановились (`taskStateBlock`, `core/src/domain/Memory.kt:149`).
+- REPLAN (`replanTask`, `core/src/ChatService.kt:786` + `clearTaskChats`, `core/src/ChatService.kt:739`): стоп авто → чистка ВСЕХ реплик чатов задачи → возврат в PLANNING с дефолтными шагами.
+
+## Инварианты (День 14)
+
+- Сущность: `InvariantDoc(title, scope, parentId, active)` (`core/src/domain/Models.kt:39`) — только PROJECT/TASK scope. Метаданные в `state.json`, текст в `invariants/<id>.md` (`Store`, `core/src/data/Store.kt:92`). Создание через `+ → Инварианты` (`CreateKind.INVARIANTS`, `desktop/src/ui/AppViewModel.kt:40`).
+- Редактирование: `InvariantPane` — прямое текстовое поле с автосейвом (debounce 600мс, cap 8000 симв, `onInvariantEdit`, `desktop/src/ui/AppViewModel.kt:330`). Дистилляции нет — инвариант это правило, а не факт из диалога.
+- Инжект: `relevantInvariants` (наследование как у памяти, `GENERAL` — пусто, `core/src/ChatService.kt:163`) → `invariantsTextForChat` (cap 3200) → `invariantsBlock` с директивой отказа при конфликте (`core/src/domain/Memory.kt:137`). Тумблер `🛡` в дереве/`InvariantsPanel` включает/выключает инжект без удаления текста.
+- Проверка: переход `EXECUTION→VALIDATION` (`advanceToValidationWithCheck`, `core/src/ChatService.kt:726`) запускает `validateAgainstInvariants` (`core/src/ChatService.kt:656`): инварианты + транскрипт EXECUTION (≤8000 симв) → `VALIDATE_SYSTEM` (`core/src/domain/Memory.kt:16`) → `parseValidationJson` (`success | failure+errors`, `core/src/domain/Memory.kt:55`) → `TaskState.lastValidation`. Без инвариантов/сообщений/ключа — `SUCCESS` с `note` (решает пользователь).
+- Конфликт: `FAILURE` показывает карточки `rule/evidence/fix` в `TaskStateBar` + кнопки `↻ Retry EXECUTION` / `Проверить снова`. Retry (`retryExecution`, `core/src/ChatService.kt:807`): `VALIDATION→EXECUTION` (`canRetry`), чистка только `[авто]`-реплик (`clearExecutionReplies` — планировочный диалог живёт), сброс шагов в `done=false`, рестарт авто-цикла (`AppViewModel.retryExecution`, `desktop/src/ui/AppViewModel.kt:731`).
+- Ручной ре-чек в VALIDATION: кнопка `↻ Проверить` (`runValidation`, `desktop/src/ui/AppViewModel.kt:715`).
 
 ## Стартовые доки
 
-`createProject` / `createTask` создают только узлы дерева (папки) без `.md` (`desktop/src/ui/AppViewModel.kt:207`). Стартовые `tech-stack.md` / `project-goal.md` / `task-state.md` из ранней версии Task 1 убраны — все документы теперь создаются только через save-диалог (явный выбор). General-доки также только через save-диалог (scope `GENERAL`).
+`createProject` / `createTask` создают только узлы дерева (папки) без `.md` (`desktop/src/ui/AppViewModel.kt:231`). Стартовые `tech-stack.md` / `project-goal.md` / `task-state.md` из ранней версии Task 1 убраны — все документы теперь создаются только через save-диалог (явный выбор). General-доки также только через save-диалог (scope `GENERAL`). Исключения: док `план` создаётся автоматически при финализации planning (см. День 13 выше), файлы инвариантов — при `+ → Инварианты` (пустые, заполняются вручную).
