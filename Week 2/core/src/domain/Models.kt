@@ -33,6 +33,35 @@ data class MemoryDoc(
     val active: Boolean = true,
 )
 
+// Task 4 (День 14): инварианты — отдельный тип сущности, хранится отдельно от диалога.
+// Правила-факты, которые ассистент не имеет права нарушать.
+@Serializable
+data class InvariantDoc(
+    val id: String,
+    val title: String,
+    val scope: Scope,
+    val parentId: String? = null,
+    val active: Boolean = true,
+)
+
+@Serializable
+enum class ValidationVerdict { SUCCESS, FAILURE }
+
+@Serializable
+data class InvariantViolation(
+    val rule: String,
+    val evidence: String = "",
+    val fix: String = "",
+)
+
+@Serializable
+data class ValidationResult(
+    val verdict: ValidationVerdict,
+    val violations: List<InvariantViolation> = emptyList(),
+    val at: Long = System.currentTimeMillis(),
+    val note: String = "",
+)
+
 @Serializable
 data class ChatMessage(
     val role: String, // user | assistant
@@ -58,6 +87,8 @@ data class AppState(
     // chatId -> сообщения (без system, только живые)
     val messages: Map<String, List<ChatMessage>> = emptyMap(),
     val memoryDocs: List<MemoryDoc> = emptyList(),
+    // Task 4: инварианты — метаданные, контент в invariants/<id>.md
+    val invariantDocs: List<InvariantDoc> = emptyList(),
     val profiles: List<UserProfile> = emptyList(),
     // null = Аноним: профиль не инжектится в system prompt
     val activeProfileId: String? = null,

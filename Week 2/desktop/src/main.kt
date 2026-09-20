@@ -81,10 +81,12 @@ import androidx.compose.ui.window.rememberWindowState
 import com.mikepenz.markdown.m3.Markdown
 import kotlin.math.roundToInt
 import core.domain.Chat
+import core.domain.InvariantDoc
 import core.domain.MemoryDoc
 import core.domain.Scope
 import core.domain.TaskStage
 import core.domain.TaskStatus
+import core.domain.ValidationVerdict
 import desktop.ui.AppViewModel
 import desktop.ui.CreateKind
 import desktop.ui.Selection
@@ -134,10 +136,14 @@ fun Root() {
                         onClick = { vm.toggleProject(p.id) },
                     )
                     if (!pCollapsed) {
-                        // project docs + chats
+                        // project docs + invariants (Task 4: 🛡) + chats
                         st.docs.filter { it.scope == Scope.PROJECT && it.parentId == p.id }.forEach { d ->
                             DocRow(d, st.selection is Selection.DocSel && (st.selection as Selection.DocSel).docId == d.id,
                                 onOpen = { vm.select(Selection.DocSel(d.id)) }, onToggle = { vm.toggleDoc(d.id) }, indent = 12)
+                        }
+                        st.invariants.filter { it.scope == Scope.PROJECT && it.parentId == p.id }.forEach { d ->
+                            InvariantRow(d, st.selection is Selection.InvariantSel && (st.selection as Selection.InvariantSel).docId == d.id,
+                                onOpen = { vm.select(Selection.InvariantSel(d.id)) }, onToggle = { vm.toggleInvariant(d.id) }, indent = 12)
                         }
                         st.chats.filter { it.scope == Scope.PROJECT && it.parentId == p.id }.forEach { c ->
                             ChatRow(c.name, selected = st.selection == Selection.ChatSel(c.id), indent = 12) { vm.select(Selection.ChatSel(c.id)) }
@@ -196,6 +202,10 @@ fun Root() {
                                     DocRow(d, st.selection is Selection.DocSel && (st.selection as Selection.DocSel).docId == d.id,
                                         onOpen = { vm.select(Selection.DocSel(d.id)) }, onToggle = { vm.toggleDoc(d.id) }, indent = 24)
                                 }
+                                st.invariants.filter { it.scope == Scope.TASK && it.parentId == t.id }.forEach { d ->
+                                    InvariantRow(d, st.selection is Selection.InvariantSel && (st.selection as Selection.InvariantSel).docId == d.id,
+                                        onOpen = { vm.select(Selection.InvariantSel(d.id)) }, onToggle = { vm.toggleInvariant(d.id) }, indent = 24)
+                                }
                                 st.chats.filter { it.scope == Scope.TASK && it.parentId == t.id }.forEach { c ->
                                     ChatRow(c.name, selected = st.selection == Selection.ChatSel(c.id), indent = 24) { vm.select(Selection.ChatSel(c.id)) }
                                 }
@@ -239,6 +249,11 @@ fun Root() {
                     if (doc == null) Text("Документ удалён")
                     else MemoryPane(vm, doc, st.docContents[doc.id].orEmpty())
                 }
+                is Selection.InvariantSel -> {
+                    val doc = st.invariants.firstOrNull { it.id == sel.docId }
+                    if (doc == null) Text("Документ удалён")
+                    else InvariantPane(vm, doc, st.invariantContents[doc.id].orEmpty())
+                }
                 null -> Text("Выбери чат слева или создай новый (+)")
             }
             st.status?.let { Text(it, color = Color(0xFFB00020), fontSize = 12.sp) }
@@ -271,6 +286,20 @@ fun DocRow(d: MemoryDoc, selected: Boolean, onOpen: () -> Unit, onToggle: () -> 
     TreeRow(
         icon = if (d.active) "M↓" else "M✕",
         iconColor = if (d.active) Color(0xFF64B5F6) else Color(0xFF777777),
+        label = d.title + ".md",
+        indent = indent,
+        selected = selected,
+        onClick = onOpen,
+        onIconClick = onToggle,
+    )
+}
+
+// Task 4: строка инвариантов — иконка 🛡, клик по ней вкл/выкл инжект в промпт
+@Composable
+fun InvariantRow(d: InvariantDoc, selected: Boolean, onOpen: () -> Unit, onToggle: () -> Unit, indent: Int = 0) {
+    TreeRow(
+        icon = if (d.active) "🛡" else "🛡✕",
+        iconColor = if (d.active) Color(0xFFFFB74D) else Color(0xFF777777),
         label = d.title + ".md",
         indent = indent,
         selected = selected,
@@ -484,6 +513,37 @@ fun MessageBubble(vm: AppViewModel, chat: Chat, role: String, text: String) {
 }
 
 @Composable
+fun InvariantPane(vm: AppViewModel, doc: InvariantDoc, content: String) {
+    // Task 4: редактор инвариантов — перечень правил как факты, автосейв при изменениях.
+    val docTaskId = doc.parentId
+    if (doc.scope == Scope.TASK && docTaskId != null) {
+        TaskStateBar(vm, docTaskId)
+        Spacer(Modifier.height(6.dp))
+    }
+    Text("🛡 " + doc.title + ".md", fontWeight = FontWeight.Bold, fontSize = 16.sp)
+    Text(
+        "${doc.scope} ${doc.parentId ?: ""} · ${if (doc.active) "active (инжектится в system prompt)" else "выключен"} · автосейв",
+        fontSize = 12.sp, color = Color.Gray
+    )
+    Row {
+        TextButton(onClick = { vm.toggleInvariant(doc.id) }) { Text(if (doc.active) "выключить" else "включить") }
+        TextButton(onClick = { vm.deleteInvariant(doc.id) }) { Text("удалить") }
+    }
+    Spacer(Modifier.height(6.dp))
+    Text("Перечень правил-фактов, которые ассистент не имеет права нарушать:", fontSize = 12.sp, color = Color.Gray)
+    Spacer(Modifier.height(4.dp))
+    OutlinedTextField(
+        value = content,
+        onValueChange = { vm.onInvariantEdit(doc.id, it) },
+        modifier = Modifier.fillMaxWidth().heightIn(min = 200.dp),
+        placeholder = { Text("Напр.\n- Только Retrofit, без голого OkHttp\n- Архитектура MVVM\n- Код по-русски в комментариях") },
+        maxLines = 20,
+    )
+    Spacer(Modifier.height(4.dp))
+    Text("💾 сохраняется автоматически (~${content.length} симв)", fontSize = 11.sp, color = Color.Gray)
+}
+
+@Composable
 fun MemoryPane(vm: AppViewModel, doc: MemoryDoc, content: String) {
     // Task 3: если док привязан к задаче — показать бар состояния
     val docTaskId = doc.parentId
@@ -588,6 +648,52 @@ fun TaskStateBar(vm: AppViewModel, taskId: String) {
         if (ts.stage == TaskStage.VALIDATION) {
             Text("🔍 Валидация: проверь результат, продолжи чат по исправлениям или подтверди ниже", fontSize = 11.sp, color = Color(0xFF6A1B9A), fontWeight = FontWeight.SemiBold)
         }
+        // Task 4: результат автопроверки инвариантов (success — ждём юзера, failure — ошибки + Retry)
+        if (ts.stage == TaskStage.VALIDATION) {
+            val v = ts.lastValidation
+            // ссылка на инварианты задачи/проекта
+            val invDocs = st.invariants.filter {
+                (it.scope == Scope.TASK && it.parentId == taskId) ||
+                    (it.scope == Scope.PROJECT && it.parentId == (st.tasks.firstOrNull { t -> t.id == taskId }?.projectId))
+            }
+            if (invDocs.isNotEmpty()) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("🛡 инварианты: ${invDocs.size} док.", fontSize = 11.sp, color = Color(0xFF6A1B9A), modifier = Modifier.weight(1f))
+                    invDocs.firstOrNull()?.let { d ->
+                        TextButton(onClick = { vm.select(Selection.InvariantSel(d.id)) }) { Text("открыть", fontSize = 11.sp) }
+                    }
+                }
+            }
+            if (v == null && !st.busy) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text("Проверка инвариантов ещё не запускалась.", fontSize = 11.sp, color = Color.Gray, modifier = Modifier.weight(1f))
+                    OutlinedButton(onClick = { vm.runValidation(taskId) }) { Text("Проверить", fontSize = 12.sp) }
+                }
+            }
+            if (v != null && v.verdict == ValidationVerdict.SUCCESS) {
+                Text("✅ Инварианты соблюдены${if (v.note.isNotBlank()) ": ${v.note}" else ""} — ждём твоего подтверждения ниже", fontSize = 11.sp, color = Color(0xFF2E7D32), fontWeight = FontWeight.SemiBold)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Spacer(Modifier.weight(1f))
+                    TextButton(onClick = { vm.runValidation(taskId) }, enabled = !st.busy) { Text("Проверить снова", fontSize = 11.sp) }
+                }
+            }
+            if (v != null && v.verdict == ValidationVerdict.FAILURE) {
+                Text("❌ Нарушены инварианты (${v.violations.size}):", fontSize = 11.sp, color = Color(0xFFB00020), fontWeight = FontWeight.Bold)
+                v.violations.forEach { e ->
+                    Column(Modifier.fillMaxWidth().background(Color(0xFFFFEBEE), RoundedCornerShape(4.dp)).padding(6.dp).padding(top = 2.dp)) {
+                        Text("• ${e.rule}", fontSize = 11.sp, color = Color(0xFFB00020), fontWeight = FontWeight.SemiBold)
+                        if (e.evidence.isNotBlank()) Text("  ↳ \"${e.evidence}\"", fontSize = 10.sp, color = Color.Gray)
+                        if (e.fix.isNotBlank()) Text("  ✎ ${e.fix}", fontSize = 10.sp, color = Color(0xFF333333))
+                    }
+                    Spacer(Modifier.height(4.dp))
+                }
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    Button(onClick = { vm.retryExecution(taskId) }, enabled = !st.busy) { Text("↻ Retry EXECUTION", fontSize = 12.sp) }
+                    OutlinedButton(onClick = { vm.runValidation(taskId) }, enabled = !st.busy) { Text("Проверить снова", fontSize = 12.sp) }
+                }
+                Text("Делать Retry EXECUTION?", fontSize = 11.sp, color = Color(0xFFB00020))
+            }
+        }
         if (st.busy) {
             Text("⚙️ ИИ работает через API…", fontSize = 11.sp, color = Color(0xFF1565C0), fontWeight = FontWeight.SemiBold)
         }
@@ -668,11 +774,14 @@ fun TaskStateBar(vm: AppViewModel, taskId: String) {
 @Composable
 fun CreateDialog(vm: AppViewModel) {
     val st by vm.state.collectAsState()
-    val needParent = st.createKind == CreateKind.PROJECT_CHAT || st.createKind == CreateKind.TASK || st.createKind == CreateKind.TASK_CHAT
+    val needParent = st.createKind == CreateKind.PROJECT_CHAT || st.createKind == CreateKind.TASK || st.createKind == CreateKind.TASK_CHAT || st.createKind == CreateKind.INVARIANTS
     val canConfirm = st.createName.isNotBlank() && (!needParent || st.createParentId != null)
     val parentOptions: List<Pair<String, String>> = when (st.createKind) {
         CreateKind.PROJECT_CHAT, CreateKind.TASK -> st.projects.map { it.id to "📁 ${it.name}" }
         CreateKind.TASK_CHAT -> st.tasks.map { it.id to "📋 ${st.projects.firstOrNull { p -> p.id == it.projectId }?.name ?: "?"} / ${it.name}" }
+        // Task 4: инварианты привязываются к проекту или задаче (scope выводится по родителю)
+        CreateKind.INVARIANTS -> st.projects.map { it.id to "📁 ${it.name}" } +
+            st.tasks.map { it.id to "📋 ${st.projects.firstOrNull { p -> p.id == it.projectId }?.name ?: "?"} / ${it.name} 🛡" }
         else -> emptyList()
     }
     AlertDialog(

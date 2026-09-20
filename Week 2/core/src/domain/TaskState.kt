@@ -41,6 +41,8 @@ data class TaskState(
     val nextAction: String = defaultNextAction(TaskStage.PLANNING, 0, emptyList()),
     val history: List<StateTransition> = emptyList(),
     val updatedAt: Long = System.currentTimeMillis(),
+    // Task 4: результат автопроверки инвариантов на этапе VALIDATION
+    val lastValidation: ValidationResult? = null,
 )
 
 fun defaultNextAction(stage: TaskStage, stepIndex: Int, steps: List<TaskStep>): String = when (stage) {
@@ -94,6 +96,10 @@ object TaskStateMachine {
         TaskStage.VALIDATION -> TaskStage.DONE
         TaskStage.DONE -> null
     }
+
+    // Task 4: Retry — откат VALIDATION -> EXECUTION при failure по инвариантам
+    fun canRetry(from: TaskStage, to: TaskStage): Boolean =
+        from == TaskStage.VALIDATION && to == TaskStage.EXECUTION
 
     fun nextAction(stage: TaskStage, stepIndex: Int, steps: List<TaskStep>): String =
         defaultNextAction(stage, stepIndex, steps)

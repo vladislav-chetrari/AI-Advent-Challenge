@@ -5,12 +5,18 @@ import core.domain.AppState
 import core.domain.Chat
 import core.domain.ChatMessage
 import core.domain.DISTILL_SYSTEM
+import core.domain.InvariantDoc
+import core.domain.InvariantViolation
 import core.domain.MemoryDoc
 import core.domain.Project
 import core.domain.PromptBuilder
 import core.domain.Scope
 import core.domain.Task
 import core.domain.UserProfile
+import core.domain.VALIDATE_SYSTEM
+import core.domain.ValidationResult
+import core.domain.ValidationVerdict
+import core.domain.parseValidationJson
 import core.domain.StateTransition
 import core.domain.TaskStage
 import core.domain.TaskState
@@ -95,6 +101,36 @@ class ChatService(
 
     fun docContent(doc: MemoryDoc): String = store.readDocContent(doc)
 
+    // --- Task 4: инварианты (отдельный тип сущности) ---
+
+    fun createInvariantDoc(title: String, scope: Scope, parentId: String?): InvariantDoc {
+        val clean = title.trim().take(60).ifBlank { "инварианты" }
+        store.state.invariantDocs.firstOrNull {
+            it.scope == scope && it.parentId == parentId && it.title == clean
+        }?.let { return it }
+        val d = InvariantDoc(newId(), clean, scope, parentId)
+        store.update { it.copy(invariantDocs = it.invariantDocs + d) }
+        store.writeInvariantContent(d.id, "")
+        return d
+    }
+
+    fun toggleInvariantActive(docId: String) {
+        store.update { s ->
+            s.copy(invariantDocs = s.invariantDocs.map { if (it.id == docId) it.copy(active = !it.active) else it })
+        }
+    }
+
+    fun deleteInvariant(docId: String) {
+        store.update { s -> s.copy(invariantDocs = s.invariantDocs.filterNot { it.id == docId }) }
+        store.deleteInvariantContent(docId)
+    }
+
+    fun invariantContent(doc: InvariantDoc): String = store.readInvariantContent(doc)
+
+    fun saveInvariantContent(docId: String, content: String) {
+        store.writeInvariantContent(docId, content.take(8000))
+    }
+
     // --- релевантные доки с наследованием ---
 
     fun relevantDocs(chat: Chat): List<MemoryDoc> {
@@ -122,6 +158,32 @@ class ChatService(
         }
     }
 
+    // Task 4: релевантные инварианты с тем же наследованием что и память:
+    // PROJECT-чат -> инварианты проекта, TASK-чат -> проекта + задачи. Только active.
+    fun relevantInvariants(chat: Chat): List<InvariantDoc> {
+        val s = store.state
+        return when (chat.scope) {
+            Scope.GENERAL -> emptyList()
+            Scope.PROJECT -> s.invariantDocs.filter {
+                it.scope == Scope.PROJECT && it.parentId == chat.parentId && it.active
+            }.sortedBy { it.title }
+            Scope.TASK -> {
+                val taskObj = s.tasks.firstOrNull { it.id == chat.parentId }
+                val proj = if (taskObj != null) s.invariantDocs.filter {
+                    it.scope == Scope.PROJECT && it.parentId == taskObj.projectId && it.active
+                } else emptyList()
+                val task = s.invariantDocs.filter {
+                    it.scope == Scope.TASK && it.parentId == chat.parentId && it.active
+                }
+                (proj + task).sortedWith(compareBy({ it.scope.ordinal }, { it.title }))
+            }
+        }
+    }
+
+    fun invariantsTextForChat(chat: Chat): String =
+        relevantInvariants(chat).map { store.readInvariantContent(it).trim() }
+            .filter { it.isNotBlank() }.joinToString("\n\n").take(3200)
+
     fun buildSystemPrompt(chat: Chat): String {
         val docs = relevantDocs(chat).map { it.title to store.readDocContent(it) }
         val tState: TaskState? = when (chat.scope) {
@@ -133,7 +195,7 @@ class ChatService(
             Scope.TASK -> store.state.tasks.firstOrNull { it.id == chat.parentId }?.name
             else -> null
         }
-        return PromptBuilder.buildSystemPrompt(docs, activeProfile(), tState, tName)
+        return PromptBuilder.buildSystemPrompt(docs, activeProfile(), tState, tName, invariantsTextForChat(chat))
     }
 
     // --- профили (День 12): null = Аноним, в промпт ничего не инжектится ---
@@ -582,5 +644,115 @@ class ChatService(
         val clean = action.trim().take(200)
         if (clean.isEmpty()) return
         updateTaskState(taskId) { it.copy(nextAction = clean) }
+    }
+
+    // --- Task 4: валидация EXECUTION по инвариантам (VALIDATION) ---
+
+    /**
+     * Проверка всех сообщений EXECUTION + документ инвариантов.
+     * Отправляет в API промпт соответствия с констрейнтом success|failure+errors.
+     * Без инвариантов или без ключа — success (нечего/нечем проверять).
+     */
+    suspend fun validateAgainstInvariants(taskId: String, chatId: String): ValidationResult {
+        val chat = store.state.chats.firstOrNull { it.id == chatId }
+            ?: return ValidationResult(ValidationVerdict.SUCCESS, note = "Нет чата — проверка пропущена")
+        val invText = invariantsTextForChat(chat)
+        if (invText.isBlank()) {
+            val ok = ValidationResult(ValidationVerdict.SUCCESS, note = "Инварианты не заданы — проверка пропущена")
+            updateTaskState(taskId) { it.copy(lastValidation = ok) }
+            return ok
+        }
+        val msgs = store.state.messages[chatId].orEmpty()
+        if (msgs.isEmpty()) {
+            val ok = ValidationResult(ValidationVerdict.SUCCESS, note = "Нет сообщений EXECUTION — нечего проверять")
+            updateTaskState(taskId) { it.copy(lastValidation = ok) }
+            return ok
+        }
+        val transcript = msgs.joinToString("\n") { "${it.role}: ${it.content}" }.take(8000)
+        val apiKey = ApiKeyProvider.resolve()
+        if (apiKey.isNullOrBlank()) {
+            val ok = ValidationResult(ValidationVerdict.SUCCESS, note = "Нет API-ключа — автопроверка пропущена, решает пользователь")
+            updateTaskState(taskId) { it.copy(lastValidation = ok) }
+            return ok
+        }
+        val payload = buildString {
+            append("ИНВАРИАНТЫ:\n").append(invText.take(4000)).append("\n\n")
+            append("СООБЩЕНИЯ EXECUTION:\n").append(transcript)
+        }.trim()
+        val r = try {
+            llm.complete(
+                listOf(
+                    ChatMessage("system", VALIDATE_SYSTEM),
+                    ChatMessage("user", payload),
+                ),
+                apiKey,
+            )
+        } catch (e: Exception) {
+            val fail = ValidationResult(
+                ValidationVerdict.FAILURE,
+                listOf(InvariantViolation("Ошибка вызова валидации", e.message?.take(200).orEmpty(), "Повторить проверку")),
+                note = "network",
+            )
+            updateTaskState(taskId) { it.copy(lastValidation = fail) }
+            return fail
+        }
+        val ok = r as? LlmResult.Ok
+        if (ok == null) {
+            val fail = ValidationResult(
+                ValidationVerdict.FAILURE,
+                listOf(InvariantViolation("Валидатор не ответил", "Пустой/ошибочный ответ API", "Повторить проверку")),
+                note = "llm-error",
+            )
+            updateTaskState(taskId) { it.copy(lastValidation = fail) }
+            return fail
+        }
+        val (success, errors) = parseValidationJson(ok.text)
+        val res = if (success) ValidationResult(ValidationVerdict.SUCCESS, note = "Инварианты соблюдены")
+        else ValidationResult(
+            ValidationVerdict.FAILURE,
+            errors.map { (rule, quote, fix) -> InvariantViolation(rule, quote, fix) }
+                .ifEmpty { listOf(InvariantViolation("Нарушение инвариантов", ok.text.take(200), "Исправить и повторить")) },
+            note = "Найдены нарушения",
+        )
+        updateTaskState(taskId) { it.copy(lastValidation = res) }
+        return res
+    }
+
+    /**
+     * Переход EXECUTION -> VALIDATION + автопроверка инвариантов.
+     * Возвращает результат валидации (success — ждём валидации пользователя,
+     * failure — показываем ошибки, спрашиваем Retry EXECUTION).
+     */
+    suspend fun advanceToValidationWithCheck(taskId: String, chatId: String, reason: String = ""): ValidationResult? {
+        val cur = getTaskState(taskId) ?: return null
+        if (cur.stage != TaskStage.EXECUTION) {
+            advanceTask(taskId, reason)
+            return getTaskState(taskId)?.lastValidation
+        }
+        advanceTask(taskId, reason)
+        return try {
+            validateAgainstInvariants(taskId, chatId)
+        } catch (_: Exception) { getTaskState(taskId)?.lastValidation }
+    }
+
+    /** Retry EXECUTION после failure: VALIDATION -> EXECUTION, шаги сбрасываются в невыполненные. */
+    fun retryExecution(taskId: String, reason: String = "retry after invariant failure"): Boolean {
+        val cur = getTaskState(taskId) ?: return false
+        if (!TaskStateMachine.canRetry(cur.stage, TaskStage.EXECUTION)) return false
+        if (cur.status != TaskStatus.ACTIVE) return false
+        val trans = StateTransition(cur.stage, TaskStage.EXECUTION, reason = reason.take(200))
+        val reset = cur.steps.map { it.copy(done = false) }
+        updateTaskState(taskId) {
+            it.copy(
+                stage = TaskStage.EXECUTION,
+                status = TaskStatus.ACTIVE,
+                stepIndex = 0,
+                steps = reset,
+                nextAction = defaultNextAction(TaskStage.EXECUTION, 0, reset),
+                history = it.history + trans,
+                // lastValidation оставляем — UI покажет что было failure до ретрая
+            )
+        }
+        return true
     }
 }

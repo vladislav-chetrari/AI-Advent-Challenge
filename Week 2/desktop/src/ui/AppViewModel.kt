@@ -3,6 +3,7 @@ package desktop.ui
 import core.ChatService
 import core.domain.Chat
 import core.domain.ChatMessage
+import core.domain.InvariantDoc
 import core.domain.MemoryDoc
 import core.domain.Project
 import core.domain.Scope
@@ -15,6 +16,7 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -25,6 +27,8 @@ import kotlinx.coroutines.launch
 sealed interface Selection {
     data class ChatSel(val chatId: String) : Selection
     data class DocSel(val docId: String) : Selection
+    // Task 4: выбор документа инвариантов
+    data class InvariantSel(val docId: String) : Selection
 }
 
 enum class CreateKind(val title: String) {
@@ -33,6 +37,8 @@ enum class CreateKind(val title: String) {
     PROJECT_CHAT("Чат в проекте"),
     TASK("Задача"),
     TASK_CHAT("Чат в задаче"),
+    // Task 4: новый тип сущности через меню добавления
+    INVARIANTS("Инварианты"),
 }
 
 data class SaveDialog(
@@ -62,6 +68,9 @@ data class UiState(
     val chats: List<Chat> = emptyList(),
     val docs: List<MemoryDoc> = emptyList(),
     val docContents: Map<String, String> = emptyMap(),
+    // Task 4: инварианты + их контент (автосейв из редактора)
+    val invariants: List<InvariantDoc> = emptyList(),
+    val invariantContents: Map<String, String> = emptyMap(),
     val messages: Map<String, List<ChatMessage>> = emptyMap(),
     val selection: Selection? = null,
     val input: String = "",
@@ -97,6 +106,7 @@ class AppViewModel(
     fun refresh(sel: Selection? = _state.value.selection) {
         val s = service.state()
         val contents = s.memoryDocs.associate { it.id to service.docContent(it) }
+        val invContents = s.invariantDocs.associate { it.id to service.invariantContent(it) }
         // system prompt для выбранного чата (уже с активным профилем, null = Аноним)
         var sys = ""
         val selChat = (sel as? Selection.ChatSel)?.chatId?.let { id -> s.chats.firstOrNull { it.id == id } }
@@ -105,6 +115,7 @@ class AppViewModel(
             it.copy(
                 projects = s.projects, tasks = s.tasks, chats = s.chats,
                 docs = s.memoryDocs, docContents = contents,
+                invariants = s.invariantDocs, invariantContents = invContents,
                 messages = s.messages,
                 profiles = s.profiles, activeProfileId = s.activeProfileId,
                 taskStates = s.taskStates,
@@ -134,6 +145,17 @@ class AppViewModel(
                 }
                 is Selection.DocSel -> {
                     val doc = cur.docs.firstOrNull { it.id == sel.docId }
+                    when (doc?.scope) {
+                        Scope.PROJECT -> doc.parentId?.let { projects += it }
+                        Scope.TASK -> {
+                            doc.parentId?.let { tasks += it }
+                            cur.tasks.firstOrNull { t -> t.id == doc.parentId }?.let { projects += it.projectId }
+                        }
+                        else -> Unit
+                    }
+                }
+                is Selection.InvariantSel -> {
+                    val doc = cur.invariants.firstOrNull { it.id == sel.docId }
                     when (doc?.scope) {
                         Scope.PROJECT -> doc.parentId?.let { projects += it }
                         Scope.TASK -> {
@@ -238,6 +260,21 @@ class AppViewModel(
                 sel = Selection.ChatSel(c.id)
                 expandTasks = setOf(tid)
             }
+            CreateKind.INVARIANTS -> {
+                // Родитель — проект или задача: scope выводим по типу родителя
+                val pid = st.createParentId ?: return
+                val isProject = service.state().projects.any { it.id == pid }
+                if (isProject) {
+                    val d = service.createInvariantDoc(name.ifBlank { "инварианты" }, Scope.PROJECT, pid)
+                    sel = Selection.InvariantSel(d.id)
+                    expandProjects = setOf(pid)
+                } else {
+                    val d = service.createInvariantDoc(name.ifBlank { "инварианты" }, Scope.TASK, pid)
+                    sel = Selection.InvariantSel(d.id)
+                    expandTasks = setOf(pid)
+                    service.state().tasks.firstOrNull { it.id == pid }?.let { expandProjects = setOf(it.projectId) }
+                }
+            }
         }
         _state.update {
             it.copy(
@@ -258,6 +295,34 @@ class AppViewModel(
         service.deleteDoc(docId)
         val sel = _state.value.selection
         refresh(if (sel is Selection.DocSel && sel.docId == docId) null else sel)
+    }
+
+    // --- Task 4: инварианты — toggle/delete + автосейв при изменениях ---
+
+    fun toggleInvariant(docId: String) {
+        service.toggleInvariantActive(docId)
+        refresh()
+    }
+
+    fun deleteInvariant(docId: String) {
+        service.deleteInvariant(docId)
+        val sel = _state.value.selection
+        refresh(if (sel is Selection.InvariantSel && sel.docId == docId) null else sel)
+    }
+
+    private var invariantSaveJob: Job? = null
+
+    /** Автосейв: мгновенно в UI-стейт, на диск — с debounce 600мс. */
+    fun onInvariantEdit(docId: String, text: String) {
+        val capped = text.take(8000)
+        _state.update { cur ->
+            cur.copy(invariantContents = cur.invariantContents + (docId to capped))
+        }
+        invariantSaveJob?.cancel()
+        invariantSaveJob = scope.launch {
+            delay(600)
+            try { service.saveInvariantContent(docId, capped) } catch (_: Exception) { }
+        }
     }
 
     // --- ПКМ save flow: distill -> диалог -> commit ---
@@ -435,13 +500,30 @@ class AppViewModel(
             }
             return
         }
-        // EXECUTION → VALIDATION вручную (если авто-цикл уже всё сделал — просто переход;
-        // если остались шаги — переход всё равно разрешён, остаток сгорит)
+        // EXECUTION → VALIDATION: переход + автопроверка инвариантов.
+        // success — ждём валидации пользователя, failure — показываем ошибки, спрашиваем Retry.
         if (stageBefore == TaskStage.EXECUTION) {
+            val chatForCheck = chat
+            if (chatForCheck == null) {
+                autoJob?.cancel()
+                service.advanceTask(taskId)
+                _state.update { it.copy(busy = false, status = null) }
+                refresh()
+                return
+            }
+            if (_state.value.busy) return
             autoJob?.cancel()
-            service.advanceTask(taskId)
-            _state.update { it.copy(busy = false, status = null) }
-            refresh()
+            _state.update { it.copy(busy = true, status = null) }
+            refresh(Selection.ChatSel(chatForCheck.id))
+            autoJob = scope.launch {
+                try {
+                    service.advanceToValidationWithCheck(taskId, chatForCheck.id, reason = "manual: execution done")
+                } catch (_: Exception) {
+                    service.advanceTask(taskId)
+                }
+                _state.update { it.copy(busy = false) }
+                refresh(Selection.ChatSel(chatForCheck.id))
+            }
             return
         }
         // остальные переходы — синхронно без дистилляции (VALIDATION → DONE = подтверждение юзера)
@@ -492,8 +574,12 @@ class AppViewModel(
                     if (isLast) {
                         service.completeCurrentStep(taskId)
                         refresh(Selection.ChatSel(chatId))
-                        // Все шаги готовы → автопереход в VALIDATION, дальше ждём юзера
-                        service.advanceTask(taskId, reason = "auto: all steps done")
+                        // Все шаги готовы → автопереход в VALIDATION + автопроверка инвариантов
+                        try {
+                            service.advanceToValidationWithCheck(taskId, chatId, reason = "auto: all steps done")
+                        } catch (_: Exception) {
+                            service.advanceTask(taskId, reason = "auto: all steps done")
+                        }
                         _state.update { it.copy(busy = false, status = null) }
                         refresh(Selection.ChatSel(chatId))
                         break
@@ -606,5 +692,40 @@ class AppViewModel(
     fun updateNextAction(taskId: String, action: String) {
         service.updateNextAction(taskId, action)
         refresh()
+    }
+
+    // --- Task 4: валидация инвариантов + Retry EXECUTION ---
+
+    /** Ручной ре-чек в VALIDATION (кнопка «Проверить снова»). */
+    fun runValidation(taskId: String) {
+        val chat = resolveTaskChat(taskId) ?: return
+        if (_state.value.busy) return
+        _state.update { it.copy(busy = true, status = null) }
+        refresh(Selection.ChatSel(chat.id))
+        scope.launch {
+            try {
+                service.validateAgainstInvariants(taskId, chat.id)
+            } catch (e: Exception) {
+                _state.update { it.copy(status = "Проверка не удалась: ${e.message?.take(150)}") }
+            }
+            _state.update { it.copy(busy = false) }
+            refresh(Selection.ChatSel(chat.id))
+        }
+    }
+
+    /** failure → Retry EXECUTION: откат VALIDATION -> EXECUTION + рестарт авто-цикла. */
+    fun retryExecution(taskId: String) {
+        val chat = resolveTaskChat(taskId)
+        autoJob?.cancel()
+        autoJob = null
+        if (!service.retryExecution(taskId)) {
+            _state.update { it.copy(status = "Retry невозможен (только из VALIDATION)") }
+            refresh()
+            return
+        }
+        _state.update { it.copy(busy = false, status = null) }
+        refresh(chat?.let { Selection.ChatSel(it.id) })
+        // сразу рестарт авто-цикла с невыполненных шагов
+        if (chat != null) startAutoExecution(taskId, chat.id)
     }
 }
