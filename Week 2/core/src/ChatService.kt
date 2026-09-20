@@ -38,16 +38,12 @@ class ChatService(
     fun createProject(name: String): Project {
         val p = Project(newId(), name.trim().take(60).ifBlank { "project" })
         store.update { it.copy(projects = it.projects + p) }
-        // Стартовые доки проекта чтобы было куда сохранять
-        createMemoryDoc("tech-stack", Scope.PROJECT, p.id)
-        createMemoryDoc("project-goal", Scope.PROJECT, p.id)
         return p
     }
 
     fun createTask(projectId: String, name: String): Task {
         val t = Task(newId(), projectId, name.trim().take(60).ifBlank { "task" })
         store.update { it.copy(tasks = it.tasks + t) }
-        createMemoryDoc("task-state", Scope.TASK, t.id)
         return t
     }
 

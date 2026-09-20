@@ -4,7 +4,10 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -12,18 +15,22 @@ import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -68,6 +75,7 @@ import androidx.compose.ui.window.PopupPositionProvider
 import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
+import com.mikepenz.markdown.m3.Markdown
 import kotlin.math.roundToInt
 import core.domain.Chat
 import core.domain.MemoryDoc
@@ -75,6 +83,7 @@ import core.domain.Scope
 import desktop.ui.AppViewModel
 import desktop.ui.CreateKind
 import desktop.ui.Selection
+import desktop.ui.chatMarkdownTypography
 
 fun main() = application {
     val windowState = rememberWindowState(width = 1200.dp, height = 800.dp)
@@ -100,37 +109,53 @@ fun Root() {
             }
             Spacer(Modifier.height(8.dp))
             LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
-                // General chats
+                // General: без ветки — чаты и доки лежат прямо в корне древа
                 item {
-                    TreeHeader(" general")
                     st.chats.filter { it.scope == Scope.GENERAL }.forEach { c ->
                         ChatRow(c.name, selected = st.selection == Selection.ChatSel(c.id)) { vm.select(Selection.ChatSel(c.id)) }
                     }
                     st.docs.filter { it.scope == Scope.GENERAL }.forEach { d ->
-                        DocRow(d, st.docContents[d.id].orEmpty(), st.selection is Selection.DocSel && (st.selection as Selection.DocSel).docId == d.id,
+                        DocRow(d, st.selection is Selection.DocSel && (st.selection as Selection.DocSel).docId == d.id,
                             onOpen = { vm.select(Selection.DocSel(d.id)) }, onToggle = { vm.toggleDoc(d.id) })
                     }
                 }
                 // Projects
                 items(st.projects, key = { "p${it.id}" }) { p ->
-                    TreeHeader("▾ \uD83D\uDCC1 ${p.name}")
-                    // project docs + chats
-                    st.docs.filter { it.scope == Scope.PROJECT && it.parentId == p.id }.forEach { d ->
-                        DocRow(d, null, st.selection is Selection.DocSel && (st.selection as Selection.DocSel).docId == d.id,
-                            onOpen = { vm.select(Selection.DocSel(d.id)) }, onToggle = { vm.toggleDoc(d.id) })
-                    }
-                    st.chats.filter { it.scope == Scope.PROJECT && it.parentId == p.id }.forEach { c ->
-                        ChatRow("  ☰ ${c.name}", selected = st.selection == Selection.ChatSel(c.id)) { vm.select(Selection.ChatSel(c.id)) }
-                    }
-                    // tasks
-                    st.tasks.filter { it.projectId == p.id }.forEach { t ->
-                        TreeHeader("    ▾ \uD83D\uDCC1 ${t.name}")
-                        st.docs.filter { it.scope == Scope.TASK && it.parentId == t.id }.forEach { d ->
-                            DocRow(d, null, st.selection is Selection.DocSel && (st.selection as Selection.DocSel).docId == d.id,
-                                onOpen = { vm.select(Selection.DocSel(d.id)) }, onToggle = { vm.toggleDoc(d.id) })
+                    val pCollapsed = p.id !in st.expandedProjects
+                    TreeHeader(
+                        p.name,
+                        icon = "📁",
+                        collapsed = pCollapsed,
+                        onClick = { vm.toggleProject(p.id) },
+                    )
+                    if (!pCollapsed) {
+                        // project docs + chats
+                        st.docs.filter { it.scope == Scope.PROJECT && it.parentId == p.id }.forEach { d ->
+                            DocRow(d, st.selection is Selection.DocSel && (st.selection as Selection.DocSel).docId == d.id,
+                                onOpen = { vm.select(Selection.DocSel(d.id)) }, onToggle = { vm.toggleDoc(d.id) }, indent = 12)
                         }
-                        st.chats.filter { it.scope == Scope.TASK && it.parentId == t.id }.forEach { c ->
-                            ChatRow("      ☰ ${c.name}", selected = st.selection == Selection.ChatSel(c.id)) { vm.select(Selection.ChatSel(c.id)) }
+                        st.chats.filter { it.scope == Scope.PROJECT && it.parentId == p.id }.forEach { c ->
+                            ChatRow(c.name, selected = st.selection == Selection.ChatSel(c.id), indent = 12) { vm.select(Selection.ChatSel(c.id)) }
+                        }
+                        // tasks
+                        st.tasks.filter { it.projectId == p.id }.forEach { t ->
+                            val tCollapsed = t.id !in st.expandedTasks
+                            TreeHeader(
+                                t.name,
+                                icon = "📋",
+                                indent = 12,
+                                collapsed = tCollapsed,
+                                onClick = { vm.toggleTask(t.id) },
+                            )
+                            if (!tCollapsed) {
+                                st.docs.filter { it.scope == Scope.TASK && it.parentId == t.id }.forEach { d ->
+                                    DocRow(d, st.selection is Selection.DocSel && (st.selection as Selection.DocSel).docId == d.id,
+                                        onOpen = { vm.select(Selection.DocSel(d.id)) }, onToggle = { vm.toggleDoc(d.id) }, indent = 24)
+                                }
+                                st.chats.filter { it.scope == Scope.TASK && it.parentId == t.id }.forEach { c ->
+                                    ChatRow(c.name, selected = st.selection == Selection.ChatSel(c.id), indent = 24) { vm.select(Selection.ChatSel(c.id)) }
+                                }
+                            }
                         }
                     }
                 }
@@ -161,32 +186,66 @@ fun Root() {
 }
 
 @Composable
-fun TreeHeader(t: String) {
-    Text(t, color = Color(0xFFBBBBBB), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.padding(vertical = 4.dp))
+fun TreeHeader(name: String, icon: String = "📁", indent: Int = 0, collapsed: Boolean = true, onClick: (() -> Unit)? = null) {
+    val t = "${if (collapsed) "▸" else "▾"} $icon $name"
+    val mod = Modifier
+        .fillMaxWidth()
+        .padding(vertical = 4.dp)
+        .then(if (indent > 0) Modifier.padding(start = indent.dp) else Modifier)
+        .then(if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier)
+    Text(t, color = Color(0xFFBBBBBB), fontSize = 13.sp, fontWeight = FontWeight.SemiBold, modifier = mod)
 }
 
 @Composable
-fun ChatRow(label: String, selected: Boolean, onClick: () -> Unit) {
-    Text(
-        label, color = if (selected) Color(0xFF7DD87D) else Color(0xFF9CCC9C),
-        fontSize = 14.sp,
-        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick)
-            .background(if (selected) Color(0xFF2D2D2D) else Color.Transparent)
-            .padding(horizontal = 8.dp, vertical = 3.dp)
+fun ChatRow(label: String, selected: Boolean, indent: Int = 0, onClick: () -> Unit) {
+    TreeRow(icon = "☰", iconColor = Color(0xFF9CCC9C), label = label, indent = indent, selected = selected, onClick = onClick)
+}
+
+@Composable
+fun DocRow(d: MemoryDoc, selected: Boolean, onOpen: () -> Unit, onToggle: () -> Unit, indent: Int = 0) {
+    TreeRow(
+        icon = if (d.active) "M↓" else "M✕",
+        iconColor = if (d.active) Color(0xFF64B5F6) else Color(0xFF777777),
+        label = d.title + ".md",
+        indent = indent,
+        selected = selected,
+        onClick = onOpen,
+        onIconClick = onToggle,
     )
 }
 
+// Общая строка древа: одинаковые отступы, шрифт и подсветка; различаются только иконки.
+// У дока иконка кликабельна (вкл/выкл в промпте), клик по названию открывает документ.
 @Composable
-fun DocRow(d: MemoryDoc, preview: String?, selected: Boolean, onOpen: () -> Unit, onToggle: () -> Unit) {
+private fun TreeRow(
+    icon: String,
+    iconColor: Color,
+    label: String,
+    indent: Int,
+    selected: Boolean,
+    onClick: () -> Unit,
+    onIconClick: (() -> Unit)? = null,
+) {
     Row(
-        Modifier.fillMaxWidth().clickable(onClick = onOpen)
+        Modifier.fillMaxWidth()
             .background(if (selected) Color(0xFF2D2D2D) else Color.Transparent)
-            .padding(horizontal = 8.dp, vertical = 2.dp),
+            .then(if (indent > 0) Modifier.padding(start = indent.dp) else Modifier)
+            .padding(horizontal = 8.dp, vertical = 3.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(if (d.active) "M↓ " else "M✕ ", color = Color(0xFF64B5F6), fontSize = 13.sp)
-        Text(d.title + ".md", color = Color(0xFF7FC97F), fontSize = 13.sp, modifier = Modifier.weight(1f))
-        Checkbox(checked = d.active, onCheckedChange = { onToggle() })
+        Text(
+            icon,
+            color = iconColor,
+            fontSize = 14.sp,
+            modifier = Modifier.padding(end = 6.dp)
+                .then(if (onIconClick != null) Modifier.clickable(onClick = onIconClick) else Modifier)
+        )
+        Text(
+            label,
+            color = if (selected) Color(0xFF7DD87D) else Color(0xFF9CCC9C),
+            fontSize = 14.sp,
+            modifier = Modifier.weight(1f).clickable(onClick = onClick)
+        )
     }
 }
 
@@ -195,18 +254,38 @@ fun ChatPane(vm: AppViewModel, chat: Chat) {
     val st by vm.state.collectAsState()
     Column(Modifier.fillMaxHeight()) {
     // Шапка: системный промпт collapse/extend
+    // Заголовок — хлебные крошки по уровню: general — имя, project — "проект / имя", task — "проект / задача / имя"
+    val title = when (chat.scope) {
+        Scope.GENERAL -> chat.name
+        Scope.PROJECT -> "${st.projects.firstOrNull { it.id == chat.parentId }?.name ?: "?"} / ${chat.name}"
+        Scope.TASK -> {
+            val task = st.tasks.firstOrNull { it.id == chat.parentId }
+            val project = st.projects.firstOrNull { it.id == task?.projectId }
+            "${project?.name ?: "?"} / ${task?.name ?: "?"} / ${chat.name}"
+        }
+    }
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Text(chat.name, fontWeight = FontWeight.Bold, fontSize = 16.sp, modifier = Modifier.weight(1f))
-        TextButton(onClick = vm::toggleSystem) { Text(if (st.systemExpanded) "▲ prompt" else "▼ prompt") }
-        TextButton(onClick = vm::clearChat) { Text("очистить") }
+        Text(title, fontWeight = FontWeight.Bold, fontSize = 16.sp, maxLines = 1, modifier = Modifier.weight(1f))
+        TextButton(onClick = vm::toggleSystem) { Text(if (st.systemExpanded) "▲ system prompt" else "▼ system prompt") }
+        TextButton(onClick = vm::clearChat) { Text("🗑", fontSize = 16.sp) }
     }
     if (st.systemExpanded) {
-        SelectionContainer {
-            Text(
-                st.systemPrompt.ifBlank { "(память пуста, только base prompt)" },
-                fontSize = 11.sp, color = Color.Gray,
-                modifier = Modifier.fillMaxWidth().background(Color(0xFFF5F5F5)).padding(8.dp)
-            )
+        // Развёрнутый промпт: максимум пол окна, внутри скролл
+        BoxWithConstraints(Modifier.fillMaxWidth()) {
+            val half = maxHeight / 2
+            Box(
+                Modifier.fillMaxWidth()
+                    .heightIn(max = half)
+                    .verticalScroll(rememberScrollState())
+                    .background(Color(0xFFF5F5F5)).padding(8.dp)
+            ) {
+                SelectionContainer {
+                    Text(
+                        st.systemPrompt.ifBlank { "(память пуста, только base prompt)" },
+                        fontSize = 11.sp, color = Color.Gray,
+                    )
+                }
+            }
         }
         Text("~${st.systemPrompt.length / 4} tok (оценка) · last prompt_tokens=${st.promptTokens}", fontSize = 11.sp, color = Color.Gray)
     }
@@ -296,7 +375,15 @@ fun MessageBubble(vm: AppViewModel, chat: Chat, role: String, text: String) {
     ) {
         Column {
             Text(role, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
-            SelectionContainer { Text(text, fontSize = 14.sp) }
+            SelectionContainer {
+                if (role == "user") {
+                    Text(text, fontSize = 14.sp)
+                } else {
+                    // Реплики LLM — markdown: компактная типографика (дефолт displayLarge ~57sp — огромный).
+                    // modifier fillMaxWidth вместо дефолтного fillMaxSize, иначе пузырь растягивается.
+                    Markdown(text, typography = chatMarkdownTypography(), modifier = Modifier.fillMaxWidth())
+                }
+            }
         }
     }
     // Своё меню строго в позиции курсора (PopupPositionProvider возвращает window-координаты клика)
@@ -333,19 +420,28 @@ fun MemoryPane(vm: AppViewModel, doc: MemoryDoc, content: String) {
         TextButton(onClick = { vm.deleteDoc(doc.id) }) { Text("удалить") } }
     Spacer(Modifier.height(6.dp))
     SelectionContainer {
-        Text(content.ifBlank { "(пусто)" }, fontSize = 13.sp, modifier = Modifier.fillMaxWidth().background(Color(0xFFF9F9F9)).padding(10.dp))
+        if (content.isBlank()) {
+            Text("(пусто)", fontSize = 13.sp, modifier = Modifier.fillMaxWidth().background(Color(0xFFF9F9F9)).padding(10.dp))
+        } else {
+            // MemoryDoc — .md файлы: рендерим markdown той же компактной типографикой, что и реплики
+            Markdown(
+                content,
+                typography = chatMarkdownTypography(),
+                modifier = Modifier.fillMaxWidth().background(Color(0xFFF9F9F9)).padding(10.dp)
+            )
+        }
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun CreateDialog(vm: AppViewModel) {
     val st by vm.state.collectAsState()
-    var kindExpanded by remember { mutableStateOf(false) }
-    var parentExpanded by remember { mutableStateOf(false) }
     val needParent = st.createKind == CreateKind.PROJECT_CHAT || st.createKind == CreateKind.TASK || st.createKind == CreateKind.TASK_CHAT
+    val canConfirm = st.createName.isNotBlank() && (!needParent || st.createParentId != null)
     val parentOptions: List<Pair<String, String>> = when (st.createKind) {
         CreateKind.PROJECT_CHAT, CreateKind.TASK -> st.projects.map { it.id to "📁 ${it.name}" }
-        CreateKind.TASK_CHAT -> st.tasks.map { it.id to "📁 ${st.projects.firstOrNull { p -> p.id == it.projectId }?.name ?: "?"} / ${it.name}" }
+        CreateKind.TASK_CHAT -> st.tasks.map { it.id to "📋 ${st.projects.firstOrNull { p -> p.id == it.projectId }?.name ?: "?"} / ${it.name}" }
         else -> emptyList()
     }
     AlertDialog(
@@ -353,26 +449,49 @@ fun CreateDialog(vm: AppViewModel) {
         title = { Text("Создать") },
         text = {
             Column {
-                // тип
-                Box {
-                    OutlinedButton(onClick = { kindExpanded = true }) { Text(st.createKind.title) }
-                    DropdownMenu(kindExpanded, onDismissRequest = { kindExpanded = false }) {
-                        CreateKind.entries.forEach { k ->
-                            DropdownMenuItem(text = { Text(k.title) }, onClick = { vm.setCreateKind(k); kindExpanded = false })
-                        }
+                // Тип сущности — одиночный выбор чипами: клик сразу переключает (setCreateKind сбрасывает parent)
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    CreateKind.entries.forEach { k ->
+                        FilterChip(
+                            selected = st.createKind == k,
+                            onClick = { vm.setCreateKind(k) },
+                            label = { Text(k.title) },
+                        )
                     }
                 }
                 Spacer(Modifier.height(8.dp))
-                OutlinedTextField(value = st.createName, onValueChange = vm::setCreateName, label = { Text("Имя") })
+                OutlinedTextField(
+                    value = st.createName,
+                    onValueChange = vm::setCreateName,
+                    label = { Text("Имя") },
+                    singleLine = true,
+                    modifier = Modifier.onPreviewKeyEvent { event ->
+                        if (event.key == Key.Enter || event.key == Key.NumPadEnter) {
+                            if (event.type == KeyEventType.KeyDown && canConfirm) vm.commitCreate()
+                            true
+                        } else false
+                    },
+                )
                 if (needParent) {
                     Spacer(Modifier.height(8.dp))
-                    Box {
-                        OutlinedButton(onClick = { parentExpanded = true }) {
-                            Text(parentOptions.firstOrNull { it.first == st.createParentId }?.second ?: "Выбери родителя")
-                        }
-                        DropdownMenu(parentExpanded, onDismissRequest = { parentExpanded = false }) {
+                    Text("Родитель:", fontSize = 12.sp, color = Color.Gray)
+                    Spacer(Modifier.height(4.dp))
+                    if (parentOptions.isEmpty()) {
+                        Text("Нет доступных родителей — сначала создай проект/задачу", fontSize = 12.sp, color = Color.Gray)
+                    } else {
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        ) {
                             parentOptions.forEach { (id, label) ->
-                                DropdownMenuItem(text = { Text(label) }, onClick = { vm.setCreateParent(id); parentExpanded = false })
+                                FilterChip(
+                                    selected = st.createParentId == id,
+                                    onClick = { vm.setCreateParent(id) },
+                                    label = { Text(label) },
+                                )
                             }
                         }
                     }
@@ -382,7 +501,7 @@ fun CreateDialog(vm: AppViewModel) {
         confirmButton = {
             Button(
                 onClick = vm::commitCreate,
-                enabled = st.createName.isNotBlank() && (!needParent || st.createParentId != null)
+                enabled = canConfirm
             ) { Text("Создать") }
         },
         dismissButton = { TextButton(onClick = vm::closeCreate) { Text("Отмена") } },

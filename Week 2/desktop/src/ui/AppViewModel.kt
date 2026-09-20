@@ -58,6 +58,9 @@ data class UiState(
     val createName: String = "",
     val createParentId: String? = null,
     val saveDialog: SaveDialog? = null,
+    // развернутость узлов дерева (по умолчанию всё свернуто)
+    val expandedProjects: Set<String> = emptySet(),
+    val expandedTasks: Set<String> = emptySet(),
 )
 
 class AppViewModel(
@@ -87,11 +90,52 @@ class AppViewModel(
         }
     }
 
-    fun select(sel: Selection) = refresh(sel)
+    fun select(sel: Selection) {
+        // авто-раскрытие предков, чтобы выбранный узел не остался в свернутой ветке
+        // (general-узлы лежат в корне, раскрывать для них нечего)
+        _state.update { cur ->
+            var projects = cur.expandedProjects
+            var tasks = cur.expandedTasks
+            when (sel) {
+                is Selection.ChatSel -> {
+                    val chat = cur.chats.firstOrNull { it.id == sel.chatId }
+                    when (chat?.scope) {
+                        Scope.PROJECT -> chat.parentId?.let { projects += it }
+                        Scope.TASK -> {
+                            chat.parentId?.let { tasks += it }
+                            cur.tasks.firstOrNull { t -> t.id == chat.parentId }?.let { projects += it.projectId }
+                        }
+                        else -> Unit
+                    }
+                }
+                is Selection.DocSel -> {
+                    val doc = cur.docs.firstOrNull { it.id == sel.docId }
+                    when (doc?.scope) {
+                        Scope.PROJECT -> doc.parentId?.let { projects += it }
+                        Scope.TASK -> {
+                            doc.parentId?.let { tasks += it }
+                            cur.tasks.firstOrNull { t -> t.id == doc.parentId }?.let { projects += it.projectId }
+                        }
+                        else -> Unit
+                    }
+                }
+            }
+            cur.copy(expandedProjects = projects, expandedTasks = tasks)
+        }
+        refresh(sel)
+    }
 
     fun onInput(v: String) = _state.update { it.copy(input = v) }
 
     fun toggleSystem() = _state.update { it.copy(systemExpanded = !it.systemExpanded) }
+
+    fun toggleProject(id: String) = _state.update {
+        it.copy(expandedProjects = if (id in it.expandedProjects) it.expandedProjects - id else it.expandedProjects + id)
+    }
+
+    fun toggleTask(id: String) = _state.update {
+        it.copy(expandedTasks = if (id in it.expandedTasks) it.expandedTasks - id else it.expandedTasks + id)
+    }
 
     fun send() {
         val st = _state.value
@@ -131,13 +175,16 @@ class AppViewModel(
     fun openCreate() = _state.update { it.copy(showCreate = true, createName = "", createParentId = null) }
     fun closeCreate() = _state.update { it.copy(showCreate = false) }
     fun setCreateKind(k: CreateKind) = _state.update { it.copy(createKind = k, createParentId = null) }
-    fun setCreateName(v: String) = _state.update { it.copy(createName = v) }
+    fun setCreateName(v: String) = _state.update { it.copy(createName = v.take(30)) }
     fun setCreateParent(id: String?) = _state.update { it.copy(createParentId = id) }
 
     fun commitCreate() {
         val st = _state.value
         val name = st.createName.trim().ifBlank { "untitled" }
         var sel: Selection? = st.selection
+        // какие узлы раскрыть после создания, чтобы новый чат/проект был виден
+        var expandProjects: Set<String> = emptySet()
+        var expandTasks: Set<String> = emptySet()
         when (st.createKind) {
             CreateKind.GENERAL_CHAT -> {
                 val c = service.createChat(name, Scope.GENERAL, null)
@@ -145,28 +192,36 @@ class AppViewModel(
             }
             CreateKind.PROJECT -> {
                 val p = service.createProject(name)
-                // сразу чат в проекте для удобства
-                val c = service.createChat("$name chat 1", Scope.PROJECT, p.id)
-                sel = Selection.ChatSel(c.id)
+                // только папка: без стартовых доков и чата
+                expandProjects = setOf(p.id)
             }
             CreateKind.PROJECT_CHAT -> {
                 val pid = st.createParentId ?: return
                 val c = service.createChat(name, Scope.PROJECT, pid)
                 sel = Selection.ChatSel(c.id)
+                expandProjects = setOf(pid)
             }
             CreateKind.TASK -> {
                 val pid = st.createParentId ?: return
                 val t = service.createTask(pid, name)
-                val c = service.createChat("$name chat 1", Scope.TASK, t.id)
-                sel = Selection.ChatSel(c.id)
+                // только папка: без стартового дока и чата
+                expandProjects = setOf(pid)
+                expandTasks = setOf(t.id)
             }
             CreateKind.TASK_CHAT -> {
                 val tid = st.createParentId ?: return
                 val c = service.createChat(name, Scope.TASK, tid)
                 sel = Selection.ChatSel(c.id)
+                expandTasks = setOf(tid)
             }
         }
-        _state.update { it.copy(showCreate = false) }
+        _state.update {
+            it.copy(
+                showCreate = false,
+                expandedProjects = it.expandedProjects + expandProjects,
+                expandedTasks = it.expandedTasks + expandTasks,
+            )
+        }
         refresh(sel)
     }
 
