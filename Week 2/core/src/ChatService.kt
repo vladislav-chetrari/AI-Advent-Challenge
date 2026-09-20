@@ -10,6 +10,7 @@ import core.domain.Project
 import core.domain.PromptBuilder
 import core.domain.Scope
 import core.domain.Task
+import core.domain.UserProfile
 import core.domain.newId
 import core.domain.parseDistillJson
 import core.network.ApiKeyProvider
@@ -107,7 +108,54 @@ class ChatService(
 
     fun buildSystemPrompt(chat: Chat): String {
         val docs = relevantDocs(chat).map { it.title to store.readDocContent(it) }
-        return PromptBuilder.buildSystemPrompt(docs)
+        return PromptBuilder.buildSystemPrompt(docs, activeProfile())
+    }
+
+    // --- профили (День 12): null = Аноним, в промпт ничего не инжектится ---
+
+    fun activeProfile(): UserProfile? {
+        val id = store.state.activeProfileId ?: return null
+        return store.state.profiles.firstOrNull { it.id == id }
+    }
+
+    fun createProfile(name: String, style: String, format: String, constraints: String): UserProfile {
+        val p = UserProfile(
+            id = newId(),
+            name = name.trim().take(60).ifBlank { "пользователь" },
+            style = style.trim().take(500),
+            format = format.trim().take(500),
+            constraints = constraints.trim().take(500),
+        )
+        store.update { it.copy(profiles = it.profiles + p, activeProfileId = p.id) }
+        return p
+    }
+
+    fun updateProfile(id: String, name: String, style: String, format: String, constraints: String) {
+        store.update { s ->
+            s.copy(profiles = s.profiles.map {
+                if (it.id == id) it.copy(
+                    name = name.trim().take(60).ifBlank { it.name },
+                    style = style.trim().take(500),
+                    format = format.trim().take(500),
+                    constraints = constraints.trim().take(500),
+                ) else it
+            })
+        }
+    }
+
+    fun deleteProfile(id: String) {
+        store.update { s ->
+            s.copy(
+                profiles = s.profiles.filterNot { it.id == id },
+                activeProfileId = if (s.activeProfileId == id) null else s.activeProfileId,
+            )
+        }
+    }
+
+    fun setActiveProfile(id: String?) {
+        // null = Аноним; чужой id игнорируем, чтобы не зависнуть на битой ссылке
+        val clean = if (id != null && store.state.profiles.none { it.id == id }) null else id
+        store.update { it.copy(activeProfileId = clean) }
     }
 
     fun clearChat(chatId: String) {

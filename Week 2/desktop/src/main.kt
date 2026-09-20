@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.IntrinsicSize
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -17,11 +18,13 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -160,6 +163,26 @@ fun Root() {
                     }
                 }
             }
+            Spacer(Modifier.height(8.dp))
+            // Низ древа: круглая кнопка профиля (Аноним по умолчанию, без инжекта в промпт)
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                val active = st.profiles.firstOrNull { it.id == st.activeProfileId }
+                val label = active?.name?.trim()?.firstOrNull()?.uppercase() ?: "?"
+                Button(
+                    onClick = vm::openProfile,
+                    shape = CircleShape,
+                    modifier = Modifier.size(44.dp),
+                    contentPadding = PaddingValues(0.dp),
+                ) { Text(label, fontSize = 18.sp, fontWeight = FontWeight.Bold) }
+                Spacer(Modifier.width(8.dp))
+                Column(Modifier.weight(1f)) {
+                    Text(active?.name ?: "Аноним", color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+                    Text(
+                        if (active == null) "без персонализации" else "профиль инжектится",
+                        color = Color(0xFF888888), fontSize = 11.sp, maxLines = 1,
+                    )
+                }
+            }
         }
         // Справа: чат или память
         Column(Modifier.weight(1f).fillMaxHeight().padding(12.dp)) {
@@ -183,6 +206,7 @@ fun Root() {
 
     if (st.showCreate) CreateDialog(vm)
     st.saveDialog?.let { SaveDialogView(vm) }
+    st.profileDialog?.let { ProfileDialogView(vm) }
 }
 
 @Composable
@@ -600,5 +624,68 @@ fun SaveDialogView(vm: AppViewModel) {
             ) { Text("Сохранить") }
         },
         dismissButton = { TextButton(onClick = vm::closeSave) { Text("Отмена") } },
+    )
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+fun ProfileDialogView(vm: AppViewModel) {
+    val st by vm.state.collectAsState()
+    val d = st.profileDialog ?: return
+    AlertDialog(
+        onDismissRequest = vm::closeProfile,
+        title = { Text("Профиль") },
+        text = {
+            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState())) {
+                Text("Выбор пользователя (клик сразу переключает):", fontSize = 12.sp, color = Color.Gray)
+                Spacer(Modifier.height(4.dp))
+                FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    FilterChip(
+                        selected = d.selectedId == null,
+                        onClick = { vm.setProfileSelected(null) },
+                        label = { Text("Аноним") },
+                    )
+                    st.profiles.forEach { p ->
+                        FilterChip(
+                            selected = d.selectedId == p.id,
+                            onClick = { vm.setProfileSelected(p.id) },
+                            label = { Text(p.name) },
+                        )
+                    }
+                }
+                if (d.selectedId == null) {
+                    Spacer(Modifier.height(4.dp))
+                    Text("Аноним: в system prompt ничего не добавляется.", fontSize = 12.sp, color = Color.Gray)
+                }
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = d.name, onValueChange = vm::setProfileName,
+                    label = { Text("Имя") }, singleLine = true, modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = d.style, onValueChange = vm::setProfileStyle,
+                    label = { Text("Стиль (напр. кратко, по-русски)") }, modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = d.format, onValueChange = vm::setProfileFormat,
+                    label = { Text("Формат (напр. списки, примеры кода)") }, modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(
+                    value = d.constraints, onValueChange = vm::setProfileConstraints,
+                    label = { Text("Ограничения (напр. без кода без просьбы)") }, modifier = Modifier.fillMaxWidth(),
+                )
+                Spacer(Modifier.height(8.dp))
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = vm::createProfile, enabled = d.name.isNotBlank()) { Text("Создать") }
+                    OutlinedButton(onClick = vm::saveProfile, enabled = d.selectedId != null) { Text("Сохранить") }
+                    OutlinedButton(onClick = vm::deleteProfile, enabled = d.selectedId != null) { Text("Удалить") }
+                }
+            }
+        },
+        confirmButton = { Button(onClick = vm::closeProfile) { Text("Готово") } },
+        dismissButton = {},
     )
 }

@@ -43,11 +43,31 @@ object PromptBuilder {
 
     fun estimateTokens(text: String): Int = (text.length / 4).coerceAtLeast(1)
 
+    // Блок профиля. null (Аноним) или все поля пустые = нет блока, промпт не меняется.
+    fun profileBlock(p: core.domain.UserProfile?): String? {
+        if (p == null) return null
+        val style = p.style.trim()
+        val format = p.format.trim()
+        val limits = p.constraints.trim()
+        if (style.isBlank() && format.isBlank() && limits.isBlank()) return null
+        return buildString {
+            append("[Профиль: ").append(p.name.trim().ifBlank { "пользователь" }).append("]\n")
+            if (style.isNotBlank()) append("Стиль: ").append(style.take(500)).append("\n")
+            if (format.isNotBlank()) append("Формат: ").append(format.take(500)).append("\n")
+            if (limits.isNotBlank()) append("Ограничения: ").append(limits.take(500))
+        }.trimEnd()
+    }
+
     // docs: уже отфильтрованные active доки релевантных scope в порядке general->project->task
-    fun buildSystemPrompt(docs: List<Pair<String, String>>): String {
-        if (docs.isEmpty()) return BASE
+    fun buildSystemPrompt(
+        docs: List<Pair<String, String>>,
+        profile: core.domain.UserProfile? = null,
+    ): String {
+        val block = profileBlock(profile)
+        if (docs.isEmpty() && block == null) return BASE
         return buildString {
             append(BASE)
+            if (block != null) append("\n\n").append(block)
             for ((title, content) in docs) {
                 val capped = content.take(PER_SCOPE_CAP_CHARS)
                 if (capped.isBlank()) continue

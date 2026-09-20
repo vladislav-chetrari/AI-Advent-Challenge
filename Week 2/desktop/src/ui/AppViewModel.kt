@@ -7,6 +7,7 @@ import core.domain.MemoryDoc
 import core.domain.Project
 import core.domain.Scope
 import core.domain.Task
+import core.domain.UserProfile
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -39,6 +40,15 @@ data class SaveDialog(
     val useNewDoc: Boolean = false,
 )
 
+// Диалог профиля: выбор (null = Аноним) + создание/правка характеристик.
+data class ProfileDialog(
+    val selectedId: String? = null,
+    val name: String = "",
+    val style: String = "",
+    val format: String = "",
+    val constraints: String = "",
+)
+
 data class UiState(
     val projects: List<Project> = emptyList(),
     val tasks: List<Task> = emptyList(),
@@ -58,6 +68,9 @@ data class UiState(
     val createName: String = "",
     val createParentId: String? = null,
     val saveDialog: SaveDialog? = null,
+    val profiles: List<UserProfile> = emptyList(),
+    val activeProfileId: String? = null,
+    val profileDialog: ProfileDialog? = null,
     // развернутость узлов дерева (по умолчанию всё свернуто)
     val expandedProjects: Set<String> = emptySet(),
     val expandedTasks: Set<String> = emptySet(),
@@ -75,7 +88,7 @@ class AppViewModel(
     fun refresh(sel: Selection? = _state.value.selection) {
         val s = service.state()
         val contents = s.memoryDocs.associate { it.id to service.docContent(it) }
-        // system prompt для выбранного чата
+        // system prompt для выбранного чата (уже с активным профилем, null = Аноним)
         var sys = ""
         val selChat = (sel as? Selection.ChatSel)?.chatId?.let { id -> s.chats.firstOrNull { it.id == id } }
         if (selChat != null) sys = service.buildSystemPrompt(selChat)
@@ -84,6 +97,7 @@ class AppViewModel(
                 projects = s.projects, tasks = s.tasks, chats = s.chats,
                 docs = s.memoryDocs, docContents = contents,
                 messages = s.messages,
+                profiles = s.profiles, activeProfileId = s.activeProfileId,
                 selection = sel ?: selChat?.let { c -> Selection.ChatSel(c.id) },
                 systemPrompt = sys.ifBlank { it.systemPrompt },
             )
@@ -305,4 +319,69 @@ class AppViewModel(
 
     fun messagesOf(chatId: String): List<ChatMessage> =
         service.state().messages[chatId].orEmpty()
+
+    // --- диалог профиля: Аноним (null) + выбор/создание/правка ---
+
+    fun openProfile() {
+        val s = service.state()
+        val active = s.profiles.firstOrNull { it.id == s.activeProfileId }
+        _state.update {
+            it.copy(
+                profileDialog = ProfileDialog(
+                    selectedId = s.activeProfileId,
+                    name = active?.name.orEmpty(),
+                    style = active?.style.orEmpty(),
+                    format = active?.format.orEmpty(),
+                    constraints = active?.constraints.orEmpty(),
+                )
+            )
+        }
+    }
+
+    fun closeProfile() = _state.update { it.copy(profileDialog = null) }
+
+    fun setProfileSelected(id: String?) {
+        val p = service.state().profiles.firstOrNull { it.id == id }
+        service.setActiveProfile(id)
+        _state.update {
+            it.copy(
+                profileDialog = it.profileDialog?.copy(
+                    selectedId = id,
+                    name = p?.name.orEmpty(),
+                    style = p?.style.orEmpty(),
+                    format = p?.format.orEmpty(),
+                    constraints = p?.constraints.orEmpty(),
+                )
+            )
+        }
+        refresh()
+    }
+
+    fun setProfileName(v: String) = _state.update { it.copy(profileDialog = it.profileDialog?.copy(name = v.take(60))) }
+    fun setProfileStyle(v: String) = _state.update { it.copy(profileDialog = it.profileDialog?.copy(style = v.take(500))) }
+    fun setProfileFormat(v: String) = _state.update { it.copy(profileDialog = it.profileDialog?.copy(format = v.take(500))) }
+    fun setProfileConstraints(v: String) = _state.update { it.copy(profileDialog = it.profileDialog?.copy(constraints = v.take(500))) }
+
+    fun createProfile() {
+        val d = _state.value.profileDialog ?: return
+        if (d.name.isBlank()) return
+        val p = service.createProfile(d.name, d.style, d.format, d.constraints)
+        _state.update { it.copy(profileDialog = d.copy(selectedId = p.id)) }
+        refresh()
+    }
+
+    fun saveProfile() {
+        val d = _state.value.profileDialog ?: return
+        val id = d.selectedId ?: return
+        service.updateProfile(id, d.name, d.style, d.format, d.constraints)
+        refresh()
+    }
+
+    fun deleteProfile() {
+        val d = _state.value.profileDialog ?: return
+        val id = d.selectedId ?: return
+        service.deleteProfile(id)
+        _state.update { it.copy(profileDialog = ProfileDialog()) }
+        refresh()
+    }
 }

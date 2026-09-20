@@ -39,6 +39,17 @@ data class ChatMessage(
     val content: String,
 )
 
+// Профиль пользователя (День 12). null activeProfileId = Аноним (по умолчанию),
+// в промпт ничего не инжектится.
+@Serializable
+data class UserProfile(
+    val id: String,
+    val name: String,
+    val style: String = "",
+    val format: String = "",
+    val constraints: String = "",
+)
+
 @Serializable
 data class AppState(
     val projects: List<Project> = emptyList(),
@@ -47,6 +58,9 @@ data class AppState(
     // chatId -> сообщения (без system, только живые)
     val messages: Map<String, List<ChatMessage>> = emptyMap(),
     val memoryDocs: List<MemoryDoc> = emptyList(),
+    val profiles: List<UserProfile> = emptyList(),
+    // null = Аноним: профиль не инжектится в system prompt
+    val activeProfileId: String? = null,
 )
 
 fun newId(): String = java.util.UUID.randomUUID().toString().take(8)
