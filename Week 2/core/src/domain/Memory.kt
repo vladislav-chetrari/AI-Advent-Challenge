@@ -11,6 +11,16 @@ const val DISTILL_SYSTEM: String =
         "Skip chit-chat, keep: user profile, decisions, tech stack, goals, constraints, task details. " +
         "No preamble, no markdown, JSON array only."
 
+// Дистилляция ВСЕГО разговора в чистый план (Task 3).
+// На вход — полный транскрипт, на выход — только шаги, без болтовни.
+const val PLAN_DISTILL_SYSTEM: String =
+    "You extract a clean actionable plan from a FULL conversation transcript. " +
+        "Return ONLY a JSON array of strings, e.g. [\"step 1\", \"step 2\", \"step 3\"]. " +
+        "Language of steps: Russian. 3-7 steps, each max 80 chars, imperative, self-contained, " +
+        "no pronouns without antecedent. Merge duplicates, drop chit-chat and questions, " +
+        "keep only: goal, concrete actions, deliverables, validation. Order logically. " +
+        "No preamble, no markdown, JSON array only."
+
 fun parseDistillJson(raw: String): List<String> {
     val t = raw.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
     val start = t.indexOf('[')
@@ -25,6 +35,26 @@ fun parseDistillJson(raw: String): List<String> {
                 ?.trim()?.take(500)?.takeIf { it.isNotBlank() }
             s
         }.take(3).filter { it.isNotBlank() }
+    } catch (_: Exception) {
+        emptyList()
+    }
+}
+
+/** Парсинг дистиллята плана: до 10 шагов, каждый ≤80 симв. */
+fun parsePlanDistillJson(raw: String): List<String> {
+    val t = raw.trim().removePrefix("```json").removePrefix("```").removeSuffix("```").trim()
+    val start = t.indexOf('[')
+    val end = t.lastIndexOf(']')
+    if (start < 0 || end <= start) return emptyList()
+    return try {
+        val json = kotlinx.serialization.json.Json { ignoreUnknownKeys = true; isLenient = true }
+        val arr = json.parseToJsonElement(t.substring(start, end + 1))
+            as? kotlinx.serialization.json.JsonArray ?: return emptyList()
+        arr.mapNotNull { el ->
+            val s = (el as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
+                ?.trim()?.take(80)?.takeIf { it.length >= 3 }
+            s
+        }.take(10).filter { it.isNotBlank() }
     } catch (_: Exception) {
         emptyList()
     }
@@ -58,16 +88,49 @@ object PromptBuilder {
         }.trimEnd()
     }
 
+    // Task 3: блок состояния задачи — инжектится чтобы LLM не повторял пройденное
+    fun taskStateBlock(state: core.domain.TaskState?, taskName: String? = null): String? {
+        if (state == null) return null
+        return buildString {
+            append("[Задача")
+            if (taskName != null) append(": ").append(taskName.take(60)) else append("")
+            append("]\n")
+            append("Этап: ").append(state.stage.name).append(" (").append(state.stage.label).append(")\n")
+            append("Статус: ").append(state.status.name)
+            if (state.status == core.domain.TaskStatus.PAUSED) append(" — на паузе, жди команду 'продолжи'")
+            append("\n")
+            if (state.steps.isNotEmpty()) {
+                append("Шаг: ").append(state.stepIndex + 1).append("/").append(state.steps.size)
+                state.steps.getOrNull(state.stepIndex)?.let { append(" — ").append(it.title.take(80)) }
+                append("\n")
+                // краткий прогресс шагов без повторов
+                val doneTitles = state.steps.filter { it.done }.map { it.title.take(30) }
+                if (doneTitles.isNotEmpty()) append("Пройдено: ").append(doneTitles.joinToString(", ")).append("\n")
+            } else {
+                append("Шаг: ").append(state.stepIndex + 1).append("\n")
+            }
+            append("Ожидаемое действие: ").append(state.nextAction.take(200)).append("\n")
+            if (state.history.isNotEmpty()) {
+                val hist = state.history.takeLast(5).joinToString(" → ") { "${it.from.name}→${it.to.name}" }
+                append("История переходов: ").append(hist)
+            }
+        }.trimEnd()
+    }
+
     // docs: уже отфильтрованные active доки релевантных scope в порядке general->project->task
     fun buildSystemPrompt(
         docs: List<Pair<String, String>>,
         profile: core.domain.UserProfile? = null,
+        taskState: core.domain.TaskState? = null,
+        taskName: String? = null,
     ): String {
         val block = profileBlock(profile)
-        if (docs.isEmpty() && block == null) return BASE
+        val tBlock = taskStateBlock(taskState, taskName)
+        if (docs.isEmpty() && block == null && tBlock == null) return BASE
         return buildString {
             append(BASE)
             if (block != null) append("\n\n").append(block)
+            if (tBlock != null) append("\n\n").append(tBlock)
             for ((title, content) in docs) {
                 val capped = content.take(PER_SCOPE_CAP_CHARS)
                 if (capped.isBlank()) continue

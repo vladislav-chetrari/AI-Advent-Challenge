@@ -7,12 +7,19 @@ import core.domain.MemoryDoc
 import core.domain.Project
 import core.domain.Scope
 import core.domain.Task
+import core.domain.TaskStage
+import core.domain.TaskState
+import core.domain.TaskStatus
 import core.domain.UserProfile
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 sealed interface Selection {
@@ -74,6 +81,8 @@ data class UiState(
     // развернутость узлов дерева (по умолчанию всё свернуто)
     val expandedProjects: Set<String> = emptySet(),
     val expandedTasks: Set<String> = emptySet(),
+    // Task 3: состояние задач
+    val taskStates: Map<String, TaskState> = emptyMap(),
 )
 
 class AppViewModel(
@@ -98,6 +107,7 @@ class AppViewModel(
                 docs = s.memoryDocs, docContents = contents,
                 messages = s.messages,
                 profiles = s.profiles, activeProfileId = s.activeProfileId,
+                taskStates = s.taskStates,
                 selection = sel ?: selChat?.let { c -> Selection.ChatSel(c.id) },
                 systemPrompt = sys.ifBlank { it.systemPrompt },
             )
@@ -382,6 +392,219 @@ class AppViewModel(
         val id = d.selectedId ?: return
         service.deleteProfile(id)
         _state.update { it.copy(profileDialog = ProfileDialog()) }
+        refresh()
+    }
+
+    // --- Task State Machine (Task 3) + автоплан + авто-EXECUTION ---
+
+    private var autoJob: Job? = null
+
+    /** Чат для автозапуска: текущий выбранный TASK-чат этой задачи, иначе первый чат задачи. */
+    private fun resolveTaskChat(taskId: String): Chat? {
+        val sel = _state.value.selection as? Selection.ChatSel
+        val selChat = sel?.chatId?.let { id -> service.state().chats.firstOrNull { it.id == id } }
+        if (selChat != null && selChat.scope == Scope.TASK && selChat.parentId == taskId) return selChat
+        return service.findTaskChat(taskId)
+    }
+
+    fun advanceTask(taskId: String) {
+        val stageBefore = service.getTaskState(taskId)?.stage
+        val chat = resolveTaskChat(taskId)
+        // planning → execution: дистиллировать ВЕСЬ разговор в чистый план через API,
+        // выложить в отдельный документ «план», затем запустить АВТО-цикл по всем шагам.
+        if (stageBefore == TaskStage.PLANNING && chat != null) {
+            if (_state.value.busy) return
+            autoJob?.cancel()
+            _state.update { it.copy(busy = true, status = null) }
+            refresh(Selection.ChatSel(chat.id))
+            autoJob = scope.launch {
+                try {
+                    service.finalizePlanAndAdvance(taskId, chat.id)
+                } catch (e: Exception) {
+                    service.advanceTask(taskId, reason = "fallback: ${e.message?.take(100)}")
+                }
+                refresh(Selection.ChatSel(chat.id))
+                val stageAfter = service.getTaskState(taskId)?.stage
+                if (stageAfter == TaskStage.EXECUTION) {
+                    // не сбрасываем busy — startAutoExecution продолжит с тем же индикатором
+                    startAutoExecutionLocked(taskId, chat.id)
+                } else {
+                    _state.update { it.copy(busy = false) }
+                    refresh()
+                }
+            }
+            return
+        }
+        // EXECUTION → VALIDATION вручную (если авто-цикл уже всё сделал — просто переход;
+        // если остались шаги — переход всё равно разрешён, остаток сгорит)
+        if (stageBefore == TaskStage.EXECUTION) {
+            autoJob?.cancel()
+            service.advanceTask(taskId)
+            _state.update { it.copy(busy = false, status = null) }
+            refresh()
+            return
+        }
+        // остальные переходы — синхронно без дистилляции (VALIDATION → DONE = подтверждение юзера)
+        autoJob?.cancel()
+        service.advanceTask(taskId)
+        _state.update { it.copy(busy = false) }
+        refresh()
+    }
+
+    /**
+     * Авто-цикл EXECUTION: шаг за шагом через API, выдаёт код.
+     * Пауза (status=PAUSED или cancel job) останавливает цикл на НЕвыполненном шаге:
+     * in-flight шаг не помечается done, resume продолжит с него же.
+     * После последнего шага — автопереход в VALIDATION и ожидание подтверждения юзера.
+     */
+    private suspend fun startAutoExecutionLocked(taskId: String, chatId: String) {
+        val chat = service.state().chats.firstOrNull { it.id == chatId } ?: run {
+            _state.update { it.copy(busy = false) }
+            return
+        }
+        while (currentCoroutineContext().isActive) {
+            val ts = service.getTaskState(taskId) ?: break
+            if (ts.stage != TaskStage.EXECUTION) break
+            if (ts.status != TaskStatus.ACTIVE) break // пауза — стоим на невыполненном шаге
+            if (ts.stepIndex >= ts.steps.size) break
+            if (ts.steps.isEmpty()) break
+            val r: core.AskResult = try {
+                service.autoExecuteCurrentStep(chat)
+            } catch (e: CancellationException) {
+                // Пауза во время запроса: in-flight шаг НЕ помечаем done, стоим на нём
+                _state.update { it.copy(busy = false) }
+                refresh(Selection.ChatSel(chatId))
+                throw e
+            }
+            when (r) {
+                is core.AskResult.Success -> {
+                    refresh(Selection.ChatSel(chatId))
+                    _state.update {
+                        it.copy(promptTokens = r.promptTokens,
+                            systemPrompt = service.buildSystemPrompt(chat))
+                    }
+                    // После ответа проверить паузу ДО пометки done:
+                    // если юзер нажал паузу во время запроса — шаг остаётся невыполненным
+                    val after = service.getTaskState(taskId) ?: break
+                    if (after.status != TaskStatus.ACTIVE || after.stage != TaskStage.EXECUTION) break
+                    if (!currentCoroutineContext().isActive) break
+                    val isLast = after.stepIndex >= after.steps.size - 1
+                    if (isLast) {
+                        service.completeCurrentStep(taskId)
+                        refresh(Selection.ChatSel(chatId))
+                        // Все шаги готовы → автопереход в VALIDATION, дальше ждём юзера
+                        service.advanceTask(taskId, reason = "auto: all steps done")
+                        _state.update { it.copy(busy = false, status = null) }
+                        refresh(Selection.ChatSel(chatId))
+                        break
+                    } else {
+                        service.nextStep(taskId) // помечает текущий done + двигает индекс
+                        refresh(Selection.ChatSel(chatId))
+                        // цикл продолжится со следующим шагом
+                    }
+                }
+                is core.AskResult.Failure -> {
+                    refresh(Selection.ChatSel(chatId))
+                    // «на паузе» — не ошибка, просто стоим на текущем шаге
+                    if (r.message.contains("пауз")) {
+                        _state.update { it.copy(busy = false, status = null) }
+                    } else {
+                        _state.update { it.copy(busy = false, status = r.message) }
+                    }
+                    break
+                }
+            }
+        }
+        // страховка: если вышли не в VALIDATION/DONE — снять busy
+        val end = service.getTaskState(taskId)
+        if (end?.stage == TaskStage.EXECUTION && end.status == TaskStatus.ACTIVE) {
+            // цикл прерван отменой job (пауза уже выставит свой статус) — ничего
+        }
+        refresh()
+    }
+
+    /** Старт/рестарт авто-цикла с текущего (невыполненного) шага. Используется resume. */
+    private fun startAutoExecution(taskId: String, chatId: String) {
+        if (_state.value.busy) return
+        autoJob?.cancel()
+        _state.update { it.copy(busy = true, status = null) }
+        refresh(Selection.ChatSel(chatId))
+        autoJob = scope.launch { startAutoExecutionLocked(taskId, chatId) }
+    }
+
+    /** Legacy одиночный прогон одного шага (оставлен для ручного режима, авто-цикл выше — основной). */
+    private fun autoRunStep(taskId: String, chatId: String) {
+        val chat = service.state().chats.firstOrNull { it.id == chatId } ?: return
+        if (_state.value.busy) return
+        _state.update { it.copy(busy = true, status = null) }
+        refresh(Selection.ChatSel(chatId))
+        scope.launch {
+            when (val r = service.autoExecuteCurrentStep(chat)) {
+                is core.AskResult.Success -> {
+                    refresh(Selection.ChatSel(chatId))
+                    _state.update {
+                        it.copy(busy = false, promptTokens = r.promptTokens,
+                            systemPrompt = service.buildSystemPrompt(chat))
+                    }
+                }
+                is core.AskResult.Failure -> {
+                    refresh(Selection.ChatSel(chatId))
+                    _state.update { it.copy(busy = false, status = r.message) }
+                }
+            }
+        }
+    }
+
+    /** Ручной шаг (не авто): оставлен для PLANNING, в EXECUTION авто-цикл — основной. */
+    fun nextStepAndRun(taskId: String) {
+        val chat = resolveTaskChat(taskId) ?: run { nextStep(taskId); return }
+        // В EXECUTION одиночный шаг не нужен — есть авто-цикл; но для совместимости прогнать один
+        autoRunStep(taskId, chat.id)
+    }
+
+    fun setTaskStage(taskId: String, stage: TaskStage) {
+        service.setTaskStage(taskId, stage)
+        refresh()
+    }
+
+    fun pauseTask(taskId: String) {
+        // Остановить авто-цикл ПЕРВЫМ, затем статус PAUSED — цикл встанет на невыполненном шаге
+        autoJob?.cancel()
+        autoJob = null
+        service.pauseTask(taskId)
+        _state.update { it.copy(busy = false) }
+        refresh()
+    }
+
+    fun resumeTask(taskId: String) {
+        service.resumeTask(taskId)
+        refresh()
+        // В EXECUTION resume = продолжить авто с текущего невыполненного шага
+        val ts = service.getTaskState(taskId)
+        if (ts?.stage == TaskStage.EXECUTION && ts.status == TaskStatus.ACTIVE) {
+            val chat = resolveTaskChat(taskId) ?: return
+            startAutoExecution(taskId, chat.id)
+        }
+        // В VALIDATION resume ничего не запускает — ждём подтверждения юзера
+    }
+
+    fun nextStep(taskId: String) {
+        service.nextStep(taskId)
+        refresh()
+    }
+
+    fun prevStep(taskId: String) {
+        service.prevStep(taskId)
+        refresh()
+    }
+
+    fun completeStep(taskId: String) {
+        service.completeCurrentStep(taskId)
+        refresh()
+    }
+
+    fun updateNextAction(taskId: String, action: String) {
+        service.updateNextAction(taskId, action)
         refresh()
     }
 }

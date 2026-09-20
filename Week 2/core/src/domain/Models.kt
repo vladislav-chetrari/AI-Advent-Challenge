@@ -61,6 +61,8 @@ data class AppState(
     val profiles: List<UserProfile> = emptyList(),
     // null = Аноним: профиль не инжектится в system prompt
     val activeProfileId: String? = null,
+    // Task 3: FSM состояние задач
+    val taskStates: Map<String, TaskState> = emptyMap(),
 )
 
 fun newId(): String = java.util.UUID.randomUUID().toString().take(8)
