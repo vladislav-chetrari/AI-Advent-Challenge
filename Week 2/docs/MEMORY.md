@@ -4,41 +4,47 @@
 
 | Требование | Слой | Сущность | Хранение | Код |
 |---|---|---|---|---|
-| День 11: краткосрочная (текущий диалог) | Краткосрочная | `messages: Map<chatId, List<ChatMessage>>` — живая история чата, режется окном `N=12` | `state.json` | `core/src/domain/Models.kt:54`, `core/src/data/Store.kt` |
+| День 11: краткосрочная (текущий диалог) | Краткосрочная | `messages: Map<chatId, List<ChatMessage>>` — живая история чата, режется окном `N=12` | `state.json` | `core/src/domain/Models.kt:86`, `core/src/data/Store.kt` |
 | День 11: рабочая (данные текущей задачи) | Рабочая | `MemoryDoc(scope=PROJECT, parentId=projectId)` и `MemoryDoc(scope=TASK, parentId=taskId)` | `memory/<docId>.md` | `core/src/domain/Models.kt:28` |
-| День 11: долговременная (профиль, решения, знания) | Долговременная | `MemoryDoc(scope=GENERAL)` — общие знания, решения | `memory/<docId>.md` | `core/src/domain/Models.kt:28` |
-| День 12: персонализация | Персонализация | `UserProfile(name, style, format, constraints)` + `activeProfileId` (null = Аноним) | `state.json` | `core/src/domain/Models.kt:45` |
+| День 11: долговременная (профиль, решения, знания) | Долговременная | `MemoryDoc(scope=GENERAL)` — общие знания, решения; док `план` (scope=TASK, title=`план`) — зафиксированный план задачи | `memory/<docId>.md` | `core/src/domain/Models.kt:28`, `core/src/ChatService.kt:352` |
+| День 12: персонализация | Персонализация | `UserProfile(name, style, format, constraints)` + `activeProfileId` (null = Аноним) | `state.json` | `core/src/domain/Models.kt:77` |
+| День 13: состояние задачи | Состояние (FSM) | `TaskState(stage, status, stepIndex, steps, nextAction, history, lastValidation)` per-task | `state.json` (`taskStates`) | `core/src/domain/TaskState.kt:35` |
+| День 14: инварианты | Ограничения | `InvariantDoc(scope, parentId, active)` — правила, которые нельзя нарушать | `invariants/<docId>.md` (+ метаданные в `state.json`) | `core/src/domain/Models.kt:39` |
 
 ## Правила
 
 1. **Память принадлежит scope, чат только читает/пишет.** Два чата одной задачи
-   (`task_x_chat_1/2`) делят один `task`-док — дублей нет (`core/src/ChatService.kt:84`).
-2. **Task всегда внутри Project** (`Task.projectId` обязателен, `core/src/domain/Models.kt:15`).
-3. **Наследование при чтении** (`ChatService.relevantDocs`, `core/src/ChatService.kt:84`):
+   (`task_x_chat_1/2`) делят один `task`-док — дублей нет (`core/src/ChatService.kt:136`).
+2. **Task всегда внутри Project** (`Task.projectId` обязателен, `core/src/domain/Models.kt:16`).
+3. **Наследование при чтении** (`ChatService.relevantDocs`, `core/src/ChatService.kt:136`):
    - `GENERAL`-чат → только `GENERAL`-доки;
    - `PROJECT(P)`-чат → `GENERAL` + доки проекта `P`;
    - `TASK(T in P)`-чат → `GENERAL` + доки проекта `P` + доки задачи `T`.
    Порядок инжекта: `GENERAL → PROJECT → TASK`. Только `active=true`, сортировка `scope.ordinal → title`.
-4. **Профили — глобальные**, не привязаны к scope. Один активный на всё приложение (`AppState.activeProfileId`). `null` = Аноним — в промпт ничего не добавляется. Хранятся в `state.json`, а не в `.md`, т.к. это не факты задачи, а предпочтения пользователя (`core/src/ChatService.kt:116`).
-5. **Окно малое by design**: Sliding Window `N=12` (`PromptBuilder.SLIDING_N`, `core/src/domain/Memory.kt:42`),
+4. **Профили — глобальные**, не привязаны к scope. Один активный на всё приложение (`AppState.activeProfileId`). `null` = Аноним — в промпт ничего не добавляется. Хранятся в `state.json`, а не в `.md`, т.к. это не факты задачи, а предпочтения пользователя (`core/src/ChatService.kt:203`).
+5. **Окно малое by design**: Sliding Window `N=12` (`PromptBuilder.SLIDING_N`, `core/src/domain/Memory.kt:116`),
    cap `~800` токенов (`3200` символов) на док (`PromptBuilder.PER_SCOPE_CAP_CHARS`).
    Суммаризации нет — старое молча отбрасывается, важное живёт в фактах / профиле.
+6. **Инварианты принадлежат scope, но GENERAL-чатам не инжектятся** (`relevantInvariants`, `core/src/ChatService.kt:163`): `PROJECT`-чат → инварианты проекта, `TASK(T in P)`-чат → инварианты проекта `P` + задачи `T`. Только `active=true`. Хранятся отдельно от диалога (`invariants/*.md`), правятся текстом напрямую без дистилляции.
+7. **Состояние задачи — отдельно от диалога** (`taskStates` в `state.json`): этап/статус/шаги/`nextAction`/история переходов. Переходы только вперёд `PLANNING→EXECUTION→VALIDATION→DONE` + `canRetry VALIDATION→EXECUTION` + возврат `REPLAN →PLANNING` (`TaskStateMachine`, `core/src/domain/TaskState.kt:77`). Пауза возможна на любом этапе кроме DONE.
 
 ## Сборка system prompt
 
 ```
-BASE ("Ты coding-агент...")                          // core/src/domain/Memory.kt:35
+BASE ("Ты coding-агент...")                          // core/src/domain/Memory.kt:109
 + [Профиль: <name>]\nСтиль: ...\nФормат: ...\nОграничения: ...   // если activeProfile != null и есть непустые поля, PromptBuilder.profileBlock
++ [Задача: <name>]\nЭтап: ...\nСтатус: ...\nШаг: i/N\nОжидаемое действие: ...   // только TASK-чаты, PromptBuilder.taskStateBlock
++ [Инварианты — НЕ НАРУШАТЬ]\n<текст capped 3200>    // если есть релевантные инварианты, PromptBuilder.invariantsBlock
 + [Память: <title>]\n<content capped 3200>            // × N релевантных доков (general → project → task)
-+ последние N сообщений (effectiveHistory: system + tail)        // core/src/domain/Memory.kt:79
++ последние N сообщений (effectiveHistory: system + tail)        // core/src/domain/Memory.kt:202
 ```
 
-Код сборки: `ChatService.buildSystemPrompt` (`core/src/ChatService.kt:109`) → `PromptBuilder.buildSystemPrompt` (`core/src/domain/Memory.kt:62`).
+Код сборки: `ChatService.buildSystemPrompt` (`core/src/ChatService.kt:187`) → `PromptBuilder.buildSystemPrompt` (`core/src/domain/Memory.kt:178`).
 
 Посмотреть собранный промпт: шапка чата → `▼ system prompt` / `▲ system prompt` (оценка `chars/4` +
-`prompt_tokens` прошлого ответа API, `desktop/src/main.kt:291`). Выключение дока чекбоксом в дереве
+`prompt_tokens` прошлого ответа API). Выключение дока чекбоксом в дереве
 или смена профиля в кружке внизу слева сразу меняет следующий system prompt — на этом строятся демо
-«как влияет память» (Task 1) и «как влияет профиль» (Task 2).
+«как влияет память» (Task 1) и «как влияет профиль» (Task 2). Блок `[Задача]` меняется кнопками `TaskStateBar` (Task 3), блок `[Инварианты]` — тумблером `🛡` и текстом `InvariantPane` (Task 4).
 
 ## Save-flow — явное сохранение (требование «вы явно выбираете, что и куда»)
 
