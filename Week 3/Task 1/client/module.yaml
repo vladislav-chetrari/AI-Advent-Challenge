@@ -1,0 +1,13 @@
+product: jvm/app
+
+dependencies:
+  - $libs.kotlin.sdk.client
+  - $libs.kotlinx.coroutines.core
+  - $kotlin.serialization.json
+  - $libs.ktor.client.core
+  - $libs.ktor.client.cio
+  - $libs.slf4j.simple
+
+settings:
+  kotlin:
+    serialization: json
