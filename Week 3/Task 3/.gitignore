@@ -1,0 +1,7 @@
+# Week 3 / Task 2 — Kotlin Toolchain (Amper)
+build/
+*.class
+*.jar
+.DS_Store
+.idea/
+out/
