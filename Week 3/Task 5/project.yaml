@@ -1,0 +1,5 @@
+modules:
+  - archive-server
+  - books-server
+  - press-server
+  - science-server
