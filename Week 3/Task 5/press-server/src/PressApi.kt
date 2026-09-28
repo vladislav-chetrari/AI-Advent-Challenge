@@ -3,10 +3,16 @@ import io.ktor.client.call.body
 import io.ktor.client.engine.cio.CIO
 import io.ktor.client.plugins.HttpTimeout
 import io.ktor.client.plugins.contentnegotiation.ContentNegotiation
+import io.ktor.client.request.accept
 import io.ktor.client.request.get
 import io.ktor.client.request.header
 import io.ktor.client.request.parameter
+import io.ktor.client.statement.bodyAsText
+import io.ktor.http.ContentType
+import io.ktor.http.HttpStatusCode
+import io.ktor.http.isSuccess
 import io.ktor.serialization.kotlinx.json.json
+import kotlinx.coroutines.delay
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -14,6 +20,7 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
+import java.io.IOException
 
 @Serializable
 data class NewsHit(
@@ -39,28 +46,45 @@ class PressApi {
     }
 
     suspend fun searchNews(query: String, maxRecords: Int): NewsResult {
-        val raw: JsonObject = http.get("https://api.gdeltproject.org/api/v2/doc/doc") {
-            parameter("query", query)
-            parameter("mode", "artlist")
-            parameter("maxrecords", maxRecords.coerceIn(1, 100))
-            parameter("format", "json")
-            header("User-Agent", "ai-advent-week3-task5/1.0 (demo)")
-        }.body()
-        val arr = raw["articles"]?.jsonArray ?: return NewsResult()
-        val articles = arr.mapNotNull { el ->
-            val o = el as? JsonObject ?: return@mapNotNull null
-            val title = o["title"]?.jsonPrimitive?.contentOrNull.orEmpty()
-            val url = o["url"]?.jsonPrimitive?.contentOrNull.orEmpty()
-            if (title.isBlank() || url.isBlank()) return@mapNotNull null
-            NewsHit(
-                title = title,
-                url = url,
-                domain = o["domain"]?.jsonPrimitive?.contentOrNull.orEmpty(),
-                date = o["seendate"]?.jsonPrimitive?.contentOrNull,
-                language = o["language"]?.jsonPrimitive?.contentOrNull,
-            )
+        var lastError = ""
+        repeat(3) { attempt ->
+            val resp = http.get("https://api.gdeltproject.org/api/v2/doc/doc") {
+                parameter("query", query)
+                parameter("mode", "artlist")
+                parameter("maxrecords", maxRecords.coerceIn(1, 100))
+                parameter("format", "json")
+                accept(ContentType.Application.Json)
+                header("User-Agent", "ai-advent-week3-task5/1.0 (demo)")
+            }
+            if (resp.status == HttpStatusCode.TooManyRequests) {
+                lastError = "GDELT rate-limited (429). Подождите ~60 сек, уменьшите maxrecords и закэшируйте результат."
+                // Небольшой backoff перед повтором: 2с, 5с
+                if (attempt < 2) delay((attempt + 1) * 2500L)
+                if (attempt == 2) throw IOException(lastError)
+                return@repeat
+            }
+            if (!resp.status.isSuccess()) {
+                val snippet = runCatching { resp.bodyAsText().take(300) }.getOrDefault("")
+                throw IOException("GDELT HTTP ${resp.status.value} ${resp.status.description}. $snippet")
+            }
+            val raw: JsonObject = resp.body()
+            val arr = raw["articles"]?.jsonArray ?: return NewsResult()
+            val articles = arr.mapNotNull { el ->
+                val o = el as? JsonObject ?: return@mapNotNull null
+                val title = o["title"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                val url = o["url"]?.jsonPrimitive?.contentOrNull.orEmpty()
+                if (title.isBlank() || url.isBlank()) return@mapNotNull null
+                NewsHit(
+                    title = title,
+                    url = url,
+                    domain = o["domain"]?.jsonPrimitive?.contentOrNull.orEmpty(),
+                    date = o["seendate"]?.jsonPrimitive?.contentOrNull,
+                    language = o["language"]?.jsonPrimitive?.contentOrNull,
+                )
+            }
+            return NewsResult(count = articles.size, articles = articles)
         }
-        return NewsResult(count = articles.size, articles = articles)
+        throw IOException(lastError.ifBlank { "GDELT request failed" })
     }
 
     suspend fun wiki(topic: String, lang: String): String {
