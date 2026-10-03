@@ -64,7 +64,9 @@ class FixedSizeChunker(
 
 // Стратегия 2: структурная — сначала делим по структуре документа,
 // затем слишком длинные секции добиваем фиксированным окном.
-// Markdown: заголовки ##/###, код: class/fun/object, остальное: абзацы.
+// Markdown: заголовки ##/###, wiki-extracts: == ... == (exsectionformat=wiki),
+// код: class/fun/object, plain-текст без разметки: эвристика одиночных
+// заголовков, иначе — абзацы (1 абзац = 1 чанк).
 class StructureChunker(
     val maxChars: Int = 1500,
     val overlapChars: Int = 120,
@@ -110,21 +112,63 @@ class StructureChunker(
     private fun splitMarkdown(text: String): List<Pair<String, String>> {
         val out = mutableListOf<Pair<String, String>>()
         var section = "(начало)"
+        var headings = 0
         val buf = StringBuilder()
         fun flush() {
             if (buf.isNotBlank()) out += section to buf.toString()
             buf.clear()
         }
         for (line in text.lines()) {
-            val h = Regex("^(#{1,4})\\s+(.*)").find(line)
-            if (h != null && buf.length > 200) {
+            val md = Regex("^(#{1,4})\\s+(.*)").find(line)
+            // Wiki-extracts с exsectionformat=wiki: "== Биография ==", "=== Детство ==="
+            val wiki = Regex("^={2,4}\\s*(.+?)\\s*={2,4}\\s*$").find(line)
+            val title = (md?.groupValues?.getOrNull(2)?.trim()
+                ?: wiki?.groupValues?.getOrNull(1)?.trim()?.take(80))
+            if (title != null && title.isNotBlank() && buf.length > 200) {
                 flush()
-                section = h.groupValues[2].trim().take(80)
+                section = title
+                headings++
             }
             buf.appendLine(line)
         }
         flush()
-        return out.ifEmpty { listOf("(весь файл)" to text) }
+        if (headings > 0) return out.ifEmpty { listOf("(весь файл)" to text) }
+        // Нет markdown/wiki-разметки (старый wiki-extract без ==, plain .md):
+        // пробуем эвристику одиночных заголовков, иначе — абзацы.
+        // Без этого structural вырождался в "(начало) [k/N]" + fixed-окна
+        // и от fixed отличался только размером окна.
+        val pseudo = splitPseudoHeadings(text)
+        if (pseudo.size > 1) return pseudo
+        return splitParagraphs("(начало)", text).ifEmpty { listOf("(весь файл)" to text) }
+    }
+
+    // Fallback для plain-текста вики-статей: одиночная короткая строка,
+    // за которой идёт длинный блок — почти наверняка заголовок секции
+    // ("Детство", "Легенда о щите Медузы", ...). Заголовок уходит в section
+    // и в начало тела секции, чтобы чанк оставался самодостаточным.
+    private fun splitPseudoHeadings(text: String): List<Pair<String, String>> {
+        val blocks = text.split(Regex("\n\\s*\n")).map { it.trim() }.filter { it.isNotEmpty() }
+        if (blocks.size < 3) return emptyList()
+        val out = mutableListOf<Pair<String, String>>()
+        var section = "(начало)"
+        val buf = StringBuilder()
+        fun flush() {
+            if (buf.toString().trim().length >= 50) out += section to buf.toString()
+            buf.clear()
+        }
+        for ((i, b) in blocks.withIndex()) {
+            val singleLine = "\n" !in b
+            val nextLong = i + 1 < blocks.size && blocks[i + 1].length > 150
+            if (singleLine && b.length in 2..80 && nextLong && !b.endsWith(".") && i > 0) {
+                flush()
+                section = b
+                buf.appendLine(b)
+            } else {
+                buf.appendLine(b).appendLine()
+            }
+        }
+        flush()
+        return out
     }
 
     private fun splitCode(fileName: String, text: String): List<Pair<String, String>> {

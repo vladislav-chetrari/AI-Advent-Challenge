@@ -44,9 +44,13 @@ private suspend fun runCommand(args: Array<String>) {
             }
         }
         "compare" -> {
-            val (paths, _) = splitPaths(args)
+            val (paths, rest) = splitPaths(args)
             if (paths.isEmpty()) fail("нужен хотя бы один путь: week4 compare <путь...>")
-            val res = svc.compareRoots(paths.map { File(it) }, DEFAULT_PROBES) { println(it) }
+            // Свои пробы про САМ корпус, иначе дефолтные (про агента) дадут
+            // одинаковый мусор на обеих стратегиях и разницы не будет видно.
+            val probes = flags(rest, "--probe").ifEmpty { DEFAULT_PROBES }
+            val topK = flag(rest, "--topK")?.toIntOrNull() ?: 3
+            val res = svc.compareRoots(paths.map { File(it) }, probes, { println(it) }, topK)
             for (rep in listOf(res.fixed, res.structure)) {
                 val st = rep.stats
                 println("\n### ${st.strategy}: ${st.chunks} чанков / ${st.docs} доков / avg ${st.avgChars} симв / ${st.indexMs}мс")
@@ -130,7 +134,8 @@ private fun fail(msg: String): Nothing {
 
 private fun usage() {
     println("week4 index <путь...> [--strategy fixed|structure|both]")
-    println("week4 compare <путь...]")
+    println("week4 compare <путь...> [--probe \"вопрос...\" ...] [--topK 3]")
+    println("  пример: week4 compare corpus --probe \"Сколько сольдо за погребение Катерины?\" --probe \"В каком разделе про коршуна и Фрейда?\"")
     println("week4 wiki <название статьи|URL> [...] [--strategy both]")
     println("week4 search <запрос...> [--strategy structure] [--topK 5]")
     println("week4 ask <вопрос...> [--strategy structure] [--topK 5]")
@@ -139,6 +144,21 @@ private fun usage() {
 private fun flag(args: Array<String>, name: String): String? {
     val i = args.indexOf(name)
     return if (i >= 0 && i + 1 < args.size) args[i + 1] else null
+}
+
+// Повторяемый флаг: --probe "q1" --probe "q2" -> [q1, q2].
+private fun flags(args: Array<String>, name: String): List<String> {
+    val out = mutableListOf<String>()
+    var i = 0
+    while (i < args.size) {
+        if (args[i] == name && i + 1 < args.size) {
+            out += args[i + 1]
+            i += 2
+        } else {
+            i++
+        }
+    }
+    return out
 }
 
 // Позиционные аргументы (пути/названия статей) отдельно от --флагов.

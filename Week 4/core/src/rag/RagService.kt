@@ -291,23 +291,28 @@ class RagService(
 
     // Task 1 (усиление): индексируем корпус обеими стратегиями и гоняем
     // одни и те же пробные запросы — видно разницу в релевантности top-1.
+    // Пробные запросы должны быть про САМ корпус (а не дефолтные про агента),
+    // иначе обе стратегии покажут одинаковый мусор: CLI compare принимает
+    // свои пробы через --probe "..." (можно несколько раз).
     suspend fun compare(
         corpusDir: File,
         probes: List<String> = DEFAULT_PROBES,
         onLog: (String) -> Unit = {},
-    ): CompareResult = compareRoots(listOf(corpusDir), probes, onLog)
+        topK: Int = 3,
+    ): CompareResult = compareRoots(listOf(corpusDir), probes, onLog, topK)
 
     suspend fun compareRoots(
         roots: List<File>,
         probes: List<String> = DEFAULT_PROBES,
         onLog: (String) -> Unit = {},
+        topK: Int = 3,
     ): CompareResult {
         suspend fun run(strategy: String): StrategyReport {
             onLog("== Стратегия: $strategy ==")
             val outcome = reindexRoots(roots, strategy, onLog)
             val probeHits = LinkedHashMap<String, List<String>>()
             for (q in probes) {
-                val hits = search(q, strategy, topK = 3)
+                val hits = search(q, strategy, topK)
                 probeHits[q] = hits.map { h ->
                     val sec = h.chunk.section.ifBlank { "—" }
                     "${h.chunk.title} / $sec (${"%.3f".format(h.score)})"

@@ -15,6 +15,8 @@ import kotlinx.serialization.json.jsonPrimitive
 // Статья Википедии -> RawDoc. Вход: название ("Искусственный интеллект")
 // или полный URL (язык подхватится из поддомена).
 // Чистый текст (extracts/explaintext): без разметки, сносок и карточек.
+// Заголовки секций сохраняем в wiki-формате (== ... ==, exsectionformat=wiki),
+// иначе StructureChunker не видит структуру и вырождается в fixed-окна.
 object WikiLoader {
     private val json = Json { ignoreUnknownKeys = true }
     private val client: HttpClient by lazy { HttpClient(CIO) }
@@ -36,7 +38,7 @@ object WikiLoader {
         val ref = parseInput(input, defaultLang)
         val encoded = URLEncoder.encode(ref.title, "UTF-8")
         val url = "https://${ref.lang}.wikipedia.org/w/api.php" +
-            "?action=query&prop=extracts&explaintext=1&redirects=1&format=json&titles=$encoded"
+            "?action=query&prop=extracts&explaintext=1&exsectionformat=wiki&redirects=1&format=json&titles=$encoded"
         val http = client.get(url)
         if (!http.status.isSuccess()) {
             throw IllegalStateException("Wikipedia HTTP ${http.status.value}")
