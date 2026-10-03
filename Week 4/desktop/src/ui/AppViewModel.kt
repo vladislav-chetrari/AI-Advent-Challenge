@@ -8,6 +8,7 @@ import core.rag.OllamaEmbedder
 import core.rag.RagChat
 import core.rag.RagMessage
 import core.rag.RagService
+import core.rag.TaskMemory
 import core.rag.newChatId
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -54,6 +55,8 @@ data class UiState(
     val temperature: Float = 0.35f,
     val postFilterK: Int? = 5,
     val showRagSettings: Boolean = false,
+    // Task 5: память задачи активного чата (цель + факты: ограничения/термины).
+    val taskMemory: TaskMemory? = null,
 ) {
     val indexSummary: String
         get() {
@@ -74,10 +77,12 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     init {
         val st = chats.state
+        val first = st.chats.firstOrNull()?.id
         _state.value = _state.value.copy(
             chats = st.chats,
-            activeChatId = st.chats.firstOrNull()?.id,
-            messages = st.messages[st.chats.firstOrNull()?.id].orEmpty(),
+            activeChatId = first,
+            messages = st.messages[first].orEmpty(),
+            taskMemory = first?.let { chats.getMemory(it) },
             embedLabel = svc.embedLabel,
         )
         refreshDocs()
@@ -99,11 +104,11 @@ class AppViewModel(private val scope: CoroutineScope) {
         val name = _state.value.createName.trim().ifBlank { "Чат" }
         val chat = RagChat(id = newChatId(), name = name)
         chats.upsertChat(chat)
-        update { it.copy(showCreateChat = false, chats = chats.state.chats, activeChatId = chat.id, messages = emptyList(), viewingDoc = null) }
+        update { it.copy(showCreateChat = false, chats = chats.state.chats, activeChatId = chat.id, messages = emptyList(), taskMemory = TaskMemory(), viewingDoc = null) }
     }
 
     fun selectChat(id: String) {
-        update { it.copy(activeChatId = id, messages = chats.state.messages[id].orEmpty(), viewingDoc = null, status = null) }
+        update { it.copy(activeChatId = id, messages = chats.state.messages[id].orEmpty(), taskMemory = chats.getMemory(id), viewingDoc = null, status = null) }
     }
 
     fun deleteChat(id: String) {
@@ -144,7 +149,14 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun clearChat(id: String) {
         chats.clearMessages(id)
-        update { it.copy(messages = emptyList()) }
+        update { it.copy(messages = emptyList(), taskMemory = TaskMemory()) }
+    }
+
+    // Task 5: ручной сброс фактов без очистки переписки.
+    fun clearTaskMemory() {
+        val chatId = _state.value.activeChatId ?: return
+        chats.clearMemory(chatId)
+        update { it.copy(taskMemory = TaskMemory()) }
     }
 
     fun setInput(v: String) = update { it.copy(input = v) }
@@ -162,6 +174,8 @@ class AppViewModel(private val scope: CoroutineScope) {
         val temperature = st.temperature
         val postFilterK = st.postFilterK
         val rewrite = st.rewriteEnabled
+        // Task 5: память чата — факты вместо всего лога (дешевле и без дрейфа цели).
+        val memory = chats.getMemory(chatId)
         chats.appendMessage(chatId, RagMessage(role = "user", content = text))
         update { it.copy(input = "", busy = true, status = null, messages = chats.state.messages[chatId].orEmpty()) }
         scope.launch {
@@ -171,6 +185,7 @@ class AppViewModel(private val scope: CoroutineScope) {
                         text, onlySources = svc.activeSourcesOrNull(),
                         topK = topK, filterEnabled = filterEnabled,
                         temperature = temperature, postFilterK = postFilterK, rewrite = rewrite,
+                        history = history, memory = memory,
                     )
                     // Task 4: короткая подпись для совместимости + refs для раскрывашки.
                     val refs = ans.refs.map { r ->
@@ -181,9 +196,17 @@ class AppViewModel(private val scope: CoroutineScope) {
                     val rewriteLines = ans.retrieval.rewritten.map { "↳ rewrite: $it" }
                     val info = (listOf(ans.retrieval.summary(temperature)) + rewriteLines).joinToString("\n")
                     chats.appendMessage(chatId, RagMessage(role = "assistant", content = ans.text, sources = refs, info = info, refs = ans.refs))
+                    // Факты обновляем после ответа — ход уже знает и вопрос, и ответ.
+                    // Ошибка/пустой ключ внутри — тихо остаётся старая память.
+                    val updated = svc.refreshMemory(memory, text, ans.text)
+                    chats.setMemory(chatId, updated)
+                    update { it.copy(taskMemory = updated) }
                 } else {
                     val reply = svc.askPlain(text, history)
                     chats.appendMessage(chatId, RagMessage(role = "assistant", content = reply))
+                    val updated = svc.refreshMemory(memory, text, reply.take(1200))
+                    chats.setMemory(chatId, updated)
+                    update { it.copy(taskMemory = updated) }
                 }
             } catch (e: Exception) {
                 chats.appendMessage(chatId, RagMessage(role = "assistant", content = "Ошибка: ${e.message}"))

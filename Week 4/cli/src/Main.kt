@@ -1,11 +1,15 @@
 package cli
 
+import core.rag.ChatStore
 import core.rag.DEFAULT_FINAL_K
 import core.rag.DEFAULT_MIN_SCORE
 import core.rag.DEFAULT_PROBES
 import core.rag.DEFAULT_RETRIEVE_K
+import core.rag.RagChat
+import core.rag.RagMessage
 import core.rag.RagService
 import core.rag.RerankModes
+import core.rag.newChatId
 import kotlinx.coroutines.runBlocking
 
 // Headless-доступ к тому же RagService, что и у desktop-приложения.
@@ -13,7 +17,8 @@ import kotlinx.coroutines.runBlocking
 //
 //   week4 wiki <название статьи|URL> [...] [--strategy both]
 //   week4 search <запрос...> [--strategy structure] [--topK 5] [--minScore 0.35]
-//   week4 ask <вопрос...> [--strategy structure] [--topK 20] [--filter on|off] [--temperature 0.35] [--postK 5|off] [--rewrite on|off]
+//   week4 ask <вопрос...> [--strategy structure] [--topK 20] [--filter on|off] [--temperature 0.35] [--postK 5|off] [--rewrite on|off] [--chat <название>]
+//   week4 chat [--chat <название>] [--strategy both] [--topK 20] [--filter on|off] [--temperature 0.35] [--postK 5|off] [--rewrite on|off]
 //   week4 eval-modes [--probe "вопрос..."] [--strategy both]  (Задание 3: без фильтра vs фильтр vs фильтр+rewrite)
 fun main(args: Array<String>) = runBlocking {
     if (args.isEmpty()) {
@@ -88,9 +93,17 @@ private suspend fun runCommand(args: Array<String>) {
                 else -> postKRaw.toIntOrNull()
             }
             val rewrite = flag(rest, "--rewrite") == "on"
-            val ans = svc.ask(query, strategy, topKInt, onlySources = null,
+            // Task 5: --chat <название> — разовый вопрос в контексте чата:
+            // история + факты подмешиваются в поиск и промпт, память обновляется.
+            val chatName = flag(rest, "--chat")
+            val chats = if (chatName != null) ChatStore() else null
+            val chatId = if (chatName != null && chats != null) findOrCreateChat(chats, chatName) else null
+            val history = if (chatId != null && chats != null) chats.state.messages[chatId].orEmpty() else emptyList()
+            val memory = if (chatId != null && chats != null) chats.getMemory(chatId) else null
+            val ans = svc.ask(query, strategy, topKInt, onlySources = svc.activeSourcesOrNull(),
                 filterEnabled = filterEnabled, temperature = temperature,
-                postFilterK = postFilterK, rewrite = rewrite)
+                postFilterK = postFilterK, rewrite = rewrite,
+                history = history, memory = memory)
             println(ans.text)
             println("\n[${ans.retrieval.summary(temperature)}]")
             if (ans.retrieval.rewritten.isNotEmpty()) {
@@ -110,6 +123,75 @@ private suspend fun runCommand(args: Array<String>) {
                 ans.sources.forEachIndexed { i, h ->
                     println("  [${i + 1}] ${h.chunk.title} / ${h.chunk.section.ifBlank { "—" }} (${"%.3f".format(h.score)})")
                 }
+            }
+            if (chatId != null && chats != null) {
+                chats.appendMessage(chatId, RagMessage(role = "user", content = query))
+                val refs = ans.refs.map { r ->
+                    "[${r.index}] ${r.title}" + (if (r.section.isNotBlank()) " / ${r.section}" else "")
+                }
+                chats.appendMessage(chatId, RagMessage(role = "assistant", content = ans.text, sources = refs, info = ans.retrieval.summary(temperature), refs = ans.refs))
+                chats.setMemory(chatId, svc.refreshMemory(memory ?: core.rag.TaskMemory(), query, ans.text))
+                val mem = chats.getMemory(chatId)
+                if (!mem.isEmpty()) println("[память: ${mem.facts.size} фактов${if (mem.goal.isNotBlank()) "; цель: ${mem.goal.take(80)}" else ""}]")
+            }
+        }
+        // Task 5: мини-чат с RAG + памятью задачи. Команды: /memory, /forget, /exit.
+        "chat" -> {
+            val (_, rest) = splitPaths(args)
+            val chatName = flag(rest, "--chat") ?: "cli-чат"
+            val strategy = flag(rest, "--strategy") ?: "both"
+            val topKInt = flag(rest, "--topK")?.toIntOrNull() ?: DEFAULT_RETRIEVE_K
+            val filterFlag = flag(rest, "--filter")?.lowercase()
+            val filterEnabled = filterFlag == null || (filterFlag != "off" && filterFlag != "0" && filterFlag != "false")
+            val temperature = flag(rest, "--temperature")?.toFloatOrNull()
+                ?: flag(rest, "--minScore")?.toFloatOrNull() ?: DEFAULT_MIN_SCORE
+            val postKRaw = flag(rest, "--postK") ?: flag(rest, "--finalK")
+            val postFilterK: Int? = when {
+                postKRaw == null -> DEFAULT_FINAL_K
+                postKRaw.equals("off", true) || postKRaw.equals("none", true) || postKRaw.isBlank() -> null
+                else -> postKRaw.toIntOrNull()
+            }
+            val rewrite = flag(rest, "--rewrite") == "on"
+            val chats = ChatStore()
+            val chatId = findOrCreateChat(chats, chatName)
+            println("Чат «$chatName». RAG + память задачи. Команды: /memory /forget /exit")
+            while (true) {
+                print("вы> ")
+                val line = readlnOrNull()?.trim() ?: break
+                if (line.isEmpty()) continue
+                when (line.lowercase()) {
+                    "/exit", "/quit", "/q" -> break
+                    "/memory" -> {
+                        val mem = chats.getMemory(chatId)
+                        if (mem.isEmpty()) println("(память пуста)") else println(mem.promptBlock(maxFacts = 20, maxChars = 2000))
+                        continue
+                    }
+                    "/forget" -> {
+                        chats.clearMemory(chatId)
+                        println("(память очищена)")
+                        continue
+                    }
+                }
+                val history = chats.state.messages[chatId].orEmpty()
+                val memory = chats.getMemory(chatId)
+                chats.appendMessage(chatId, RagMessage(role = "user", content = line))
+                val ans = svc.ask(line, strategy, topKInt, onlySources = svc.activeSourcesOrNull(),
+                    filterEnabled = filterEnabled, temperature = temperature,
+                    postFilterK = postFilterK, rewrite = rewrite,
+                    history = history, memory = memory)
+                println("\n${ans.text}")
+                println("[${ans.retrieval.summary(temperature)}]")
+                if (ans.refs.isNotEmpty()) {
+                    println("Источники:")
+                    ans.refs.forEach { r ->
+                        println("  [${r.index}] ${r.title} / ${r.section.ifBlank { "—" }} (${"%.3f".format(r.score)})")
+                    }
+                }
+                val refs = ans.refs.map { r ->
+                    "[${r.index}] ${r.title}" + (if (r.section.isNotBlank()) " / ${r.section}" else "")
+                }
+                chats.appendMessage(chatId, RagMessage(role = "assistant", content = ans.text, sources = refs, info = ans.retrieval.summary(temperature), refs = ans.refs))
+                chats.setMemory(chatId, svc.refreshMemory(memory, line, ans.text))
             }
         }
         // Задание 3: сравнение режимов без переиндексации — одни и те же пробы
@@ -175,14 +257,25 @@ private fun usage() {
     println("week4 wiki <название статьи|URL> [...] [--strategy both]")
     println("week4 search <запрос...> [--strategy structure] [--topK 5] [--minScore 0.35]")
     println("  --minScore: пометить кандидатов ниже порога как отсечённые")
-    println("week4 ask <вопрос...> [--strategy structure] [--topK 20] [--filter on|off] [--temperature 0.35] [--postK 5|off] [--rewrite on|off]")
+    println("week4 ask <вопрос...> [--strategy structure] [--topK 20] [--filter on|off] [--temperature 0.35] [--postK 5|off] [--rewrite on|off] [--chat <название>]")
     println("  --topK: сколько чанков забрать из индекса (до фильтрации)")
     println("  --filter: вкл/выкл фильтрации (выкл = как было в Task 2)")
     println("  --temperature: точность-порог 0-1; пусто после фильтра = честный отказ (алиас --minScore)")
     println("  --postK: top-K после фильтрации 1..topK (off = без ограничения, идут все прошедшие порог)")
     println("  --rewrite on: переписать вопрос через DeepSeek и искать по всем вариантам")
+    println("  --chat: вести вопрос в контексте чата (история + память задачи, Task 5)")
+    println("week4 chat [--chat <название>] [--strategy both] [--topK 20] [--filter on|off] [--temperature 0.35] [--postK 5|off] [--rewrite on|off]")
+    println("  мини-чат с RAG + памятью задачи; команды: /memory /forget /exit")
     println("week4 eval-modes [--probe \"вопрос...\" ...] [--strategy both] [--topK 20] [--temperature 0.35] [--postK 5|off]")
     println("  сравнение режимов без фильтра / с фильтром / фильтр+rewrite на одних пробах (без переиндексации)")
+}
+
+// Task 5: чат по имени для CLI — тот же ChatStore, что у desktop.
+private fun findOrCreateChat(chats: ChatStore, name: String): String {
+    chats.state.chats.firstOrNull { it.name == name }?.let { return it.id }
+    val chat = RagChat(id = newChatId(), name = name)
+    chats.upsertChat(chat)
+    return chat.id
 }
 
 private fun flag(args: Array<String>, name: String): String? {

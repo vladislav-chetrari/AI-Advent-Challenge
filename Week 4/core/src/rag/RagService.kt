@@ -306,12 +306,23 @@ class RagService(
         temperature: Float = DEFAULT_MIN_SCORE,
         postFilterK: Int? = DEFAULT_FINAL_K,
         rewrite: Boolean = false,
+        // Task 5: хвост диалога (для анафор) + факты задачи (цель/ограничения/термины).
+        history: List<RagMessage> = emptyList(),
+        memory: TaskMemory? = null,
     ): RagAnswer {
         val mode = if (filterEnabled) RerankModes.THRESHOLD else RerankModes.OFF
         val cfg = RerankConfig(mode, topK, postFilterK, temperature).normalized()
         val key = apiKey ?: ApiKeyProvider.resolve()
-        val rewrites = if (rewrite) rewriteQueries(query, llm, key) else emptyList()
-        val (queries, rr) = searchWithRerank(query, strategy, cfg, onlySources, rewrites)
+        val mem = if (memory == null || memory.isEmpty()) null else memory
+        val historyBlock = recentHistoryBlock(history)
+        val memBlock = mem?.promptBlock().orEmpty()
+        val rewriteCtx = listOf(memBlock, historyBlock).filter { it.isNotBlank() }
+            .joinToString("\n").ifBlank { null }
+        val rewrites = if (rewrite) rewriteQueries(query, llm, key, context = rewriteCtx) else emptyList()
+        // Поиск — по обогащённому запросу (цель + свежие факты снимают
+        // неоднозначность «а у них?»), ответ — по оригинальному вопросу.
+        val searchQuery = buildSearchQuery(query, mem)
+        val (queries, rr) = searchWithRerank(searchQuery, strategy, cfg, onlySources, rewrites)
         val debug = RetrievalDebug(
             retrieved = rr.kept.size + rr.dropped.size,
             kept = rr.kept.size,
@@ -339,11 +350,22 @@ class RagService(
                 (if (h.chunk.section.isNotBlank()) " / ${h.chunk.section}" else "") +
                 ":\n${h.chunk.text.take(1500)}"
         }.joinToString("\n\n")
-        val system = "Ты отвечаешь на вопросы по локальной базе знаний. " +
-            "Используй ТОЛЬКО приведённые фрагменты [1..${hits.size}]. " +
-            "После каждого факта ставь короткую ссылку вида [1]. " +
-            "Не выдумывай факты и цитаты. Если ответа нет во фрагментах — так и скажи."
-        val user = "Контекст:\n$context\n\nВопрос: $query"
+        // Task 5: память и хвост истории удерживают цель длинного диалога,
+        // факты шлём вместо всего лога — дешевле и меньше дрейфа.
+        val system = buildString {
+            append("Ты отвечаешь на вопросы по локальной базе знаний. ")
+            append("Используй ТОЛЬКО приведённые фрагменты [1..${hits.size}]. ")
+            append("После каждого факта ставь короткую ссылку вида [1]. ")
+            append("Не выдумывай факты и цитаты. Если ответа нет во фрагментах — так и скажи.")
+            if (memBlock.isNotBlank()) {
+                append("\nПамять задачи (цель и факты диалога — учитывай в ответе):\n")
+                append(memBlock.take(1200))
+            }
+        }
+        val user = buildString {
+            if (historyBlock.isNotBlank()) append("Последние реплики:\n").append(historyBlock).append("\n\n")
+            append("Контекст:\n").append(context).append("\n\nВопрос: ").append(query)
+        }.take(9000)
         val refs = refsFromHits(hits)
         return when (val r = llm.complete(listOf(ChatMsg("system", system), ChatMsg("user", user)), apiKey ?: ApiKeyProvider.resolve())) {
             is LlmResult.Ok -> RagAnswer(r.text, hits, debug, refused = false, refs = refs)
@@ -393,6 +415,22 @@ class RagService(
             ModeReport(label, probeHits, keptSum.toDouble() / n, droppedSum.toDouble() / n)
         }
         return ModesCompareResult(reports)
+    }
+
+    // Task 5: обновить факты чата после хода. Дешёвый вызов LLM внутри
+    // extractTaskMemory; при отсутствии ключа/сети — тихо возвращает old.
+    suspend fun refreshMemory(
+        old: TaskMemory,
+        query: String,
+        answer: String,
+        apiKey: String? = null,
+    ): TaskMemory {
+        val key = try {
+            apiKey ?: ApiKeyProvider.resolve()
+        } catch (_: Exception) {
+            null
+        }
+        return extractTaskMemory(query, answer, old, llm, key)
     }
 
     // Обычный ответ без поиска: чат с выключенным RAG.

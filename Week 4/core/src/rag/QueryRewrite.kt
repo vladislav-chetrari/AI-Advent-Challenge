@@ -14,15 +14,20 @@ suspend fun rewriteQueries(
     llm: LlmClient,
     apiKey: String?,
     maxVariants: Int = 2,
+    // Task 5: контекст задачи (память + хвост истории) — разворачивает
+    // «а у них?», «а в городе?» в самодостаточные поисковые запросы.
+    context: String? = null,
 ): List<String> {
     if (query.isBlank()) return emptyList()
     val system = "Ты помощник поиска по локальной базе знаний. " +
         "Переформулируй вопрос пользователя в поисковые запросы: " +
         "разверни местоимения и намёки, добавь вероятные термины и синонимы. " +
         "Верни от 1 до $maxVariants запросов, каждый с новой строки, без нумерации и пояснений."
+    val user = if (context.isNullOrBlank()) query
+    else "Контекст задачи:\n${context.take(1200)}\n\nВопрос: $query".take(2000)
     val result = try {
         llm.complete(
-            listOf(ChatMsg("system", system), ChatMsg("user", query)),
+            listOf(ChatMsg("system", system), ChatMsg("user", user)),
             apiKey,
         )
     } catch (_: Exception) {

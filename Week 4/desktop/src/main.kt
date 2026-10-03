@@ -250,6 +250,28 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
                 fontSize = 11.sp, color = Color.Gray, modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
             )
         }
+        // Task 5: память задачи — факты чата вместо полного лога в промпте.
+        val mem = st.taskMemory
+        if (mem != null && !mem.isEmpty()) {
+            var memExpanded by remember(chat.id, mem.updatedAt) { mutableStateOf(false) }
+            Column(Modifier.fillMaxWidth().background(Color(0xFFF0F7F0)).padding(horizontal = 12.dp, vertical = 4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        "🧠 ${if (mem.goal.isNotBlank()) mem.goal.take(80) else "фактов: ${mem.facts.size}"}",
+                        fontSize = 11.sp, color = Color(0xFF2E7D32),
+                        modifier = Modifier.weight(1f).clickable { memExpanded = !memExpanded }, maxLines = 1,
+                    )
+                    TextButton(onClick = { memExpanded = !memExpanded }) {
+                        Text(if (memExpanded) "▲" else "▼ фактов: ${mem.facts.size}", fontSize = 11.sp)
+                    }
+                    TextButton(onClick = vm::clearTaskMemory) { Text("забыть", fontSize = 11.sp) }
+                }
+                if (memExpanded) {
+                    if (mem.goal.isNotBlank()) Text("Цель: ${mem.goal}", fontSize = 11.sp, color = Color(0xFF333333))
+                    mem.facts.forEach { f -> Text("• $f", fontSize = 11.sp, color = Color(0xFF555555)) }
+                }
+            }
+        }
         val messages = st.messages
         val listState = rememberLazyListState()
         LaunchedEffect(chat.id, messages.size, st.busy) {

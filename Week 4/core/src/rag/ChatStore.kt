@@ -32,6 +32,8 @@ data class RagMessage(
 data class ChatState(
     val chats: List<RagChat> = emptyList(),
     val messages: Map<String, List<RagMessage>> = emptyMap(),
+    // Task 5: память задачи — факты на чат (цель + уточнения/ограничения/термины).
+    val memories: Map<String, TaskMemory> = emptyMap(),
 )
 
 fun newChatId(): String = java.util.UUID.randomUUID().toString().take(8)
@@ -81,7 +83,24 @@ class ChatStore(appDir: File = ApiKeyProvider.appDir()) {
             state = state.copy(
                 chats = state.chats.filter { it.id != id },
                 messages = state.messages - id,
+                memories = state.memories - id,
             )
+            persistLocked()
+        }
+    }
+
+    fun getMemory(chatId: String): TaskMemory = state.memories[chatId] ?: TaskMemory()
+
+    fun setMemory(chatId: String, memory: TaskMemory) {
+        synchronized(lock) {
+            state = state.copy(memories = state.memories + (chatId to memory))
+            persistLocked()
+        }
+    }
+
+    fun clearMemory(chatId: String) {
+        synchronized(lock) {
+            state = state.copy(memories = state.memories - chatId)
             persistLocked()
         }
     }
@@ -96,7 +115,10 @@ class ChatStore(appDir: File = ApiKeyProvider.appDir()) {
 
     fun clearMessages(chatId: String) {
         synchronized(lock) {
-            state = state.copy(messages = state.messages + (chatId to emptyList()))
+            state = state.copy(
+                messages = state.messages + (chatId to emptyList()),
+                memories = state.memories - chatId,
+            )
             persistLocked()
         }
     }
