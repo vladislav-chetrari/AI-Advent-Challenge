@@ -43,20 +43,6 @@ data class IndexStats(
     val indexMs: Long = 0,
 )
 
-// Сравнение двух стратегий на одном корпусе + пробных запросах.
-@Serializable
-data class StrategyReport(
-    val stats: IndexStats,
-    // query -> top-1 заголовок+секция (чтобы глазами сравнить релевантность)
-    val probes: Map<String, List<String>> = emptyMap(),
-)
-
-@Serializable
-data class CompareResult(
-    val fixed: StrategyReport,
-    val structure: StrategyReport,
-)
-
 // Документ базы знаний для UI: один source = одна строка в дереве.
 @Serializable
 data class DocInfo(
@@ -113,6 +99,46 @@ fun displayStrategy(requested: String, actual: Set<String>): String = when {
 data class RagAnswer(
     val text: String,
     val sources: List<ScoredChunk>,
+    // Task 3: диагностика второго этапа (сколько забрали / сколько отдали модели).
+    val retrieval: RetrievalDebug = RetrievalDebug(),
+)
+
+// Task 3 (День 23): что произошло между векторным поиском и промптом.
+data class RetrievalDebug(
+    // Сколько кандидатов забрал векторный поиск (top-K до фильтрации).
+    val retrieved: Int = 0,
+    // Сколько ушло в промпт (после фильтра).
+    val kept: Int = 0,
+    // Сколько отсечено (ниже температуры + за пределами top-K после).
+    val dropped: Int = 0,
+    // Минимальный score среди kept (видна уверенность выдачи).
+    val minKeptScore: Float? = null,
+    // Rewrite-варианты запроса (пусто — rewrite выкл/не сработал).
+    val rewritten: List<String> = emptyList(),
+    // Фильтрация: off (выкл) | threshold (вкл).
+    val rerankMode: String = "off",
+) {
+    // Однострочник для UI/CLI: "поиск: 20 → в контекст: 4 (отсечено: 16) · фильтр: темп. 0.35 · rewrite: +2".
+    fun summary(temperature: Float? = null): String = buildString {
+        append("поиск: $retrieved → в контекст: $kept (отсечено: $dropped)")
+        if (rerankMode != RerankModes.OFF && temperature != null) append(" · фильтр: темп. $temperature")
+        if (rewritten.isNotEmpty()) append(" · rewrite: +${rewritten.size}")
+    }
+}
+
+// Task 3: один режим в сравнении (off / threshold / threshold+rewrite).
+@Serializable
+data class ModeReport(
+    val modeLabel: String,
+    // probe -> строки "title / section (score)" по kept-чанкам
+    val probes: Map<String, List<String>> = emptyMap(),
+    val avgKept: Double = 0.0,
+    val avgDropped: Double = 0.0,
+)
+
+@Serializable
+data class ModesCompareResult(
+    val reports: List<ModeReport> = emptyList(),
 )
 
 // Грубая оценка токенов без токенизатора: хватает для лимитов чанков и промпта.

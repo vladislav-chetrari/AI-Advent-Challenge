@@ -2,22 +2,17 @@ package desktop.ui
 
 import core.rag.ChatStore
 import core.rag.DocInfo
-import core.rag.DocumentLoader
 import core.rag.EmbedSettings
 import core.rag.EmbedSettingsStore
 import core.rag.OllamaEmbedder
 import core.rag.RagChat
 import core.rag.RagMessage
 import core.rag.RagService
-import core.rag.SourcesStore
 import core.rag.newChatId
-import java.io.File
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 data class UiState(
     val chats: List<RagChat> = emptyList(),
@@ -33,8 +28,7 @@ data class UiState(
     val status: String? = null,
     val showCreateChat: Boolean = false,
     val createName: String = "",
-    val showAddMenu: Boolean = false,
-    // Стратегия чанкинга, выбранная при добавлении: "fixed" | "structure" | "both".
+    // Стратегия чанкинга для новых статей: "fixed" | "structure" | "both".
     val addStrategy: String = "both",
     val showWiki: Boolean = false,
     val wikiInput: String = "",
@@ -47,6 +41,18 @@ data class UiState(
     val settingsUrl: String = "",
     val settingsCheck: String? = null,
     val settingsBusy: Boolean = false,
+    // Задание 3: второй этап RAG.
+    // topK (до фильтрации) — сколько забрать из индекса;
+    // rewrite — перепись query с помощью LLM;
+    // filterEnabled вкл/выкл; temperature 0..1 — точность (порог);
+    // postFilterK (null = без ограничения, иначе 1..topK) — повторная
+    // обрезка чанков после фильтра по температуре.
+    val topK: Int = 20,
+    val rewriteEnabled: Boolean = false,
+    val filterEnabled: Boolean = true,
+    val temperature: Float = 0.35f,
+    val postFilterK: Int? = 5,
+    val showRagSettings: Boolean = false,
 ) {
     val indexSummary: String
         get() {
@@ -62,7 +68,6 @@ data class UiState(
 class AppViewModel(private val scope: CoroutineScope) {
     private val svc = RagService()
     private val chats = ChatStore()
-    private val sources = SourcesStore()
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state
 
@@ -150,17 +155,30 @@ class AppViewModel(private val scope: CoroutineScope) {
         val text = st.input.trim()
         if (st.busy || text.isEmpty()) return
         val history = chats.state.messages[chatId].orEmpty()
+        // Снапшот RAG-настроек: джоба в фоне не должна хватать ползунки на лету.
+        val topK = st.topK
+        val filterEnabled = st.filterEnabled
+        val temperature = st.temperature
+        val postFilterK = st.postFilterK
+        val rewrite = st.rewriteEnabled
         chats.appendMessage(chatId, RagMessage(role = "user", content = text))
         update { it.copy(input = "", busy = true, status = null, messages = chats.state.messages[chatId].orEmpty()) }
         scope.launch {
             try {
                 if (chat.ragEnabled) {
-                    val ans = svc.ask(text, onlySources = svc.activeSourcesOrNull())
+                    val ans = svc.ask(
+                        text, onlySources = svc.activeSourcesOrNull(),
+                        topK = topK, filterEnabled = filterEnabled,
+                        temperature = temperature, postFilterK = postFilterK, rewrite = rewrite,
+                    )
                     val refs = ans.sources.mapIndexed { i, h ->
                         "[S${i + 1}] ${h.chunk.title}" +
                             (if (h.chunk.section.isNotBlank()) " / ${h.chunk.section}" else "")
                     }
-                    chats.appendMessage(chatId, RagMessage(role = "assistant", content = ans.text, sources = refs))
+                    // Видно и факт rewrite, и его тексты (иначе эффект "ответ улучшился, а почему — непонятно").
+                    val rewriteLines = ans.retrieval.rewritten.map { "↳ rewrite: $it" }
+                    val info = (listOf(ans.retrieval.summary(temperature)) + rewriteLines).joinToString("\n")
+                    chats.appendMessage(chatId, RagMessage(role = "assistant", content = ans.text, sources = refs, info = info))
                 } else {
                     val reply = svc.askPlain(text, history)
                     chats.appendMessage(chatId, RagMessage(role = "assistant", content = reply))
@@ -214,12 +232,56 @@ class AppViewModel(private val scope: CoroutineScope) {
         }
     }
 
+    // --- Задание 3: настройки второго этапа RAG ---
+
+    fun openRagSettings() = update { it.copy(showRagSettings = true) }
+    fun closeRagSettings() = update { it.copy(showRagSettings = false) }
+    fun setFilterEnabled(v: Boolean) = update { it.copy(filterEnabled = v) }
+    fun setRewriteEnabled(v: Boolean) = update { it.copy(rewriteEnabled = v) }
+
+    // Текстовые поля: невалидный ввод игнорируем, границы жмём в normalize().
+    // top-K до фильтрации: 1..50.
+    fun setTopK(v: String) {
+        v.toIntOrNull()?.let { n ->
+            update { st ->
+                val t = n.coerceIn(1, 50)
+                // top-K после не может превышать top-K до — поджимаем.
+                val p = st.postFilterK?.coerceIn(1, t)
+                st.copy(topK = t, postFilterK = p)
+            }
+        }
+    }
+
+    // Температура (точность ответа): 0..1.
+    fun setTemperature(v: String) {
+        v.replace(',', '.').toFloatOrNull()?.let { f -> update { it.copy(temperature = f.coerceIn(0f, 1f)) } }
+    }
+
+    fun setTemperatureSlider(v: Float) = update { it.copy(temperature = v.coerceIn(0f, 1f)) }
+
+    // top-K после фильтрации — опционален: пустая строка = без ограничения,
+    // иначе число от 1 до top-K (до фильтрации).
+    fun setPostFilterK(v: String) {
+        val t = v.trim()
+        if (t.isEmpty()) {
+            update { it.copy(postFilterK = null) }
+            return
+        }
+        t.toIntOrNull()?.let { n ->
+            update { st -> st.copy(postFilterK = n.coerceIn(1, st.topK)) }
+        }
+    }
+
+    // Чекбокс "ограничить": вкл — ставит дефолт (min(topK, 5)), выкл — снимает лимит.
+    fun setPostFilterKEnabled(enabled: Boolean) = update { st ->
+        if (enabled) st.copy(postFilterK = (st.postFilterK ?: minOf(st.topK, 5)).coerceIn(1, st.topK))
+        else st.copy(postFilterK = null)
+    }
+
     // --- база знаний ---
 
-    fun openAddMenu() = update { it.copy(showAddMenu = true) }
-    fun closeAddMenu() = update { it.copy(showAddMenu = false) }
     fun setAddStrategy(v: String) = update { it.copy(addStrategy = v) }
-    fun openWiki() = update { it.copy(showAddMenu = false, showWiki = true, wikiInput = "") }
+    fun openWiki() = update { it.copy(showWiki = true, wikiInput = "") }
     fun closeWiki() = update { it.copy(showWiki = false) }
     fun setWikiInput(v: String) = update { it.copy(wikiInput = v) }
 
@@ -228,43 +290,35 @@ class AppViewModel(private val scope: CoroutineScope) {
     // чтобы джоба не воскрешала удалённое и не гонялась с чтением.
     private val activeIndexJobs = mutableSetOf<String>()
 
-    fun addRoots(paths: List<String>, strategy: String = _state.value.addStrategy) {
-        if (paths.isEmpty()) return
-        val clean = paths.map { it.trim() }.filter { it.isNotBlank() }.distinct()
-        if (clean.isEmpty()) return
-        val strat = strategy.takeIf { it == "fixed" || it == "structure" } ?: "both"
-        val cur = sources.loadState()
-        val merged = (cur.roots + clean).distinct()
-        sources.save(merged, cur.inactive)
-        update { it.copy(showAddMenu = false, addStrategy = strat) }
-        log("Добавлено: ${clean.size}")
+    fun fetchWiki() {
+        val input = _state.value.wikiInput.trim()
+        if (input.isEmpty()) return
+        val strat = _state.value.addStrategy
+        update { it.copy(showWiki = false) }
         scope.launch {
-            // Быстрое раскрытие в документы (без эмбеддингов) — дальше уже фон.
-            val loaded = withContext(Dispatchers.IO) {
-                DocumentLoader.loadRoots(clean.map { File(it) })
-            }
-            if (loaded.skipped > 0) log("Пропущено файлов: ${loaded.skipped}")
-            if (loaded.docs.isEmpty()) {
-                update { it.copy(status = "Нет документов для индексации (пустые/неподдерживаемые файлы)") }
+            val doc = try {
+                log("Загружаю Wiki: $input ...")
+                svc.fetchWikiDoc(input)
+            } catch (e: Exception) {
+                update { it.copy(status = "Wiki: ${e.message}") }
                 return@launch
             }
-            val fresh = loaded.docs.filter { it.source !in activeIndexJobs }
-            if (fresh.isEmpty()) return@launch
-            activeIndexJobs += fresh.map { it.source }
+            if (doc.source in activeIndexJobs) return@launch
+            activeIndexJobs += doc.source
             // Документ сразу в списке: некликабельная строка + прогрессбар.
-            svc.markIndexing(fresh, strat)
+            svc.markIndexing(listOf(doc), strat)
             refreshDocs()
-            update { st -> st.copy(indexProgress = st.indexProgress + fresh.associate { it.source to null }) }
+            update { st -> st.copy(indexProgress = st.indexProgress + (doc.source to null)) }
             try {
                 try {
                     svc.checkEmbeddings()
                 } catch (e: Exception) {
-                    svc.markError(fresh.map { it.source }, e.message ?: "нет связи с моделью")
+                    svc.markError(listOf(doc.source), e.message ?: "нет связи с моделью")
                     update { it.copy(status = "Индексация: ${e.message}") }
                     return@launch
                 }
                 svc.indexNewDocs(
-                    fresh,
+                    listOf(doc),
                     strat,
                     onDocProgress = { src, done, total ->
                         val p = if (total <= 0) null else (done.toFloat() / total).coerceIn(0f, 1f)
@@ -272,30 +326,13 @@ class AppViewModel(private val scope: CoroutineScope) {
                     },
                     onLog = { m -> log(m) },
                 )
-                log("Проиндексировано: ${fresh.size} док.")
+                log("Проиндексировано: ${doc.title}")
             } catch (e: Exception) {
                 update { it.copy(status = "Индексация: ${e.message}") }
             } finally {
-                activeIndexJobs -= fresh.map { it.source }.toSet()
-                update { st -> st.copy(indexProgress = st.indexProgress - fresh.map { it.source }.toSet()) }
+                activeIndexJobs -= doc.source
+                update { st -> st.copy(indexProgress = st.indexProgress - doc.source) }
                 refreshDocs()
-            }
-        }
-    }
-
-    fun fetchWiki() {
-        val input = _state.value.wikiInput.trim()
-        if (input.isEmpty()) return
-        val strat = _state.value.addStrategy
-        update { it.copy(showWiki = false) }
-        scope.launch {
-            try {
-                log("Загружаю Wiki: $input ...")
-                val f = svc.fetchWikiAndSave(input)
-                log("Сохранено: ${f.name} (${f.length() / 1024} КБ)")
-                addRoots(listOf(f.absolutePath), strat)
-            } catch (e: Exception) {
-                update { it.copy(status = "Wiki: ${e.message}") }
             }
         }
     }
@@ -309,19 +346,8 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun removeDoc(source: String) {
         if (source in activeIndexJobs) return
-        // чанки + запись документа — из индекса; файловый корень — из списка; wiki-файл из corpus — с диска
+        // чанки + запись документа — из индекса, копия статьи — из корпуса
         svc.removeSources(listOf(source))
-        for (r in sources.load()) {
-            val f = File(r)
-            if (f.isFile && (f.absolutePath == source || f.absolutePath.endsWith("/" + source) || f.name == source.substringAfterLast("/"))) {
-                val cur = sources.loadState()
-                sources.save(cur.roots - r, cur.inactive)
-                try {
-                    if (f.parentFile?.name == "corpus") f.delete()
-                } catch (_: Exception) {
-                }
-            }
-        }
         if (_state.value.viewingDoc == source) update { it.copy(viewingDoc = null, viewingText = "") }
         log("Убран документ: ${source.substringAfterLast("/")}")
         refreshDocs()

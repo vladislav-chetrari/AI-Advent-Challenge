@@ -22,6 +22,8 @@ data class RagMessage(
     val id: String = newChatId(),
     // подписи источников RAG-ответа: "[S1] title / section"
     val sources: List<String> = emptyList(),
+    // Task 3: диагностика поиска ("найдено 20 → в контекст 4..."), пусто = нет.
+    val info: String = "",
 )
 
 @Serializable

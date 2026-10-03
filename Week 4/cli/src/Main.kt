@@ -1,18 +1,20 @@
 package cli
 
+import core.rag.DEFAULT_FINAL_K
+import core.rag.DEFAULT_MIN_SCORE
 import core.rag.DEFAULT_PROBES
+import core.rag.DEFAULT_RETRIEVE_K
 import core.rag.RagService
-import java.io.File
+import core.rag.RerankModes
 import kotlinx.coroutines.runBlocking
 
 // Headless-доступ к тому же RagService, что и у desktop-приложения.
-// Источники корпуса — явные файлы/папки с диска, привязки к коду проекта нет.
+// Единственный источник документов — статьи Википедии.
 //
-//   week4 index <путь...> [--strategy fixed|structure|both]
-//   week4 compare <путь...>
 //   week4 wiki <название статьи|URL> [...] [--strategy both]
-//   week4 search <запрос...> [--strategy structure] [--topK 5]
-//   week4 ask <вопрос...> [--strategy structure] [--topK 5]
+//   week4 search <запрос...> [--strategy structure] [--topK 5] [--minScore 0.35]
+//   week4 ask <вопрос...> [--strategy structure] [--topK 20] [--filter on|off] [--temperature 0.35] [--postK 5|off] [--rewrite on|off]
+//   week4 eval-modes [--probe "вопрос..."] [--strategy both]  (Задание 3: без фильтра vs фильтр vs фильтр+rewrite)
 fun main(args: Array<String>) = runBlocking {
     if (args.isEmpty()) {
         usage()
@@ -31,35 +33,6 @@ fun main(args: Array<String>) = runBlocking {
 private suspend fun runCommand(args: Array<String>) {
     val svc = RagService()
     when (args[0]) {
-        "index" -> {
-            val (paths, rest) = splitPaths(args)
-            if (paths.isEmpty()) fail("нужен хотя бы один путь: week4 index <путь...>")
-            val strategy = flag(rest, "--strategy") ?: "both"
-            val list = if (strategy == "both") listOf("fixed", "structure") else listOf(strategy)
-            val roots = paths.map { File(it) }
-            for (s in list) {
-                val out = svc.reindexRoots(roots, s) { println(it) }
-                println("ИТОГ [$s]: ${out.stats.chunks} чанков из ${out.docs} документов " +
-                    "(avg ${out.stats.avgChars} симв, dim ${out.stats.dim}, модель ${out.stats.embedModel})")
-            }
-        }
-        "compare" -> {
-            val (paths, rest) = splitPaths(args)
-            if (paths.isEmpty()) fail("нужен хотя бы один путь: week4 compare <путь...>")
-            // Свои пробы про САМ корпус, иначе дефолтные (про агента) дадут
-            // одинаковый мусор на обеих стратегиях и разницы не будет видно.
-            val probes = flags(rest, "--probe").ifEmpty { DEFAULT_PROBES }
-            val topK = flag(rest, "--topK")?.toIntOrNull() ?: 3
-            val res = svc.compareRoots(paths.map { File(it) }, probes, { println(it) }, topK)
-            for (rep in listOf(res.fixed, res.structure)) {
-                val st = rep.stats
-                println("\n### ${st.strategy}: ${st.chunks} чанков / ${st.docs} доков / avg ${st.avgChars} симв / ${st.indexMs}мс")
-                rep.probes.forEach { (q, hits) ->
-                    println("  Q: $q")
-                    hits.forEach { println("    - $it") }
-                }
-            }
-        }
         "wiki" -> {
             val (inputs, rest) = splitPaths(args)
             if (inputs.isEmpty()) fail("нужна статья: week4 wiki <название|URL>")
@@ -67,12 +40,10 @@ private suspend fun runCommand(args: Array<String>) {
             val list = if (strategy == "both") listOf("fixed", "structure") else listOf(strategy)
             for (input in inputs) {
                 println("Загружаю Википедию: $input ...")
-                val f = svc.fetchWikiAndSave(input)
-                println("Сохранено: ${f.absolutePath} (${f.length() / 1024} КБ)")
-                val (docs, skipped) = core.rag.DocumentLoader.loadRoots(listOf(f))
-                println("Документов: ${docs.size}, пропущено: $skipped")
+                val doc = svc.fetchWikiDoc(input)
+                println("Статья: ${doc.title} (${doc.text.length / 1024} КБ)")
                 for (s in list) {
-                    val stats = svc.indexDocs(docs, s) { println(it) }
+                    val stats = svc.indexDocs(listOf(doc), s) { println(it) }
                     println("ИТОГ [$s]: ${stats.chunks} чанков (avg ${stats.avgChars} симв)")
                 }
             }
@@ -81,10 +52,13 @@ private suspend fun runCommand(args: Array<String>) {
             val (query, rest) = splitQuery(args)
             val strategy = flag(rest, "--strategy") ?: "structure"
             val topK = flag(rest, "--topK")?.toIntOrNull() ?: 5
+            // Task 3: --minScore помечает кандидатов ниже порога как отсечённые.
+            val minScore = flag(rest, "--minScore")?.toFloatOrNull()
             val hits = svc.search(query, strategy, topK)
             if (hits.isEmpty()) println("Ничего не найдено (индекс пуст?). Сначала: week4 index <путь...>")
             hits.forEachIndexed { i, h ->
-                println("[${"%.4f".format(h.score)}] ${h.chunk.title} / ${h.chunk.section.ifBlank { "—" }} (${h.chunk.source})")
+                val cut = minScore != null && h.score < minScore
+                println("[${"%.4f".format(h.score)}]${if (cut) " ×ОТСЕЧЁН" else ""} ${h.chunk.title} / ${h.chunk.section.ifBlank { "—" }} (${h.chunk.source})")
                 println("  ${h.chunk.text.take(300).replace("\n", " ")}")
                 if (i < hits.size - 1) println()
             }
@@ -92,11 +66,66 @@ private suspend fun runCommand(args: Array<String>) {
         "ask" -> {
             val (query, rest) = splitQuery(args)
             val strategy = flag(rest, "--strategy") ?: "structure"
-            val topK = flag(rest, "--topK")?.toIntOrNull() ?: 5
-            val ans = svc.ask(query, strategy, topK)
+            // Задание 3: --topK — до фильтрации (= старый --retrieveK);
+            // фильтр --filter on|off (дефолт on), --temperature 0..1 (алиас --minScore),
+            // --postK — top-K после фильтрации 1..topK ("off"/пусто = без ограничения).
+            val topK = flag(rest, "--topK")
+                ?: flag(rest, "--retrieveK") ?: DEFAULT_RETRIEVE_K.toString()
+            val topKInt = topK.toIntOrNull() ?: DEFAULT_RETRIEVE_K
+            val filterFlag = flag(rest, "--filter")?.lowercase()
+            val rerankFlag = flag(rest, "--rerank")?.lowercase()
+            val filterEnabled = when {
+                filterFlag != null -> filterFlag != "off" && filterFlag != "0" && filterFlag != "false"
+                rerankFlag != null -> rerankFlag != RerankModes.OFF && rerankFlag != "0" && rerankFlag != "false"
+                else -> true
+            }
+            val temperature = flag(rest, "--temperature")?.toFloatOrNull()
+                ?: flag(rest, "--minScore")?.toFloatOrNull() ?: DEFAULT_MIN_SCORE
+            val postKRaw = flag(rest, "--postK") ?: flag(rest, "--post-filter-k") ?: flag(rest, "--finalK")
+            val postFilterK: Int? = when {
+                postKRaw == null -> DEFAULT_FINAL_K
+                postKRaw.equals("off", true) || postKRaw.equals("none", true) || postKRaw.isBlank() -> null
+                else -> postKRaw.toIntOrNull()
+            }
+            val rewrite = flag(rest, "--rewrite") == "on"
+            val ans = svc.ask(query, strategy, topKInt, onlySources = null,
+                filterEnabled = filterEnabled, temperature = temperature,
+                postFilterK = postFilterK, rewrite = rewrite)
             println(ans.text)
-            println("\nИсточники:")
-            ans.sources.forEachIndexed { i, h -> println("  [S${i + 1}] ${h.chunk.title} / ${h.chunk.section.ifBlank { "—" }}") }
+            println("\n[${ans.retrieval.summary(temperature)}]")
+            if (ans.retrieval.rewritten.isNotEmpty()) {
+                println("Rewrite-запросы:")
+                ans.retrieval.rewritten.forEach { println("  + $it") }
+            }
+            println("Источники:")
+            ans.sources.forEachIndexed { i, h ->
+                println("  [S${i + 1}] ${h.chunk.title} / ${h.chunk.section.ifBlank { "—" }} (${"%.3f".format(h.score)})")
+            }
+        }
+        // Задание 3: сравнение режимов без переиндексации — одни и те же пробы
+        // через без фильтра / с фильтром / фильтр+rewrite. Для rewrite нужен DEEPSEEK_API_KEY.
+        "eval-modes" -> {
+            val (_, rest) = splitPaths(args)
+            val probes = flags(rest, "--probe").ifEmpty { DEFAULT_PROBES }
+            val strategy = flag(rest, "--strategy") ?: "both"
+            val topK = flag(rest, "--topK")?.toIntOrNull()
+                ?: flag(rest, "--retrieveK")?.toIntOrNull() ?: DEFAULT_RETRIEVE_K
+            val temperature = flag(rest, "--temperature")?.toFloatOrNull()
+                ?: flag(rest, "--minScore")?.toFloatOrNull() ?: DEFAULT_MIN_SCORE
+            val postKRaw = flag(rest, "--postK") ?: flag(rest, "--post-filter-k") ?: flag(rest, "--finalK")
+            val postFilterK: Int? = when {
+                postKRaw == null -> DEFAULT_FINAL_K
+                postKRaw.equals("off", true) || postKRaw.equals("none", true) || postKRaw.isBlank() -> null
+                else -> postKRaw.toIntOrNull()
+            }
+            val res = svc.compareModes(probes, strategy, topK, temperature, postFilterK, onLog = { println(it) })
+            for (rep in res.reports) {
+                println("\n### ${rep.modeLabel}: в среднем kept=${"%.1f".format(rep.avgKept)} dropped=${"%.1f".format(rep.avgDropped)}")
+                rep.probes.forEach { (q, hits) ->
+                    println("  Q: $q")
+                    hits.forEach { println("    - $it") }
+                }
+            }
         }
         // Скрытый дымовой тест новых путей: RAG вкл/выкл, фильтр документов. He для видео.
         "selftest" -> {
@@ -133,12 +162,17 @@ private fun fail(msg: String): Nothing {
 }
 
 private fun usage() {
-    println("week4 index <путь...> [--strategy fixed|structure|both]")
-    println("week4 compare <путь...> [--probe \"вопрос...\" ...] [--topK 3]")
-    println("  пример: week4 compare corpus --probe \"Сколько сольдо за погребение Катерины?\" --probe \"В каком разделе про коршуна и Фрейда?\"")
     println("week4 wiki <название статьи|URL> [...] [--strategy both]")
-    println("week4 search <запрос...> [--strategy structure] [--topK 5]")
-    println("week4 ask <вопрос...> [--strategy structure] [--topK 5]")
+    println("week4 search <запрос...> [--strategy structure] [--topK 5] [--minScore 0.35]")
+    println("  --minScore: пометить кандидатов ниже порога как отсечённые")
+    println("week4 ask <вопрос...> [--strategy structure] [--topK 20] [--filter on|off] [--temperature 0.35] [--postK 5|off] [--rewrite on|off]")
+    println("  --topK: сколько чанков забрать из индекса (до фильтрации)")
+    println("  --filter: вкл/выкл фильтрации (выкл = как было в Task 2)")
+    println("  --temperature: точность-порог 0-1; пусто после фильтра = честный отказ (алиас --minScore)")
+    println("  --postK: top-K после фильтрации 1..topK (off = без ограничения, идут все прошедшие порог)")
+    println("  --rewrite on: переписать вопрос через DeepSeek и искать по всем вариантам")
+    println("week4 eval-modes [--probe \"вопрос...\" ...] [--strategy both] [--topK 20] [--temperature 0.35] [--postK 5|off]")
+    println("  сравнение режимов без фильтра / с фильтром / фильтр+rewrite на одних пробах (без переиндексации)")
 }
 
 private fun flag(args: Array<String>, name: String): String? {

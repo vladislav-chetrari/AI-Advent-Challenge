@@ -75,35 +75,9 @@ class RagService(
         else -> FixedSizeChunker()
     }
 
-    data class IndexOutcome(val stats: IndexStats, val docs: Int, val skipped: Int)
-
-    // Индексация папки (совместимость с Task 1 / CLI).
-    suspend fun reindex(
-        corpusDir: File,
-        strategy: String,
-        onLog: (String) -> Unit = {},
-    ): IndexOutcome = reindexRoots(listOf(corpusDir), strategy, onLog)
-
-    // Главный вход: явно выбранные пользователем файлы/папки (книга, статьи).
-    suspend fun reindexRoots(
-        roots: List<File>,
-        strategy: String,
-        onLog: (String) -> Unit = {},
-    ): IndexOutcome = withContext(Dispatchers.IO) {
-        val (docs, skipped) = DocumentLoader.loadRoots(roots)
-        onLog("Документов: ${docs.size}, пропущено: $skipped")
-        if (docs.isEmpty()) {
-            return@withContext IndexOutcome(
-                IndexStats(strategy, 0, 0, 0, 0, embedder().dim, embedder().name, 0), 0, skipped
-            )
-        }
-        val stats = indexDocs(docs, strategy, onLog)
-        IndexOutcome(stats, docs.size, skipped)
-    }
-
     // Ядро индексации: готовые RawDoc -> чанки -> эмбеддинги -> upsert.
-    // Сюда же придут документы из WikiLoader и будущих источников.
-    // Полная перезапись стратегии (для CLI index/compare): чужие документы не трогаем
+    // Единственный источник документов — статьи Википедии (см. fetchWikiDoc).
+    // Полная перезапись стратегии (для CLI wiki): чужие документы не трогаем
     // только в indexNewDocs; здесь исторически wipe стратегии целиком.
     suspend fun indexDocs(
         docs: List<RawDoc>,
@@ -252,15 +226,18 @@ class RagService(
         }
     }
 
-    // Статья Википедии -> файл локального корпуса (appDir/corpus).
-    // Дальше статья — обычный файл: попадает в выбор источников и индекс.
-    suspend fun fetchWikiAndSave(input: String): File = withContext(Dispatchers.IO) {
+    // Статья Википедии -> RawDoc + копия в локальном корпусе (appDir/corpus) для просмотра.
+    // Единственный способ пополнить базу знаний.
+    suspend fun fetchWikiDoc(input: String): RawDoc = withContext(Dispatchers.IO) {
         val doc = WikiLoader.fetch(input)
-        val dir = File(ApiKeyProvider.appDir(), "corpus")
-        dir.mkdirs()
-        val f = File(dir, WikiLoader.fileNameFor(doc))
-        f.writeText("# ${doc.title}\n\nИсточник: ${doc.source}\n\n${doc.text}", Charsets.UTF_8)
-        f
+        try {
+            val dir = File(appDir, "corpus")
+            dir.mkdirs()
+            File(dir, WikiLoader.fileNameFor(doc))
+                .writeText("# ${doc.title}\n\nИсточник: ${doc.source}\n\n${doc.text}", Charsets.UTF_8)
+        } catch (_: Exception) {
+        }
+        doc
     }
 
     suspend fun search(
@@ -272,6 +249,28 @@ class RagService(
         if (query.isBlank()) return emptyList()
         val q = embedder().embed(listOf(query)).first()
         return store.search(strategy, q, topK.coerceIn(1, 20), onlySources)
+    }
+
+    // Task 3: поиск со вторым этапом. По оригиналу + rewrite-вариантам
+    // забираем широко (top-K до фильтрации на запрос), выдачи сливаем max-score,
+    // дальше rerank(): порог по температуре + опциональный top-K после.
+    // Возвращаем и kept, и debug по dropped.
+    suspend fun searchWithRerank(
+        query: String,
+        strategy: String,
+        config: RerankConfig,
+        onlySources: Set<String>? = null,
+        rewrites: List<String> = emptyList(),
+    ): Pair<List<String>, RerankResult> {
+        val cfg = config.normalized()
+        if (query.isBlank()) return emptyList<String>() to RerankResult(emptyList(), emptyList())
+        val queries = (listOf(query) + rewrites.filter { it.isNotBlank() }).distinct()
+        val lists = queries.map { q ->
+            val v = embedder().embed(listOf(q)).first()
+            store.search(strategy, v, cfg.retrieveK, onlySources)
+        }
+        val merged = mergeRetrievals(lists)
+        return queries to rerank(query, merged, cfg)
     }
 
     fun stats(strategy: String): IndexStats {
@@ -289,57 +288,49 @@ class RagService(
         )
     }
 
-    // Task 1 (усиление): индексируем корпус обеими стратегиями и гоняем
-    // одни и те же пробные запросы — видно разницу в релевантности top-1.
-    // Пробные запросы должны быть про САМ корпус (а не дефолтные про агента),
-    // иначе обе стратегии покажут одинаковый мусор: CLI compare принимает
-    // свои пробы через --probe "..." (можно несколько раз).
-    suspend fun compare(
-        corpusDir: File,
-        probes: List<String> = DEFAULT_PROBES,
-        onLog: (String) -> Unit = {},
-        topK: Int = 3,
-    ): CompareResult = compareRoots(listOf(corpusDir), probes, onLog, topK)
-
-    suspend fun compareRoots(
-        roots: List<File>,
-        probes: List<String> = DEFAULT_PROBES,
-        onLog: (String) -> Unit = {},
-        topK: Int = 3,
-    ): CompareResult {
-        suspend fun run(strategy: String): StrategyReport {
-            onLog("== Стратегия: $strategy ==")
-            val outcome = reindexRoots(roots, strategy, onLog)
-            val probeHits = LinkedHashMap<String, List<String>>()
-            for (q in probes) {
-                val hits = search(q, strategy, topK)
-                probeHits[q] = hits.map { h ->
-                    val sec = h.chunk.section.ifBlank { "—" }
-                    "${h.chunk.title} / $sec (${"%.3f".format(h.score)})"
-                }
-            }
-            return StrategyReport(outcome.stats, probeHits)
-        }
-        val fixed = run("fixed")
-        val structure = run("structure")
-        return CompareResult(fixed, structure)
-    }
-
-    // RAG-ответ: retrieve topK -> промпт с контекстом [S1..Sn] -> DeepSeek.
+    // RAG-ответ: retrieve (широко) -> rewrite-слияние -> фильтр ->
+    // промпт с контекстом [S1..Sn] -> DeepSeek.
     // onlySources ограничивает контекст активными документами.
     // Дефолт "both": документы с разными стратегиями ищутся одним запросом.
-    // Задел на Task 2-5: rerank/фильтр порога встраиваются между search и buildPrompt.
+    // Задание 3: topK — до фильтрации; filterEnabled вкл/выкл;
+    // temperature 0..1 — порог точности; postFilterK (null = без ограничения,
+    // иначе 1..topK) — повторная обрезка после фильтра по температуре.
+    // Фильтр выкл = поведение Task 2 без изменений.
     suspend fun ask(
         query: String,
         strategy: String = "both",
-        topK: Int = 8,
+        topK: Int = DEFAULT_RETRIEVE_K,
         apiKey: String? = null,
         onlySources: Set<String>? = null,
+        filterEnabled: Boolean = true,
+        temperature: Float = DEFAULT_MIN_SCORE,
+        postFilterK: Int? = DEFAULT_FINAL_K,
+        rewrite: Boolean = false,
     ): RagAnswer {
-        val hits = search(query, strategy, topK, onlySources)
-        if (hits.isEmpty()) {
-            return RagAnswer("База знаний пуста — добавь документы через «+» в разделе «База знаний».", emptyList())
+        val mode = if (filterEnabled) RerankModes.THRESHOLD else RerankModes.OFF
+        val cfg = RerankConfig(mode, topK, postFilterK, temperature).normalized()
+        val key = apiKey ?: ApiKeyProvider.resolve()
+        val rewrites = if (rewrite) rewriteQueries(query, llm, key) else emptyList()
+        val (queries, rr) = searchWithRerank(query, strategy, cfg, onlySources, rewrites)
+        val debug = RetrievalDebug(
+            retrieved = rr.kept.size + rr.dropped.size,
+            kept = rr.kept.size,
+            dropped = rr.dropped.size,
+            minKeptScore = rr.kept.minOfOrNull { it.score },
+            rewritten = queries.drop(1),
+            rerankMode = cfg.mode,
+        )
+        if (rr.kept.isEmpty()) {
+            val hint = if (cfg.mode == RerankModes.OFF) {
+                "База знаний пуста — добавь статью через «+» в разделе «База знаний»."
+            } else {
+                "Ничего релевантного не нашлось (температура ${cfg.minScore}, " +
+                    "кандидатов: ${debug.retrieved}). " +
+                    "Попробуй переформулировать вопрос или снизить температуру в настройках RAG."
+            }
+            return RagAnswer(hint, emptyList(), debug)
         }
+        val hits = rr.kept
         val context = hits.mapIndexed { i, h ->
             "[S${i + 1}] ${h.chunk.title}" +
                 (if (h.chunk.section.isNotBlank()) " / ${h.chunk.section}" else "") +
@@ -350,11 +341,53 @@ class RagService(
             "Если ответа нет во фрагментах — так и скажи."
         val user = "Контекст:\n$context\n\nВопрос: $query"
         return when (val r = llm.complete(listOf(ChatMsg("system", system), ChatMsg("user", user)), apiKey ?: ApiKeyProvider.resolve())) {
-            is LlmResult.Ok -> RagAnswer(r.text, hits)
-            is LlmResult.HttpError -> RagAnswer("DeepSeek HTTP ${r.code}: ${r.detail.take(200)}", hits)
-            is LlmResult.NetworkError -> RagAnswer("Сеть: ${r.detail.take(200)}", hits)
-            LlmResult.Empty -> RagAnswer("Пустой ответ модели.", hits)
+            is LlmResult.Ok -> RagAnswer(r.text, hits, debug)
+            is LlmResult.HttpError -> RagAnswer("DeepSeek HTTP ${r.code}: ${r.detail.take(200)}", hits, debug)
+            is LlmResult.NetworkError -> RagAnswer("Сеть: ${r.detail.take(200)}", hits, debug)
+            LlmResult.Empty -> RagAnswer("Пустой ответ модели.", hits, debug)
         }
+    }
+
+    // Task 3: сравнение режимов на одних пробах БЕЗ переиндексации.
+    // Режимы: "без фильтра" / "с фильтром" / "фильтр + rewrite".
+    // Задание 3: те же top-K до, температура и опциональный top-K после
+    // для честного сравнения качества без фильтра / с фильтром.
+    suspend fun compareModes(
+        probes: List<String>,
+        strategy: String = "both",
+        topK: Int = DEFAULT_RETRIEVE_K,
+        temperature: Float = DEFAULT_MIN_SCORE,
+        postFilterK: Int? = DEFAULT_FINAL_K,
+        apiKey: String? = null,
+        onLog: (String) -> Unit = {},
+    ): ModesCompareResult {
+        val key = apiKey ?: ApiKeyProvider.resolve()
+        val modes = listOf(
+            "без фильтра" to Pair(RerankModes.OFF, false),
+            "с фильтром (темп. $temperature)" to Pair(RerankModes.THRESHOLD, false),
+            "фильтр + rewrite" to Pair(RerankModes.THRESHOLD, true),
+        )
+        val reports = modes.map { (label, mode) ->
+            onLog("== Режим: $label ==")
+            val (rerankMode, useRewrite) = mode
+            val cfg = RerankConfig(rerankMode, topK, postFilterK, temperature).normalized()
+            val probeHits = LinkedHashMap<String, List<String>>()
+            var keptSum = 0
+            var droppedSum = 0
+            for (q in probes) {
+                val rewrites = if (useRewrite) rewriteQueries(q, llm, key) else emptyList()
+                val (_, rr) = searchWithRerank(q, strategy, cfg, activeSourcesOrNull(), rewrites)
+                keptSum += rr.kept.size
+                droppedSum += rr.dropped.size
+                probeHits[q] = rr.kept.map { h ->
+                    val sec = h.chunk.section.ifBlank { "—" }
+                    "${h.chunk.title} / $sec (${"%.3f".format(h.score)})"
+                }.ifEmpty { listOf("<отсечено всё: кандидатов ${rr.kept.size + rr.dropped.size}>") }
+            }
+            val n = probes.size.coerceAtLeast(1)
+            ModeReport(label, probeHits, keptSum.toDouble() / n, droppedSum.toDouble() / n)
+        }
+        return ModesCompareResult(reports)
     }
 
     // Обычный ответ без поиска: чат с выключенным RAG.
@@ -415,43 +448,39 @@ class RagService(
         sourcesStore.setInactive(source, !active)
     }
 
-    // Убранные из списка источники: чистим их чанки из обеих стратегий.
+    // Убранные из списка источники: чистим их чанки из обеих стратегий
+    // + сохранённую копию статьи в корпусе.
     fun removeSources(sources: Collection<String>) {
         store.deleteSources(sources)
-        val cur = sourcesStore.loadState()
-        sourcesStore.save(cur.roots.filter { it !in sources }, cur.inactive - sources.toSet())
-    }
-
-    // Текст документа для просмотра: абсолютный путь, файл корпуса или поиск по корням.
-    fun docText(source: String, maxChars: Int = 30_000): String? {
-        val direct = File(source)
-        if (direct.isFile) return direct.readTextSafe()?.take(maxChars)
-        val roots = sourcesStore.load().map { File(it) }
-        // сначала файлы корпуса (туда сохраняются wiki-статьи)
-        val corpus = File(ApiKeyProvider.appDir(), "corpus")
-        corpus.walkTopDown().filter { it.isFile && (it.name == source.substringAfterLast("/") || it.absolutePath.endsWith(source)) }
-            .firstOrNull()?.readTextSafe()?.let { return it.take(maxChars) }
-        for (r in roots) {
-            if (!r.exists()) continue
-            if (r.isFile && (r.absolutePath.endsWith(source) || r.name == source.substringAfterLast("/"))) {
-                r.readTextSafe()?.let { return it.take(maxChars) }
+        sourcesStore.save(sourcesStore.loadState().inactive - sources.toSet())
+        try {
+            File(appDir, "corpus").walkTopDown().filter { it.isFile }.forEach { f ->
+                try {
+                    if (sources.any { s -> f.readText(Charsets.UTF_8).contains("Источник: $s") }) f.delete()
+                } catch (_: Exception) {
+                }
             }
-            if (r.isDirectory) {
-                r.walkTopDown().filter { it.isFile }.firstOrNull { f ->
-                    try {
-                        r.toURI().relativize(f.toURI()).path.trimEnd('/') == source
-                    } catch (_: Exception) {
-                        false
-                    }
-                }?.readTextSafe()?.let { return it.take(maxChars) }
-            }
+        } catch (_: Exception) {
         }
-        return null
     }
 
-    private fun File.readTextSafe(): String? = try {
-        readText(Charsets.UTF_8)
-    } catch (_: Exception) {
-        null
+    // Текст документа для просмотра: сначала копия статьи в корпусе,
+    // fallback — склейка чанков из индекса.
+    fun docText(source: String, maxChars: Int = 30_000): String? {
+        try {
+            File(appDir, "corpus").walkTopDown().filter { it.isFile }.forEach { f ->
+                try {
+                    val t = f.readText(Charsets.UTF_8)
+                    if (t.contains("Источник: $source")) return t.take(maxChars)
+                } catch (_: Exception) {
+                }
+            }
+        } catch (_: Exception) {
+        }
+        val chunks = store.loadAllChunks().filter { it.source == source }
+        if (chunks.isEmpty()) return null
+        val strat = if (chunks.any { it.strategy == "structure" }) "structure" else chunks.first().strategy
+        return chunks.filter { it.strategy == strat }.sortedBy { it.ord }
+            .joinToString("\n\n") { it.text }.take(maxChars).ifBlank { null }
     }
 }

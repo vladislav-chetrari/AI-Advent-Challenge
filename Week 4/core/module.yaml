@@ -12,7 +12,6 @@ dependencies:
   - org.jetbrains.exposed:exposed-core:0.61.0
   - org.jetbrains.exposed:exposed-jdbc:0.61.0
   - org.flywaydb:flyway-core:11.10.0
-  - org.apache.pdfbox:pdfbox:3.0.5
   - org.slf4j:slf4j-simple:2.0.13
 
 settings:

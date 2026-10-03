@@ -26,6 +26,7 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -53,23 +54,20 @@ import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import com.mikepenz.markdown.m3.Markdown
 import core.rag.DocInfo
-import core.rag.DocumentLoader
 import core.rag.RagChat
 import core.rag.RagMessage
 import desktop.ui.AppViewModel
 import desktop.ui.chatMarkdownTypography
-import javax.swing.JFileChooser
-import javax.swing.filechooser.FileNameExtensionFilter
 
 fun main() = application {
     val windowState = rememberWindowState(width = 1100.dp, height = 780.dp)
     Window(onCloseRequest = ::exitApplication, title = "Week4 RAG — чаты по своим документам", state = windowState) {
-        MaterialTheme { Root(window) }
+        MaterialTheme { Root() }
     }
 }
 
 @Composable
-fun Root(window: java.awt.Window) {
+fun Root() {
     val scope = rememberCoroutineScope()
     val vm = remember(scope) { AppViewModel(scope = scope) }
     val st by vm.state.collectAsState()
@@ -101,7 +99,7 @@ fun Root(window: java.awt.Window) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     TextButton(onClick = vm::openSettings) { Text("⚙", color = Color(0xFFBBBBBB), fontSize = 15.sp) }
                     Spacer(Modifier.width(2.dp))
-                    Button(onClick = vm::openAddMenu) { Text("+") }
+                    Button(onClick = vm::openWiki) { Text("+") }
                 }
             }
             Spacer(Modifier.height(4.dp))
@@ -114,7 +112,7 @@ fun Root(window: java.awt.Window) {
                         onDelete = { vm.removeDoc(d.source) })
                 }
                 if (st.docs.isEmpty()) {
-                    item { Text("Пусто — нажми + и добавь PDF, тексты или статью Wiki", color = Color(0xFF888888), fontSize = 12.sp) }
+                    item { Text("Пусто — нажми + и добавь статью Википедии", color = Color(0xFF888888), fontSize = 12.sp) }
                 }
             }
             Spacer(Modifier.height(6.dp))
@@ -145,9 +143,9 @@ fun Root(window: java.awt.Window) {
     }
 
     if (st.showCreateChat) CreateChatDialog(vm)
-    if (st.showAddMenu) AddDialog(vm, window)
     if (st.showWiki) WikiDialog(vm)
     if (st.showSettings) SettingsDialog(vm)
+    if (st.showRagSettings) RagSettingsDialog(vm)
 }
 
 @Composable
@@ -239,6 +237,10 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
                 onClick = { vm.toggleRag(chat.id) },
                 label = { Text(if (chat.ragEnabled) "RAG вкл" else "RAG выкл") },
             )
+            if (chat.ragEnabled) {
+                Spacer(Modifier.width(4.dp))
+                TextButton(onClick = vm::openRagSettings) { Text("RAG ⚙", fontSize = 12.sp) }
+            }
             Spacer(Modifier.width(8.dp))
             TextButton(onClick = { vm.clearChat(chat.id) }) { Text("очистить", fontSize = 12.sp) }
         }
@@ -287,6 +289,11 @@ fun MessageBubble(m: RagMessage) {
     val bg = if (m.role == "user") Color(0xFFE3F2FD) else Color(0xFFF1F1F1)
     Column(Modifier.fillMaxWidth().padding(vertical = 3.dp).background(bg).padding(8.dp)) {
         Text(m.role, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
+        // Task 3: диагностика второго этапа ("найдено 20 → в контекст 4...").
+        if (m.info.isNotBlank()) {
+            Text(m.info, fontSize = 10.sp, color = Color(0xFF888888))
+            Spacer(Modifier.height(2.dp))
+        }
         SelectionContainer {
             if (m.role == "user") {
                 Text(m.content, fontSize = 14.sp)
@@ -374,6 +381,131 @@ fun SettingsDialog(vm: AppViewModel) {
     )
 }
 
+// Задание 3: настройки RAG — применяются сразу, без кнопки "Сохранить".
+// Структура повторяет пайплайн: top-K до → rewrite → фильтр (температура + top-K после).
+@Composable
+fun RagSettingsDialog(vm: AppViewModel) {
+    val st by vm.state.collectAsState()
+    AlertDialog(
+        onDismissRequest = vm::closeRagSettings,
+        title = { Text("Настройки RAG") },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                // 1. Top-K до фильтрации.
+                Text("Top-K (до фильтрации)", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                OutlinedTextField(
+                    value = st.topK.toString(), onValueChange = vm::setTopK,
+                    label = { Text("Чанков забрать (1–50)", fontSize = 11.sp) }, singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                Text(
+                    "Сколько лучших чанков взять из индекса. Рекомендуется 10–30 (дефолт 20): " +
+                        "меньше 10 — можно пропустить нужное, больше 30 — дольше и шумнее.",
+                    fontSize = 11.sp, color = Color.Gray,
+                )
+                // 2. Rewrite query с помощью LLM.
+                Text("Rewrite запроса", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                    FilterChip(
+                        selected = st.rewriteEnabled,
+                        onClick = { vm.setRewriteEnabled(!st.rewriteEnabled) },
+                        label = { Text(if (st.rewriteEnabled) "Включён" else "Выключен", fontSize = 12.sp) },
+                    )
+                }
+                Text(
+                    "Модель переписывает вопрос в 1–2 поисковых запроса («а при чём тут Косово?» → «сербское кос, чёрный дрозд»). " +
+                        "Помогает коротким и разговорным вопросам; стоит +1 запрос к DeepSeek.",
+                    fontSize = 11.sp, color = Color.Gray,
+                )
+                // 3. Фильтрация вкл/выкл.
+                Text("Фильтрация", fontSize = 12.sp, fontWeight = FontWeight.Bold)
+                Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    FilterChip(
+                        selected = !st.filterEnabled,
+                        onClick = { vm.setFilterEnabled(false) },
+                        label = { Text("Выкл", fontSize = 12.sp) },
+                    )
+                    FilterChip(
+                        selected = st.filterEnabled,
+                        onClick = { vm.setFilterEnabled(true) },
+                        label = { Text("Вкл", fontSize = 12.sp) },
+                    )
+                }
+                if (!st.filterEnabled) {
+                    Text(
+                        "Фильтр выключен: первые top-K чанков идут модели как есть (режим Task 2). " +
+                            "Быстро, но мусор тоже попадает в контекст.",
+                        fontSize = 11.sp, color = Color.Gray,
+                    )
+                } else {
+                    Text(
+                        "Фильтр включён: сначала отсечение по температуре, затем опциональный top-K после. " +
+                            "Если не осталось ничего — ассистент честно скажет, что не нашёл.",
+                        fontSize = 11.sp, color = Color.Gray,
+                    )
+                    // Температура — точность ответа, 0..1.
+                    Text(
+                        "Температура: ${"%.2f".format(st.temperature)}",
+                        fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                    )
+                    Slider(
+                        value = st.temperature,
+                        onValueChange = vm::setTemperatureSlider,
+                        valueRange = 0f..1f,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = st.temperature.toString(), onValueChange = vm::setTemperature,
+                        label = { Text("Температура — точность (0–1)", fontSize = 11.sp) }, singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Text(
+                        "Порог отсечения по похожести: выше — строже, но можно отрезать и нужное. " +
+                            "Стартовая вилка 0.3–0.5: ответы пустые — снижай, в ответ лезет мусор — повышай.",
+                        fontSize = 11.sp, color = Color.Gray,
+                    )
+                    // Top-K после фильтрации — опционален, 1..top-K до.
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        FilterChip(
+                            selected = st.postFilterK != null,
+                            onClick = { vm.setPostFilterKEnabled(st.postFilterK == null) },
+                            label = { Text("Ограничить top-K после", fontSize = 12.sp) },
+                        )
+                    }
+                    OutlinedTextField(
+                        value = st.postFilterK?.toString() ?: "",
+                        onValueChange = vm::setPostFilterK,
+                        label = { Text("Top-K после (1–${st.topK}, пусто = все)", fontSize = 11.sp) },
+                        singleLine = true, enabled = st.postFilterK != null,
+                        modifier = Modifier.fillMaxWidth(),
+                        placeholder = { Text("без ограничения", fontSize = 11.sp) },
+                    )
+                    Text(
+                        "Повторная обрезка после фильтра по температуре: в контекст уйдёт не больше N чанков. " +
+                            "Пусто — идут все прошедшие порог.",
+                        fontSize = 11.sp, color = Color.Gray,
+                    )
+                }
+                Text(
+                    if (!st.filterEnabled) {
+                        "Итого сейчас: забрать ${st.topK} → в контекст ${st.topK} без фильтра."
+                    } else if (st.postFilterK != null) {
+                        "Итого сейчас: забрать ${st.topK} → фильтр (темп. ${st.temperature}) → в ответ до ${st.postFilterK}."
+                    } else {
+                        "Итого сейчас: забрать ${st.topK} → фильтр (темп. ${st.temperature}) → в ответ все прошедшие."
+                    },
+                    fontSize = 11.sp, color = Color.Gray, fontWeight = FontWeight.Bold,
+                )
+            }
+        },
+        confirmButton = { Button(onClick = vm::closeRagSettings) { Text("Готово") } },
+        dismissButton = {},
+    )
+}
+
 @Composable
 fun CreateChatDialog(vm: AppViewModel) {
     val st by vm.state.collectAsState()
@@ -420,31 +552,6 @@ fun StrategyChip(label: String, value: String, selected: String, onSelect: (Stri
 }
 
 @Composable
-fun AddDialog(vm: AppViewModel, window: java.awt.Window) {
-    val st by vm.state.collectAsState()
-    AlertDialog(
-        onDismissRequest = vm::closeAddMenu,
-        title = { Text("Добавить в базу знаний") },
-        text = {
-            Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                ChunkStrategyPicker(st.addStrategy, vm::setAddStrategy)
-                Button(onClick = { vm.addRoots(pickFiles(window), st.addStrategy) }, modifier = Modifier.fillMaxWidth()) {
-                    Text("📄 Файлы… (PDF, тексты, код)")
-                }
-                Button(onClick = { pickDirectory(window)?.let { vm.addRoots(listOf(it), st.addStrategy) } }, modifier = Modifier.fillMaxWidth()) {
-                    Text("📁 Папка…")
-                }
-                Button(onClick = vm::openWiki, modifier = Modifier.fillMaxWidth()) {
-                    Text("🌐 Статья Википедии…")
-                }
-            }
-        },
-        confirmButton = {},
-        dismissButton = { TextButton(onClick = vm::closeAddMenu) { Text("Отмена") } },
-    )
-}
-
-@Composable
 fun WikiDialog(vm: AppViewModel) {
     val st by vm.state.collectAsState()
     AlertDialog(
@@ -464,29 +571,4 @@ fun WikiDialog(vm: AppViewModel) {
         confirmButton = { Button(onClick = vm::fetchWiki, enabled = st.wikiInput.isNotBlank()) { Text("Загрузить") } },
         dismissButton = { TextButton(onClick = vm::closeWiki) { Text("Отмена") } },
     )
-}
-
-// Нативные диалоги выбора: папка — режим директорий,
-// файлы — мультиселект с фильтром по поддерживаемым расширениям.
-fun pickDirectory(parent: java.awt.Window): String? {
-    val c = JFileChooser().apply {
-        dialogTitle = "Папка с документами"
-        fileSelectionMode = JFileChooser.DIRECTORIES_ONLY
-        isAcceptAllFileFilterUsed = false
-    }
-    return if (c.showOpenDialog(parent) == JFileChooser.APPROVE_OPTION) c.selectedFile.absolutePath else null
-}
-
-fun pickFiles(parent: java.awt.Window): List<String> {
-    val c = JFileChooser().apply {
-        dialogTitle = "Документы (PDF, Markdown, текст, код)"
-        fileSelectionMode = JFileChooser.FILES_ONLY
-        isMultiSelectionEnabled = true
-        val exts = (DocumentLoader.PICK_EXTENSIONS - "pdf").toTypedArray()
-        addChoosableFileFilter(FileNameExtensionFilter("Тексты и код", *exts))
-        addChoosableFileFilter(FileNameExtensionFilter("PDF-книги", "pdf"))
-    }
-    return if (c.showOpenDialog(parent) == JFileChooser.APPROVE_OPTION) {
-        c.selectedFiles.map { it.absolutePath }
-    } else emptyList()
 }
