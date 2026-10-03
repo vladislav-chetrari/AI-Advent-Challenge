@@ -103,6 +103,8 @@ class RagService(
 
     // Ядро индексации: готовые RawDoc -> чанки -> эмбеддинги -> upsert.
     // Сюда же придут документы из WikiLoader и будущих источников.
+    // Полная перезапись стратегии (для CLI index/compare): чужие документы не трогаем
+    // только в indexNewDocs; здесь исторически wipe стратегии целиком.
     suspend fun indexDocs(
         docs: List<RawDoc>,
         strategy: String,
@@ -115,31 +117,12 @@ class RagService(
         // Инкрементальность: вектора неизменившихся текстов забираем из БД,
         // модель считает только новые. После clear+upsert индекс консистентен.
         val stored = store.loadTextVectors(strategy)
-        val vectors = arrayOfNulls<FloatArray>(chunks.size)
-        val missing = mutableListOf<String>()
-        val missingIdx = mutableListOf<Int>()
-        var reused = 0
-        chunks.forEachIndexed { i, c ->
-            val v = stored[c.text]
-            if (v != null && v.size == embedder().dim) {
-                vectors[i] = v
-                reused++
-            } else {
-                missing += c.text
-                missingIdx += i
-            }
-        }
-        if (reused > 0) onLog("Переиспользовано векторов из БД: $reused")
-        val total = missing.size
-        var done = 0
-        for (batch in missing.chunked(32)) {
-            val emb = embedder().embed(batch)
-            emb.forEachIndexed { k, v -> vectors[missingIdx[done + k]] = v }
-            done += batch.size
+        val vectors = embedWithReuse(chunks.map { it.text }, stored) { done, total ->
             if (done % 256 == 0 || done == total) onLog("Эмбеддинги: $done/$total (новых)")
         }
         store.clearStrategy(strategy)
-        store.upsert(chunks, vectors.map { it!! })
+        store.upsert(chunks, vectors)
+        touchDocsReady(docs, strategy)
         val ms = System.currentTimeMillis() - t0
         val chars = chunks.sumOf { it.text.length.toLong() }
         val stats = IndexStats(
@@ -154,6 +137,119 @@ class RagService(
         )
         onLog("Готово за ${ms / 1000}с. ${embedder().stats()}")
         stats
+    }
+
+    // Точечная индексация только что добавленных документов — выбранной
+    // при добавлении стратегией, без wipe чужих документов.
+    // onDocProgress(source, done, total): done эмбеддингов из total новых
+    // для документа (total=0 — нет новых, док уже в кэше/БД).
+    suspend fun indexNewDocs(
+        docs: List<RawDoc>,
+        strategy: String,
+        onDocProgress: (source: String, done: Int, total: Int) -> Unit = { _, _, _ -> },
+        onLog: (String) -> Unit = {},
+    ) = withContext(Dispatchers.IO) {
+        val wanted = if (strategy == "both") listOf("fixed", "structure") else listOf(strategy)
+        val storedByStrategy = wanted.associateWith { store.loadTextVectors(it) }
+        val failed = mutableListOf<String>()
+        for (doc in docs) {
+            try {
+                for (s in wanted) {
+                    val chunks = chunkerFor(s).chunk(doc)
+                    val stored = storedByStrategy[s].orEmpty()
+                    val vectors = embedWithReuse(chunks.map { it.text }, stored) { done, total ->
+                        onDocProgress(doc.source, done, total)
+                    }
+                    store.deleteSourcesForStrategy(listOf(doc.source), s)
+                    store.upsert(chunks, vectors)
+                    onLog("«${doc.title}» [$s]: ${chunks.size} чанков")
+                }
+                store.upsertDoc(
+                    DocumentEntry(doc.source, doc.title, strategy, DocStatus.READY, "", System.currentTimeMillis())
+                )
+            } catch (e: Exception) {
+                store.upsertDoc(
+                    DocumentEntry(doc.source, doc.title, strategy, DocStatus.ERROR, e.message ?: "ошибка", System.currentTimeMillis())
+                )
+                failed += "«${doc.title}»: ${e.message}"
+            }
+        }
+        if (failed.isNotEmpty()) throw IllegalStateException(failed.joinToString("; "))
+    }
+
+    // Общий эмбеддинг с переиспользованием векторов из БД + LRU-кэша модели.
+    // Возвращает вектора 1-в-1 к texts.
+    private suspend fun embedWithReuse(
+        texts: List<String>,
+        stored: Map<String, FloatArray>,
+        onBatch: (done: Int, total: Int) -> Unit = { _, _ -> },
+    ): List<FloatArray> {
+        val dim = embedder().dim
+        val vectors = arrayOfNulls<FloatArray>(texts.size)
+        val missing = mutableListOf<String>()
+        val missingIdx = mutableListOf<Int>()
+        var reused = 0
+        texts.forEachIndexed { i, t ->
+            val v = stored[t]
+            if (v != null && v.size == dim) {
+                vectors[i] = v
+                reused++
+            } else {
+                missing += t
+                missingIdx += i
+            }
+        }
+        val total = missing.size
+        var done = 0
+        for (batch in missing.chunked(32)) {
+            val emb = embedder().embed(batch)
+            emb.forEachIndexed { k, v -> vectors[missingIdx[done + k]] = v }
+            done += batch.size
+            onBatch(done, total)
+        }
+        if (total == 0) onBatch(0, 0)
+        return vectors.map { it!! }
+    }
+
+    // Новодобавленные документы сразу видны в сайдбаре как индексирующиеся.
+    fun markIndexing(docs: List<RawDoc>, strategy: String) {
+        val now = System.currentTimeMillis()
+        docs.forEach { store.upsertDoc(DocumentEntry(it.source, it.title, strategy, DocStatus.INDEXING, "", now)) }
+    }
+
+    fun markError(sources: List<String>, msg: String) {
+        val now = System.currentTimeMillis()
+        val known = store.allDocs().associateBy { it.source }
+        sources.forEach { s ->
+            val prev = known[s]
+            store.upsertDoc(
+                DocumentEntry(
+                    source = s,
+                    title = prev?.title ?: s.substringAfterLast("/"),
+                    strategy = prev?.strategy ?: "structure",
+                    status = DocStatus.ERROR,
+                    error = msg,
+                    updatedAt = now,
+                )
+            )
+        }
+    }
+
+    // После полной перезаписи стратегии (CLI) документы помечаем готовыми,
+    // выбранную ранее стратегию не затираем — сайдбар показывает факт индекса.
+    private fun touchDocsReady(docs: List<RawDoc>, strategy: String) {
+        val now = System.currentTimeMillis()
+        val known = store.allDocs().associateBy { it.source }
+        docs.forEach { d ->
+            val prev = known[d.source]
+            store.upsertDoc(
+                DocumentEntry(
+                    d.source, d.title,
+                    prev?.strategy?.takeIf { it.isNotBlank() } ?: strategy,
+                    DocStatus.READY, "", now,
+                )
+            )
+        }
     }
 
     // Статья Википедии -> файл локального корпуса (appDir/corpus).
@@ -226,10 +322,11 @@ class RagService(
 
     // RAG-ответ: retrieve topK -> промпт с контекстом [S1..Sn] -> DeepSeek.
     // onlySources ограничивает контекст активными документами.
+    // Дефолт "both": документы с разными стратегиями ищутся одним запросом.
     // Задел на Task 2-5: rerank/фильтр порога встраиваются между search и buildPrompt.
     suspend fun ask(
         query: String,
-        strategy: String = "structure",
+        strategy: String = "both",
         topK: Int = 8,
         apiKey: String? = null,
         onlySources: Set<String>? = null,
@@ -275,22 +372,35 @@ class RagService(
     fun activeSourcesOrNull(): Set<String>? {
         val inactive = sourcesStore.loadState().inactive
         if (inactive.isEmpty()) return null
-        val all = store.loadChunks("structure").map { it.source }.toSet() +
-            store.loadChunks("fixed").map { it.source }.toSet()
+        val all = store.loadAllChunks().map { it.source }.toSet()
         return (all - inactive).ifEmpty { emptySet() }
     }
 
-    fun indexedDocs(strategy: String = "structure"): List<DocInfo> {
+    // Документы для сайдбара: объединение чанков всех стратегий
+    // и таблицы document (выбранная стратегия + статус индексации).
+    // Подпись метода чанкинга — по факту лежащего в индексе.
+    fun indexedDocs(): List<DocInfo> {
         val inactive = sourcesStore.loadState().inactive
-        return store.loadChunks(strategy)
-            .groupBy { it.source }
-            .map { (src, chunks) ->
+        val grouped = store.loadAllChunks().groupBy { it.source }
+        val entries = store.allDocs().associateBy { it.source }
+        return (grouped.keys + entries.keys)
+            .map { src ->
+                val chunks = grouped[src].orEmpty()
+                val e = entries[src]
+                val actual = chunks.map { it.strategy }.toSet()
+                val requested = e?.strategy?.takeIf { it.isNotBlank() }
+                    ?: if (actual.size > 1) "both" else actual.firstOrNull() ?: "structure"
+                val err = e?.takeIf { it.status == DocStatus.ERROR }?.error?.takeIf { it.isNotBlank() }
                 DocInfo(
                     source = src,
-                    title = chunks.first().title,
+                    title = chunks.firstOrNull()?.title ?: e?.title ?: src.substringAfterLast("/"),
                     chunks = chunks.size,
                     chars = chunks.sumOf { it.text.length.toLong() },
                     active = src !in inactive,
+                    strategy = requested,
+                    strategyLabel = displayStrategy(requested, actual),
+                    indexing = e?.status == DocStatus.INDEXING,
+                    error = err,
                 )
             }
             .sortedBy { it.title.lowercase() }

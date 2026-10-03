@@ -65,7 +65,49 @@ data class DocInfo(
     val chunks: Int,
     val chars: Long,
     val active: Boolean = true,
+    // Стратегия, выбранная при добавлении: "fixed" | "structure" | "both".
+    val strategy: String = "structure",
+    // Подпись в сайдбаре — по факту проиндексированного ("фиксированный",
+    // "структурный", "обе стратегии"); пока чанков нет — по выбранной.
+    val strategyLabel: String = "",
+    // Документ прямо сейчас индексируется: строка некликабельна + прогрессбар.
+    val indexing: Boolean = false,
+    val error: String? = null,
 )
+
+// Статусы индексации документа (таблица document, поле status).
+object DocStatus {
+    const val INDEXING = "indexing"
+    const val READY = "ready"
+    const val ERROR = "error"
+}
+
+// Строка таблицы document: выбранная при добавлении стратегия + статус.
+@Serializable
+data class DocumentEntry(
+    val source: String,
+    val title: String,
+    val strategy: String = "structure",
+    val status: String = DocStatus.READY,
+    val error: String = "",
+    val updatedAt: Long = 0,
+)
+
+// Человекочитаемое имя стратегии для сайдбара.
+fun strategyName(s: String): String = when (s) {
+    "fixed" -> "фиксированный"
+    "structure" -> "структурный"
+    "both" -> "обе стратегии"
+    else -> s
+}
+
+// Подпись метода чанкинга: по фактически лежащим в индексе стратегиям,
+// для пустого (ещё индексируется) — по выбранной при добавлении.
+fun displayStrategy(requested: String, actual: Set<String>): String = when {
+    actual.size > 1 -> "обе стратегии"
+    actual.size == 1 -> strategyName(actual.first())
+    else -> strategyName(requested)
+}
 
 // RAG-ответ: текст LLM + чанки, на которые он опирался.
 data class RagAnswer(

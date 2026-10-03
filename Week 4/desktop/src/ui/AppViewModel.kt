@@ -2,6 +2,7 @@ package desktop.ui
 
 import core.rag.ChatStore
 import core.rag.DocInfo
+import core.rag.DocumentLoader
 import core.rag.EmbedSettings
 import core.rag.EmbedSettingsStore
 import core.rag.OllamaEmbedder
@@ -12,9 +13,11 @@ import core.rag.SourcesStore
 import core.rag.newChatId
 import java.io.File
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class UiState(
     val chats: List<RagChat> = emptyList(),
@@ -23,12 +26,16 @@ data class UiState(
     val docs: List<DocInfo> = emptyList(),
     val input: String = "",
     val busy: Boolean = false,
-    val indexing: Boolean = false,
+    // Прогресс индексации по документам: source -> 0..1 (null = идёт, доля неизвестна).
+    // Глобального спиннера внизу больше нет — прогресс виден в строке документа.
+    val indexProgress: Map<String, Float?> = emptyMap(),
     val indexLog: List<String> = emptyList(),
     val status: String? = null,
     val showCreateChat: Boolean = false,
     val createName: String = "",
     val showAddMenu: Boolean = false,
+    // Стратегия чанкинга, выбранная при добавлении: "fixed" | "structure" | "both".
+    val addStrategy: String = "both",
     val showWiki: Boolean = false,
     val wikiInput: String = "",
     val viewingDoc: String? = null,
@@ -46,7 +53,9 @@ data class UiState(
             if (docs.isEmpty()) return "база пуста"
             val active = docs.count { it.active }
             val chunks = docs.filter { it.active }.sumOf { it.chunks }
-            return "документов: ${docs.size} (активно: $active) · чанков: $chunks"
+            val idx = docs.count { it.indexing }
+            return "документов: ${docs.size} (активно: $active) · чанков: $chunks" +
+                if (idx > 0) " · индексируется: $idx" else ""
         }
 }
 
@@ -72,6 +81,20 @@ class AppViewModel(private val scope: CoroutineScope) {
         _state.value = fn(_state.value)
     }
 
+    // Положение скролла чатов: только память, в БД не пишем.
+    // chatId -> (индекс первого видимого сообщения, сдвиг в px).
+    private val chatScroll = mutableMapOf<String, Pair<Int, Int>>()
+
+    fun scrollFor(chatId: String): Pair<Int, Int>? = chatScroll[chatId]
+
+    fun saveScroll(chatId: String, index: Int, offset: Int) {
+        chatScroll[chatId] = index to offset
+    }
+
+    private fun dropScroll(chatId: String) {
+        chatScroll.remove(chatId)
+    }
+
     private fun log(s: String) = update { it.copy(indexLog = (it.indexLog + s).takeLast(100)) }
 
     // --- чаты ---
@@ -93,6 +116,7 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun deleteChat(id: String) {
         chats.deleteChat(id)
+        dropScroll(id)
         val rest = chats.state.chats
         update {
             it.copy(
@@ -129,6 +153,7 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun clearChat(id: String) {
         chats.clearMessages(id)
+        dropScroll(id)
         update { it.copy(messages = emptyList()) }
     }
 
@@ -209,30 +234,82 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun openAddMenu() = update { it.copy(showAddMenu = true) }
     fun closeAddMenu() = update { it.copy(showAddMenu = false) }
+    fun setAddStrategy(v: String) = update { it.copy(addStrategy = v) }
     fun openWiki() = update { it.copy(showAddMenu = false, showWiki = true, wikiInput = "") }
     fun closeWiki() = update { it.copy(showWiki = false) }
     fun setWikiInput(v: String) = update { it.copy(wikiInput = v) }
 
-    fun addRoots(paths: List<String>) {
+    // Источники, по которым прямо сейчас идёт фоновая индексация.
+    // Повторный add тех же файлов, удаление и просмотр блокируются,
+    // чтобы джоба не воскрешала удалённое и не гонялась с чтением.
+    private val activeIndexJobs = mutableSetOf<String>()
+
+    fun addRoots(paths: List<String>, strategy: String = _state.value.addStrategy) {
         if (paths.isEmpty()) return
+        val clean = paths.map { it.trim() }.filter { it.isNotBlank() }.distinct()
+        if (clean.isEmpty()) return
+        val strat = strategy.takeIf { it == "fixed" || it == "structure" } ?: "both"
         val cur = sources.loadState()
-        val merged = (cur.roots + paths.map { it.trim() }.filter { it.isNotBlank() }).distinct()
+        val merged = (cur.roots + clean).distinct()
         sources.save(merged, cur.inactive)
-        update { it.copy(showAddMenu = false) }
-        log("Добавлено: ${paths.size}")
-        reindex()
+        update { it.copy(showAddMenu = false, addStrategy = strat) }
+        log("Добавлено: ${clean.size}")
+        scope.launch {
+            // Быстрое раскрытие в документы (без эмбеддингов) — дальше уже фон.
+            val loaded = withContext(Dispatchers.IO) {
+                DocumentLoader.loadRoots(clean.map { File(it) })
+            }
+            if (loaded.skipped > 0) log("Пропущено файлов: ${loaded.skipped}")
+            if (loaded.docs.isEmpty()) {
+                update { it.copy(status = "Нет документов для индексации (пустые/неподдерживаемые файлы)") }
+                return@launch
+            }
+            val fresh = loaded.docs.filter { it.source !in activeIndexJobs }
+            if (fresh.isEmpty()) return@launch
+            activeIndexJobs += fresh.map { it.source }
+            // Документ сразу в списке: некликабельная строка + прогрессбар.
+            svc.markIndexing(fresh, strat)
+            refreshDocs()
+            update { st -> st.copy(indexProgress = st.indexProgress + fresh.associate { it.source to null }) }
+            try {
+                try {
+                    svc.checkEmbeddings()
+                } catch (e: Exception) {
+                    svc.markError(fresh.map { it.source }, e.message ?: "нет связи с моделью")
+                    update { it.copy(status = "Индексация: ${e.message}") }
+                    return@launch
+                }
+                svc.indexNewDocs(
+                    fresh,
+                    strat,
+                    onDocProgress = { src, done, total ->
+                        val p = if (total <= 0) null else (done.toFloat() / total).coerceIn(0f, 1f)
+                        update { st -> st.copy(indexProgress = st.indexProgress + (src to p)) }
+                    },
+                    onLog = { m -> log(m) },
+                )
+                log("Проиндексировано: ${fresh.size} док.")
+            } catch (e: Exception) {
+                update { it.copy(status = "Индексация: ${e.message}") }
+            } finally {
+                activeIndexJobs -= fresh.map { it.source }.toSet()
+                update { st -> st.copy(indexProgress = st.indexProgress - fresh.map { it.source }.toSet()) }
+                refreshDocs()
+            }
+        }
     }
 
     fun fetchWiki() {
         val input = _state.value.wikiInput.trim()
         if (input.isEmpty()) return
+        val strat = _state.value.addStrategy
         update { it.copy(showWiki = false) }
         scope.launch {
             try {
                 log("Загружаю Wiki: $input ...")
                 val f = svc.fetchWikiAndSave(input)
                 log("Сохранено: ${f.name} (${f.length() / 1024} КБ)")
-                addRoots(listOf(f.absolutePath))
+                addRoots(listOf(f.absolutePath), strat)
             } catch (e: Exception) {
                 update { it.copy(status = "Wiki: ${e.message}") }
             }
@@ -241,12 +318,14 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun toggleDoc(source: String) {
         val d = _state.value.docs.firstOrNull { it.source == source } ?: return
+        if (d.indexing || source in activeIndexJobs) return
         svc.setDocActive(source, !d.active)
         refreshDocs()
     }
 
     fun removeDoc(source: String) {
-        // чанки — из индекса; файловый корень — из списка; wiki-файл из corpus — с диска
+        if (source in activeIndexJobs) return
+        // чанки + запись документа — из индекса; файловый корень — из списка; wiki-файл из corpus — с диска
         svc.removeSources(listOf(source))
         for (r in sources.load()) {
             val f = File(r)
@@ -265,6 +344,8 @@ class AppViewModel(private val scope: CoroutineScope) {
     }
 
     fun viewDoc(source: String) {
+        val d = _state.value.docs.firstOrNull { it.source == source }
+        if (d?.indexing == true || source in activeIndexJobs) return
         val text = svc.docText(source) ?: "(не удалось прочитать файл)"
         update { it.copy(viewingDoc = source, viewingText = text) }
     }
@@ -277,29 +358,6 @@ class AppViewModel(private val scope: CoroutineScope) {
                 val docs = svc.indexedDocs()
                 update { it.copy(docs = docs) }
             } catch (_: Exception) {
-            }
-        }
-    }
-
-    private fun reindex() {
-        if (_state.value.indexing) return
-        val roots = sources.load().map { File(it) }.filter { it.exists() }
-        if (roots.isEmpty()) {
-            update { it.copy(status = "Нет источников для индексации") }
-            return
-        }
-        update { it.copy(indexing = true, status = null) }
-        scope.launch {
-            try {
-                for (s in listOf("fixed", "structure")) {
-                    val out = svc.reindexRoots(roots, s) { m -> log(m) }
-                    log("ИТОГ [$s]: ${out.stats.chunks} чанков из ${out.docs} документов")
-                }
-            } catch (e: Exception) {
-                update { it.copy(status = "Индексация: ${e.message}") }
-            } finally {
-                update { it.copy(indexing = false) }
-                refreshDocs()
             }
         }
     }

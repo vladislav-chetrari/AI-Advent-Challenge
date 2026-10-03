@@ -14,14 +14,15 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
@@ -35,11 +36,13 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
 import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
@@ -105,7 +108,8 @@ fun Root(window: java.awt.Window) {
             Spacer(Modifier.height(4.dp))
             LazyColumn(Modifier.weight(1f).fillMaxWidth()) {
                 items(st.docs, key = { "d${it.source}" }) { d ->
-                    DocRow(d, selected = st.viewingDoc == d.source,
+                    DocRow(d, progress = st.indexProgress[d.source],
+                        selected = st.viewingDoc == d.source,
                         onOpen = { vm.viewDoc(d.source) },
                         onToggle = { vm.toggleDoc(d.source) },
                         onDelete = { vm.removeDoc(d.source) })
@@ -116,10 +120,7 @@ fun Root(window: java.awt.Window) {
             }
             Spacer(Modifier.height(6.dp))
             Text("⚙ ${st.embedLabel}", color = Color(0xFF666666), fontSize = 10.sp, maxLines = 1)
-            Text(
-                if (st.indexing) "⏳ индексация…" else st.indexSummary,
-                color = Color(0xFF888888), fontSize = 11.sp, maxLines = 2,
-            )
+            Text(st.indexSummary, color = Color(0xFF888888), fontSize = 11.sp, maxLines = 2)
             if (st.indexLog.isNotEmpty()) {
                 Text(st.indexLog.last(), color = Color(0xFF666666), fontSize = 10.sp, maxLines = 1)
             }
@@ -173,7 +174,30 @@ fun ChatRow(c: RagChat, selected: Boolean, onOpen: () -> Unit, onToggleRag: () -
 }
 
 @Composable
-fun DocRow(d: DocInfo, selected: Boolean, onOpen: () -> Unit, onToggle: () -> Unit, onDelete: () -> Unit) {
+fun DocRow(d: DocInfo, progress: Float?, selected: Boolean, onOpen: () -> Unit, onToggle: () -> Unit, onDelete: () -> Unit) {
+    // Индексирующийся документ: строка некликабельна, вместо действий — прогрессбар.
+    if (d.indexing) {
+        Row(
+            Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("📄⏳", color = Color(0xFF777777), fontSize = 13.sp, modifier = Modifier.padding(end = 6.dp))
+            Column(Modifier.weight(1f)) {
+                Text(d.title, color = Color(0xFF777777), fontSize = 13.sp, maxLines = 1)
+                Text(
+                    "индексируется… · ${d.strategyLabel.ifBlank { "…" }}",
+                    color = Color(0xFF777777), fontSize = 10.sp, maxLines = 1,
+                )
+                Spacer(Modifier.height(3.dp))
+                if (progress == null) {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                } else {
+                    LinearProgressIndicator(progress = { progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth())
+                }
+            }
+        }
+        return
+    }
     Row(
         Modifier.fillMaxWidth()
             .background(if (selected) Color(0xFF2D2D2D) else Color.Transparent)
@@ -190,7 +214,13 @@ fun DocRow(d: DocInfo, selected: Boolean, onOpen: () -> Unit, onToggle: () -> Un
                 d.title, color = if (selected) Color(0xFF7DD87D) else Color(0xFF9CCC9C),
                 fontSize = 13.sp, maxLines = 1,
             )
-            Text("${d.chunks} чанков", color = Color(0xFF777777), fontSize = 10.sp)
+            Text(
+                "${d.chunks} чанков · ${d.strategyLabel.ifBlank { "…" }}",
+                color = Color(0xFF777777), fontSize = 10.sp, maxLines = 1,
+            )
+            d.error?.let {
+                Text("⚠ $it", color = Color(0xFFCF6679), fontSize = 10.sp, maxLines = 1)
+            }
         }
         Text("×", color = Color(0xFF777777), fontSize = 14.sp, modifier = Modifier.clickable(onClick = onDelete).padding(start = 4.dp))
     }
@@ -220,9 +250,27 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
             )
         }
         val messages = st.messages
-        val listState = rememberLazyListState()
-        LaunchedEffect(chat.id, messages.size, st.busy) {
-            if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
+        // Скролл на чат: сохранённая позиция переживает переходы между чатами,
+        // по умолчанию (сохранённого нет) вход — в конец, к последним сообщениям.
+        val saved = remember(chat.id) { vm.scrollFor(chat.id) }
+        val listState = remember(chat.id) {
+            LazyListState(
+                firstVisibleItemIndex = saved?.first?.coerceIn(0, (messages.size - 1).coerceAtLeast(0)) ?: 0,
+                firstVisibleItemScrollOffset = saved?.second?.coerceAtLeast(0) ?: 0,
+            )
+        }
+        LaunchedEffect(chat.id) {
+            if (saved == null && messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
+        }
+        // Позицию запоминаем при скролле — в память ViewModel, не в БД.
+        LaunchedEffect(listState, chat.id) {
+            snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
+                .collect { (i, o) -> vm.saveScroll(chat.id, i, o) }
+        }
+        // Новые сообщения дотягиваем только пока пользователь внизу;
+        // ушёл читать историю — позицию не срываем.
+        LaunchedEffect(messages.size, st.busy) {
+            if (messages.isNotEmpty() && !listState.canScrollForward) listState.scrollToItem(messages.size - 1)
         }
         LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp)) {
             items(messages, key = { it.id }) { m -> MessageBubble(m) }
@@ -236,7 +284,8 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
             OutlinedTextField(
                 value = st.input, onValueChange = vm::setInput,
                 modifier = Modifier.weight(1f).onPreviewKeyEvent { e ->
-                    if (e.key == Key.Enter && e.type == KeyEventType.KeyDown) {
+                    // Enter — отправить, Shift+Enter — новая строка (дефолт текстового поля).
+                    if (e.key == Key.Enter && e.type == KeyEventType.KeyDown && !e.isShiftPressed) {
                         vm.send()
                         true
                     } else false
@@ -285,7 +334,10 @@ fun DocPane(vm: AppViewModel, source: String, doc: DocInfo?, text: String) {
         }
         if (doc != null) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text("${doc.chunks} чанков · ~${doc.chars} симв", fontSize = 12.sp, color = Color.Gray, modifier = Modifier.weight(1f))
+                Text(
+                    "${doc.chunks} чанков · ${doc.strategyLabel.ifBlank { "…" }} · ~${doc.chars} симв",
+                    fontSize = 12.sp, color = Color.Gray, modifier = Modifier.weight(1f),
+                )
                 TextButton(onClick = { vm.toggleDoc(source) }) {
                     Text(if (doc.active) "выключить из RAG" else "включить в RAG", fontSize = 12.sp)
                 }
@@ -351,6 +403,13 @@ fun CreateChatDialog(vm: AppViewModel) {
             OutlinedTextField(
                 value = st.createName, onValueChange = vm::setCreateName,
                 label = { Text("Название") }, singleLine = true,
+                modifier = Modifier.onPreviewKeyEvent { e ->
+                    // Название всегда в одну строку — Enter сразу создаёт чат.
+                    if (e.key == Key.Enter && e.type == KeyEventType.KeyDown) {
+                        vm.commitCreateChat()
+                        true
+                    } else false
+                },
             )
         },
         confirmButton = { Button(onClick = vm::commitCreateChat) { Text("Создать") } },
@@ -359,16 +418,39 @@ fun CreateChatDialog(vm: AppViewModel) {
 }
 
 @Composable
+fun ChunkStrategyPicker(selected: String, onSelect: (String) -> Unit) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text("Чанкинг:", fontSize = 12.sp, color = Color.Gray)
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            StrategyChip("Обе", "both", selected, onSelect)
+            StrategyChip("Фикс. размер", "fixed", selected, onSelect)
+            StrategyChip("По структуре", "structure", selected, onSelect)
+        }
+    }
+}
+
+@Composable
+fun StrategyChip(label: String, value: String, selected: String, onSelect: (String) -> Unit) {
+    FilterChip(
+        selected = selected == value,
+        onClick = { onSelect(value) },
+        label = { Text(label, fontSize = 12.sp) },
+    )
+}
+
+@Composable
 fun AddDialog(vm: AppViewModel, window: java.awt.Window) {
+    val st by vm.state.collectAsState()
     AlertDialog(
         onDismissRequest = vm::closeAddMenu,
         title = { Text("Добавить в базу знаний") },
         text = {
             Column(Modifier.fillMaxWidth(), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Button(onClick = { vm.addRoots(pickFiles(window)) }, modifier = Modifier.fillMaxWidth()) {
+                ChunkStrategyPicker(st.addStrategy, vm::setAddStrategy)
+                Button(onClick = { vm.addRoots(pickFiles(window), st.addStrategy) }, modifier = Modifier.fillMaxWidth()) {
                     Text("📄 Файлы… (PDF, тексты, код)")
                 }
-                Button(onClick = { pickDirectory(window)?.let { vm.addRoots(listOf(it)) } }, modifier = Modifier.fillMaxWidth()) {
+                Button(onClick = { pickDirectory(window)?.let { vm.addRoots(listOf(it), st.addStrategy) } }, modifier = Modifier.fillMaxWidth()) {
                     Text("📁 Папка…")
                 }
                 Button(onClick = vm::openWiki, modifier = Modifier.fillMaxWidth()) {
@@ -388,12 +470,15 @@ fun WikiDialog(vm: AppViewModel) {
         onDismissRequest = vm::closeWiki,
         title = { Text("Статья Википедии") },
         text = {
-            OutlinedTextField(
-                value = st.wikiInput, onValueChange = vm::setWikiInput,
-                label = { Text("Название или URL") },
-                placeholder = { Text("Искусственный интеллект") },
-                singleLine = true, modifier = Modifier.fillMaxWidth(),
-            )
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedTextField(
+                    value = st.wikiInput, onValueChange = vm::setWikiInput,
+                    label = { Text("Название или URL") },
+                    placeholder = { Text("Искусственный интеллект") },
+                    singleLine = true, modifier = Modifier.fillMaxWidth(),
+                )
+                ChunkStrategyPicker(st.addStrategy, vm::setAddStrategy)
+            }
         },
         confirmButton = { Button(onClick = vm::fetchWiki, enabled = st.wikiInput.isNotBlank()) { Text("Загрузить") } },
         dismissButton = { TextButton(onClick = vm::closeWiki) { Text("Отмена") } },

@@ -7,7 +7,7 @@ import java.util.PriorityQueue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.jetbrains.exposed.sql.Database
-import org.jetbrains.exposed.sql.SchemaUtils
+import org.jetbrains.exposed.sql.ResultRow
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.eq
 import org.jetbrains.exposed.sql.SqlExpressionBuilder.inList
 import org.jetbrains.exposed.sql.Table
@@ -41,7 +41,22 @@ object ChunkTable : Table("chunk") {
     val tokens = integer("tokens")
     val embedding = binary("embedding")
     val createdAt = long("created_at")
-    override val primaryKey = PrimaryKey(id)
+    // Составной ключ: один и тот же chunk_id ("source#ord") существует
+    // отдельно в каждой стратегии, иначе fixed/structure затирали бы друг друга.
+    override val primaryKey = PrimaryKey(id, strategy)
+}
+
+// Документы базы знаний: выбранная при добавлении стратегия чанкинга
+// + статус индексации. Схема создаётся Flyway-миграцией V1 (см. DbMigrations).
+// Имя свойства src: у ColumnSet уже есть член source.
+object DocumentTable : Table("document") {
+    val src = text("source")
+    val title = text("title")
+    val strategy = text("strategy").default("structure")
+    val status = text("status").default(DocStatus.READY)
+    val error = text("error").default("")
+    val updatedAt = long("updated_at")
+    override val primaryKey = PrimaryKey(src)
 }
 
 fun FloatArray.toBlob(): ByteArray {
@@ -61,10 +76,10 @@ class SqliteVectorStore(dbFile: File) {
     private val db: Database
 
     init {
-        dbFile.parentFile?.mkdirs()
+        // Схема — только через Flyway (V1__init.sql), никаких createMissingTablesAndColumns.
+        DbMigrations.migrate(dbFile)
         val url = "jdbc:sqlite:${dbFile.absolutePath}"
         db = Database.connect(url, driver = "org.sqlite.JDBC")
-        transaction(db) { SchemaUtils.createMissingTablesAndColumns(ChunkTable) }
     }
 
     fun clearStrategy(strategy: String) {
@@ -76,6 +91,16 @@ class SqliteVectorStore(dbFile: File) {
     fun deleteSources(sources: Collection<String>) {
         if (sources.isEmpty()) return
         transaction(db) { ChunkTable.deleteWhere { ChunkTable.src.inList(sources.toList()) } }
+        deleteDocs(sources)
+    }
+
+    // Точечное удаление: только чанки указанных документов в одной стратегии.
+    // Нужно для инкрементальной индексации одного документа без wipe всей стратегии.
+    fun deleteSourcesForStrategy(sources: Collection<String>, strategy: String) {
+        if (sources.isEmpty()) return
+        transaction(db) {
+            ChunkTable.deleteWhere { (ChunkTable.src.inList(sources.toList())) and (ChunkTable.strategy eq strategy) }
+        }
     }
 
     fun clearAll() {
@@ -87,7 +112,8 @@ class SqliteVectorStore(dbFile: File) {
         transaction(db) {
             chunks.forEachIndexed { i, c ->
                 val cId = c.id
-                ChunkTable.deleteWhere { ChunkTable.id eq cId }
+                val cStrategy = c.strategy
+                ChunkTable.deleteWhere { (ChunkTable.id eq cId) and (ChunkTable.strategy eq cStrategy) }
                 ChunkTable.insert {
                     it[id] = c.id
                     it[strategy] = c.strategy
@@ -117,19 +143,51 @@ class SqliteVectorStore(dbFile: File) {
 
     fun loadChunks(strategy: String): List<Chunk> {
         return transaction(db) {
-            ChunkTable.selectAll().where { ChunkTable.strategy eq strategy }.map { row ->
-                Chunk(
-                    id = row[ChunkTable.id],
-                    strategy = row[ChunkTable.strategy],
-                    source = row[ChunkTable.src],
-                    title = row[ChunkTable.title],
-                    section = row[ChunkTable.section],
-                    ord = row[ChunkTable.ord],
-                    text = row[ChunkTable.text],
-                    tokens = row[ChunkTable.tokens],
+            ChunkTable.selectAll().where { ChunkTable.strategy eq strategy }.map { row -> row.toChunk() }
+        }
+    }
+
+    // Все чанки всех стратегий: для сайдбара (подпись метода чанкинга
+    // по факту индекса) и объединённого поиска.
+    fun loadAllChunks(): List<Chunk> {
+        return transaction(db) { ChunkTable.selectAll().map { row -> row.toChunk() } }
+    }
+
+    // --- документы (стратегия на документ + статус индексации) ---
+
+    fun upsertDoc(e: DocumentEntry) {
+        transaction(db) {
+            val s = e.source
+            DocumentTable.deleteWhere { DocumentTable.src eq s }
+            DocumentTable.insert {
+                it[src] = e.source
+                it[title] = e.title
+                it[strategy] = e.strategy
+                it[status] = e.status
+                it[error] = e.error
+                it[updatedAt] = e.updatedAt
+            }
+        }
+    }
+
+    fun allDocs(): List<DocumentEntry> {
+        return transaction(db) {
+            DocumentTable.selectAll().map { row ->
+                DocumentEntry(
+                    source = row[DocumentTable.src],
+                    title = row[DocumentTable.title],
+                    strategy = row[DocumentTable.strategy],
+                    status = row[DocumentTable.status],
+                    error = row[DocumentTable.error],
+                    updatedAt = row[DocumentTable.updatedAt],
                 )
             }
         }
+    }
+
+    fun deleteDocs(sources: Collection<String>) {
+        if (sources.isEmpty()) return
+        transaction(db) { DocumentTable.deleteWhere { DocumentTable.src.inList(sources.toList()) } }
     }
 
     // Карта текст -> вектор для стратегии: инкрементальная индексация
@@ -147,6 +205,8 @@ class SqliteVectorStore(dbFile: File) {
     // Точный top-K по косинусу. Все вектора нормализованы при записи,
     // поэтому косинус = скалярное произведение. Куча O(n log k).
     // onlySources ограничивает поиск активными документами базы знаний.
+    // strategy = "both": объединение fixed+structure (документы, добавленные
+    // с разными стратегиями, ищутся одним запросом).
     suspend fun search(
         strategy: String,
         query: FloatArray,
@@ -156,23 +216,20 @@ class SqliteVectorStore(dbFile: File) {
         withContext(Dispatchers.Default) {
             if (onlySources != null && onlySources.isEmpty()) return@withContext emptyList()
             val rows: List<Pair<Chunk, FloatArray>> = transaction(db) {
-                val q = if (onlySources == null) {
+                val q = if (strategy == "both") {
+                    if (onlySources == null) {
+                        ChunkTable.selectAll()
+                    } else {
+                        val f = onlySources.toList()
+                        ChunkTable.selectAll().where { ChunkTable.src.inList(f) }
+                    }
+                } else if (onlySources == null) {
                     ChunkTable.selectAll().where { ChunkTable.strategy eq strategy }
                 } else {
-                    ChunkTable.selectAll().where { (ChunkTable.strategy eq strategy) and (ChunkTable.src.inList(onlySources.toList())) }
+                    val f = onlySources.toList()
+                    ChunkTable.selectAll().where { (ChunkTable.strategy eq strategy) and (ChunkTable.src.inList(f)) }
                 }
-                q.map { row ->
-                    Chunk(
-                        id = row[ChunkTable.id],
-                        strategy = row[ChunkTable.strategy],
-                        source = row[ChunkTable.src],
-                        title = row[ChunkTable.title],
-                        section = row[ChunkTable.section],
-                        ord = row[ChunkTable.ord],
-                        text = row[ChunkTable.text],
-                        tokens = row[ChunkTable.tokens],
-                    ) to row[ChunkTable.embedding].toFloatArray()
-                }
+                q.map { row -> row.toChunk() to row[ChunkTable.embedding].toFloatArray() }
             }
             if (rows.isEmpty()) return@withContext emptyList()
             val heap = PriorityQueue<Pair<Int, Float>>(topK + 1, compareBy { it.second })
@@ -190,3 +247,14 @@ class SqliteVectorStore(dbFile: File) {
             heap.sortedByDescending { it.second }.map { (i, s) -> ScoredChunk(rows[i].first, s) }
         }
 }
+
+private fun ResultRow.toChunk(): Chunk = Chunk(
+    id = this[ChunkTable.id],
+    strategy = this[ChunkTable.strategy],
+    source = this[ChunkTable.src],
+    title = this[ChunkTable.title],
+    section = this[ChunkTable.section],
+    ord = this[ChunkTable.ord],
+    text = this[ChunkTable.text],
+    tokens = this[ChunkTable.tokens],
+)
