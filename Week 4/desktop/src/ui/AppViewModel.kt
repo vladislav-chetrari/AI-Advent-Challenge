@@ -81,20 +81,6 @@ class AppViewModel(private val scope: CoroutineScope) {
         _state.value = fn(_state.value)
     }
 
-    // Положение скролла чатов: только память, в БД не пишем.
-    // chatId -> (индекс первого видимого сообщения, сдвиг в px).
-    private val chatScroll = mutableMapOf<String, Pair<Int, Int>>()
-
-    fun scrollFor(chatId: String): Pair<Int, Int>? = chatScroll[chatId]
-
-    fun saveScroll(chatId: String, index: Int, offset: Int) {
-        chatScroll[chatId] = index to offset
-    }
-
-    private fun dropScroll(chatId: String) {
-        chatScroll.remove(chatId)
-    }
-
     private fun log(s: String) = update { it.copy(indexLog = (it.indexLog + s).takeLast(100)) }
 
     // --- чаты ---
@@ -116,7 +102,6 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun deleteChat(id: String) {
         chats.deleteChat(id)
-        dropScroll(id)
         val rest = chats.state.chats
         update {
             it.copy(
@@ -153,7 +138,6 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun clearChat(id: String) {
         chats.clearMessages(id)
-        dropScroll(id)
         update { it.copy(messages = emptyList()) }
     }
 

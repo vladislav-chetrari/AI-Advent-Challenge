@@ -14,8 +14,8 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -36,7 +36,6 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
-import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -250,27 +249,9 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
             )
         }
         val messages = st.messages
-        // Скролл на чат: сохранённая позиция переживает переходы между чатами,
-        // по умолчанию (сохранённого нет) вход — в конец, к последним сообщениям.
-        val saved = remember(chat.id) { vm.scrollFor(chat.id) }
-        val listState = remember(chat.id) {
-            LazyListState(
-                firstVisibleItemIndex = saved?.first?.coerceIn(0, (messages.size - 1).coerceAtLeast(0)) ?: 0,
-                firstVisibleItemScrollOffset = saved?.second?.coerceAtLeast(0) ?: 0,
-            )
-        }
-        LaunchedEffect(chat.id) {
-            if (saved == null && messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
-        }
-        // Позицию запоминаем при скролле — в память ViewModel, не в БД.
-        LaunchedEffect(listState, chat.id) {
-            snapshotFlow { listState.firstVisibleItemIndex to listState.firstVisibleItemScrollOffset }
-                .collect { (i, o) -> vm.saveScroll(chat.id, i, o) }
-        }
-        // Новые сообщения дотягиваем только пока пользователь внизу;
-        // ушёл читать историю — позицию не срываем.
-        LaunchedEffect(messages.size, st.busy) {
-            if (messages.isNotEmpty() && !listState.canScrollForward) listState.scrollToItem(messages.size - 1)
+        val listState = rememberLazyListState()
+        LaunchedEffect(chat.id, messages.size, st.busy) {
+            if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
         }
         LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp)) {
             items(messages, key = { it.id }) { m -> MessageBubble(m) }
