@@ -455,11 +455,7 @@ fun RagSettingsDialog(vm: AppViewModel) {
                         value = st.temperature,
                         onValueChange = vm::setTemperatureSlider,
                         valueRange = 0f..1f,
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    OutlinedTextField(
-                        value = st.temperature.toString(), onValueChange = vm::setTemperature,
-                        label = { Text("Температура — точность (0–1)", fontSize = 11.sp) }, singleLine = true,
+                        steps = 19,
                         modifier = Modifier.fillMaxWidth(),
                     )
                     Text(
@@ -493,9 +489,9 @@ fun RagSettingsDialog(vm: AppViewModel) {
                     if (!st.filterEnabled) {
                         "Итого сейчас: забрать ${st.topK} → в контекст ${st.topK} без фильтра."
                     } else if (st.postFilterK != null) {
-                        "Итого сейчас: забрать ${st.topK} → фильтр (темп. ${st.temperature}) → в ответ до ${st.postFilterK}."
+                        "Итого сейчас: забрать ${st.topK} → фильтр (темп. ${"%.2f".format(st.temperature)}) → в ответ до ${st.postFilterK}."
                     } else {
-                        "Итого сейчас: забрать ${st.topK} → фильтр (темп. ${st.temperature}) → в ответ все прошедшие."
+                        "Итого сейчас: забрать ${st.topK} → фильтр (темп. ${"%.2f".format(st.temperature)}) → в ответ все прошедшие."
                     },
                     fontSize = 11.sp, color = Color.Gray, fontWeight = FontWeight.Bold,
                 )

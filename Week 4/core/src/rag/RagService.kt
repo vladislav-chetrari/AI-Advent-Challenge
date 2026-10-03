@@ -324,7 +324,7 @@ class RagService(
             val hint = if (cfg.mode == RerankModes.OFF) {
                 "База знаний пуста — добавь статью через «+» в разделе «База знаний»."
             } else {
-                "Ничего релевантного не нашлось (температура ${cfg.minScore}, " +
+                "Ничего релевантного не нашлось (температура ${"%.2f".format(cfg.minScore)}, " +
                     "кандидатов: ${debug.retrieved}). " +
                     "Попробуй переформулировать вопрос или снизить температуру в настройках RAG."
             }
@@ -364,7 +364,7 @@ class RagService(
         val key = apiKey ?: ApiKeyProvider.resolve()
         val modes = listOf(
             "без фильтра" to Pair(RerankModes.OFF, false),
-            "с фильтром (темп. $temperature)" to Pair(RerankModes.THRESHOLD, false),
+            "с фильтром (темп. ${"%.2f".format(temperature)})" to Pair(RerankModes.THRESHOLD, false),
             "фильтр + rewrite" to Pair(RerankModes.THRESHOLD, true),
         )
         val reports = modes.map { (label, mode) ->

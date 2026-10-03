@@ -13,6 +13,7 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 data class UiState(
     val chats: List<RagChat> = emptyList(),
@@ -257,7 +258,12 @@ class AppViewModel(private val scope: CoroutineScope) {
         v.replace(',', '.').toFloatOrNull()?.let { f -> update { it.copy(temperature = f.coerceIn(0f, 1f)) } }
     }
 
-    fun setTemperatureSlider(v: Float) = update { it.copy(temperature = v.coerceIn(0f, 1f)) }
+    // Снап к шагу ползунка 0.05: float не хранит 0.10 точно (0.10000001),
+    // поэтому округляем через целые шаги — значение всегда равно выбранному.
+    fun setTemperatureSlider(v: Float) = update {
+        val snapped = ((v * 20).roundToInt().coerceIn(0, 20)) / 20f
+        it.copy(temperature = snapped.coerceIn(0f, 1f))
+    }
 
     // top-K после фильтрации — опционален: пустая строка = без ограничения,
     // иначе число от 1 до top-K (до фильтрации).

@@ -121,7 +121,7 @@ data class RetrievalDebug(
     // Однострочник для UI/CLI: "поиск: 20 → в контекст: 4 (отсечено: 16) · фильтр: темп. 0.35 · rewrite: +2".
     fun summary(temperature: Float? = null): String = buildString {
         append("поиск: $retrieved → в контекст: $kept (отсечено: $dropped)")
-        if (rerankMode != RerankModes.OFF && temperature != null) append(" · фильтр: темп. $temperature")
+        if (rerankMode != RerankModes.OFF && temperature != null) append(" · фильтр: темп. ${"%.2f".format(temperature)}")
         if (rewritten.isNotEmpty()) append(" · rewrite: +${rewritten.size}")
     }
 }
