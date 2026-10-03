@@ -20,10 +20,12 @@ data class RagMessage(
     val role: String, // user | assistant
     val content: String,
     val id: String = newChatId(),
-    // подписи источников RAG-ответа: "[S1] title / section"
+    // подписи источников RAG-ответа: "[1] title / section" (совместимость)
     val sources: List<String> = emptyList(),
     // Task 3: диагностика поиска ("найдено 20 → в контекст 4..."), пусто = нет.
     val info: String = "",
+    // Task 4: референсы для раскрывашки (число + source/section/chunk_id + цитата).
+    val refs: List<RagRef> = emptyList(),
 )
 
 @Serializable

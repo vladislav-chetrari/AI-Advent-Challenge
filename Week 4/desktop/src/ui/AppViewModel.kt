@@ -172,14 +172,15 @@ class AppViewModel(private val scope: CoroutineScope) {
                         topK = topK, filterEnabled = filterEnabled,
                         temperature = temperature, postFilterK = postFilterK, rewrite = rewrite,
                     )
-                    val refs = ans.sources.mapIndexed { i, h ->
-                        "[S${i + 1}] ${h.chunk.title}" +
-                            (if (h.chunk.section.isNotBlank()) " / ${h.chunk.section}" else "")
+                    // Task 4: короткая подпись для совместимости + refs для раскрывашки.
+                    val refs = ans.refs.map { r ->
+                        "[${r.index}] ${r.title}" +
+                            (if (r.section.isNotBlank()) " / ${r.section}" else "")
                     }
                     // Видно и факт rewrite, и его тексты (иначе эффект "ответ улучшился, а почему — непонятно").
                     val rewriteLines = ans.retrieval.rewritten.map { "↳ rewrite: $it" }
                     val info = (listOf(ans.retrieval.summary(temperature)) + rewriteLines).joinToString("\n")
-                    chats.appendMessage(chatId, RagMessage(role = "assistant", content = ans.text, sources = refs, info = info))
+                    chats.appendMessage(chatId, RagMessage(role = "assistant", content = ans.text, sources = refs, info = info, refs = ans.refs))
                 } else {
                     val reply = svc.askPlain(text, history)
                     chats.appendMessage(chatId, RagMessage(role = "assistant", content = reply))

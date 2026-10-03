@@ -95,13 +95,49 @@ fun displayStrategy(requested: String, actual: Set<String>): String = when {
     else -> strategyName(requested)
 }
 
+// Task 4 (День 24): компактный референс под ответом.
+// В тексте ответа — короткая метка [N], здесь — откуда факт:
+// source + section/chunk_id + цитата-фрагмент из чанка.
+@Serializable
+data class RagRef(
+    val index: Int, // 1-based, совпадает с [N] в тексте ответа
+    val title: String,
+    val section: String = "",
+    val source: String = "",
+    val chunkId: String = "",
+    val strategy: String = "",
+    val score: Float = 0f,
+    val excerpt: String = "",
+)
+
 // RAG-ответ: текст LLM + чанки, на которые он опирался.
 data class RagAnswer(
     val text: String,
     val sources: List<ScoredChunk>,
     // Task 3: диагностика второго этапа (сколько забрали / сколько отдали модели).
     val retrieval: RetrievalDebug = RetrievalDebug(),
+    // Task 4: true = честный отказ без вызова LLM (ничего релевантного).
+    val refused: Boolean = false,
+    // Task 4: готовые референсы для раскрывашки под ответом.
+    val refs: List<RagRef> = emptyList(),
 )
+
+// Task 4: референсы строим серверной стороной из kept-чанков,
+// а не парсим из текста LLM — источники и цитаты есть всегда.
+fun refsFromHits(hits: List<ScoredChunk>, excerptLen: Int = 280): List<RagRef> =
+    hits.mapIndexed { i, h ->
+        val flat = h.chunk.text.replace(Regex("\\s+"), " ").trim()
+        RagRef(
+            index = i + 1,
+            title = h.chunk.title,
+            section = h.chunk.section,
+            source = h.chunk.source,
+            chunkId = h.chunk.id,
+            strategy = h.chunk.strategy,
+            score = h.score,
+            excerpt = flat.take(excerptLen),
+        )
+    }
 
 // Task 3 (День 23): что произошло между векторным поиском и промптом.
 data class RetrievalDebug(

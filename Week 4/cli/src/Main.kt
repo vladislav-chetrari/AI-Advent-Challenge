@@ -97,9 +97,19 @@ private suspend fun runCommand(args: Array<String>) {
                 println("Rewrite-запросы:")
                 ans.retrieval.rewritten.forEach { println("  + $it") }
             }
-            println("Источники:")
-            ans.sources.forEachIndexed { i, h ->
-                println("  [S${i + 1}] ${h.chunk.title} / ${h.chunk.section.ifBlank { "—" }} (${"%.3f".format(h.score)})")
+            // Task 4: тот же формат, что в GUI — коротко [N], детали + цитата ниже.
+            if (ans.refs.isNotEmpty()) {
+                println("Источники:")
+                ans.refs.forEach { r ->
+                    println("  [${r.index}] ${r.title} / ${r.section.ifBlank { "—" }} (${"%.3f".format(r.score)})")
+                    println("      ${r.source} · ${r.chunkId.ifBlank { "—" }}")
+                    if (r.excerpt.isNotBlank()) println("      “${r.excerpt}”")
+                }
+            } else {
+                println("Источники:")
+                ans.sources.forEachIndexed { i, h ->
+                    println("  [${i + 1}] ${h.chunk.title} / ${h.chunk.section.ifBlank { "—" }} (${"%.3f".format(h.score)})")
+                }
             }
         }
         // Задание 3: сравнение режимов без переиндексации — одни и те же пробы

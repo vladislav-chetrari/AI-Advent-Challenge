@@ -301,13 +301,36 @@ fun MessageBubble(m: RagMessage) {
                 Markdown(m.content, typography = chatMarkdownTypography(), modifier = Modifier.fillMaxWidth())
             }
         }
-        if (m.sources.isNotEmpty()) {
+        // Task 4: компактно — в ответе только короткие [N], детали скрыты под раскрывашкой.
+        val refCount = if (m.refs.isNotEmpty()) m.refs.size else m.sources.size
+        if (refCount > 0) {
             var expanded by remember(m.id) { mutableStateOf(false) }
             TextButton(onClick = { expanded = !expanded }) {
-                Text(if (expanded) "▲ источники (${m.sources.size})" else "▼ источники (${m.sources.size})", fontSize = 11.sp)
+                Text(if (expanded) "▲ источники ($refCount)" else "▼ источники ($refCount)", fontSize = 11.sp)
             }
             if (expanded) {
-                m.sources.forEach { s -> Text(s, fontSize = 11.sp, color = Color.Gray) }
+                if (m.refs.isNotEmpty()) {
+                    m.refs.forEach { r ->
+                        Text(
+                            "[${r.index}] ${r.title}" +
+                                (if (r.section.isNotBlank()) " / ${r.section}" else "") +
+                                " (${"%.3f".format(r.score)})",
+                            fontSize = 11.sp, color = Color.Gray, fontWeight = FontWeight.Bold,
+                        )
+                        Text(
+                            "${r.source} · ${r.chunkId.ifBlank { "—" }}",
+                            fontSize = 10.sp, color = Color(0xFF888888), maxLines = 1,
+                        )
+                        if (r.excerpt.isNotBlank()) {
+                            SelectionContainer {
+                                Text("“${r.excerpt}”", fontSize = 11.sp, color = Color(0xFF555555))
+                            }
+                        }
+                        Spacer(Modifier.height(4.dp))
+                    }
+                } else {
+                    m.sources.forEach { s -> Text(s, fontSize = 11.sp, color = Color.Gray) }
+                }
             }
         }
     }

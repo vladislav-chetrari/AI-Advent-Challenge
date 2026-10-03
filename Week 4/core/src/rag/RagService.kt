@@ -320,31 +320,36 @@ class RagService(
             rewritten = queries.drop(1),
             rerankMode = cfg.mode,
         )
+        // Task 4: «не знаю» — шаблоном без вызова LLM.
         if (rr.kept.isEmpty()) {
             val hint = if (cfg.mode == RerankModes.OFF) {
                 "База знаний пуста — добавь статью через «+» в разделе «База знаний»."
             } else {
-                "Ничего релевантного не нашлось (температура ${"%.2f".format(cfg.minScore)}, " +
-                    "кандидатов: ${debug.retrieved}). " +
-                    "Попробуй переформулировать вопрос или снизить температуру в настройках RAG."
+                "Не знаю по этой базе — ничего релевантного не нашлось " +
+                    "(температура ${"%.2f".format(cfg.minScore)}, кандидатов: ${debug.retrieved}). " +
+                    "Уточни вопрос или добавь нужную статью в базу знаний."
             }
-            return RagAnswer(hint, emptyList(), debug)
+            return RagAnswer(hint, emptyList(), debug, refused = true)
         }
         val hits = rr.kept
+        // Task 4: короткие числовые метки [N] — в тексте только они,
+        // детали (source/section/chunk_id + цитата) уходят в refs под ответом.
         val context = hits.mapIndexed { i, h ->
-            "[S${i + 1}] ${h.chunk.title}" +
+            "[${i + 1}] ${h.chunk.title}" +
                 (if (h.chunk.section.isNotBlank()) " / ${h.chunk.section}" else "") +
                 ":\n${h.chunk.text.take(1500)}"
         }.joinToString("\n\n")
         val system = "Ты отвечаешь на вопросы по локальной базе знаний. " +
-            "Используй ТОЛЬКО приведённые фрагменты. После каждого факта ставь ссылку вида [S1]. " +
-            "Если ответа нет во фрагментах — так и скажи."
+            "Используй ТОЛЬКО приведённые фрагменты [1..${hits.size}]. " +
+            "После каждого факта ставь короткую ссылку вида [1]. " +
+            "Не выдумывай факты и цитаты. Если ответа нет во фрагментах — так и скажи."
         val user = "Контекст:\n$context\n\nВопрос: $query"
+        val refs = refsFromHits(hits)
         return when (val r = llm.complete(listOf(ChatMsg("system", system), ChatMsg("user", user)), apiKey ?: ApiKeyProvider.resolve())) {
-            is LlmResult.Ok -> RagAnswer(r.text, hits, debug)
-            is LlmResult.HttpError -> RagAnswer("DeepSeek HTTP ${r.code}: ${r.detail.take(200)}", hits, debug)
-            is LlmResult.NetworkError -> RagAnswer("Сеть: ${r.detail.take(200)}", hits, debug)
-            LlmResult.Empty -> RagAnswer("Пустой ответ модели.", hits, debug)
+            is LlmResult.Ok -> RagAnswer(r.text, hits, debug, refused = false, refs = refs)
+            is LlmResult.HttpError -> RagAnswer("DeepSeek HTTP ${r.code}: ${r.detail.take(200)}", hits, debug, refs = refs)
+            is LlmResult.NetworkError -> RagAnswer("Сеть: ${r.detail.take(200)}", hits, debug, refs = refs)
+            LlmResult.Empty -> RagAnswer("Пустой ответ модели.", hits, debug, refs = refs)
         }
     }
 
