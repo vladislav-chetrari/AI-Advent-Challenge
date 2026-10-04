@@ -1,8 +1,10 @@
 package desktop
 
+import androidx.compose.foundation.VerticalScrollbar
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -17,6 +19,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.rememberScrollbarAdapter
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
@@ -41,6 +44,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEvent
 import androidx.compose.ui.input.key.KeyEventType
 import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
@@ -223,6 +227,10 @@ fun DocRow(d: DocInfo, progress: Float?, selected: Boolean, onOpen: () -> Unit, 
     }
 }
 
+// Enter с основной клавиатуры и с NumPad — подтверждение (отправка/создание/загрузка).
+private fun isConfirmKey(e: KeyEvent): Boolean =
+    (e.key == Key.Enter || e.key == Key.NumPadEnter) && e.type == KeyEventType.KeyDown
+
 @Composable
 fun ChatPane(vm: AppViewModel, chat: RagChat) {
     val st by vm.state.collectAsState()
@@ -267,8 +275,17 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
                     TextButton(onClick = vm::clearTaskMemory) { Text("забыть", fontSize = 11.sp) }
                 }
                 if (memExpanded) {
-                    if (mem.goal.isNotBlank()) Text("Цель: ${mem.goal}", fontSize = 11.sp, color = Color(0xFF333333))
-                    mem.facts.forEach { f -> Text("• $f", fontSize = 11.sp, color = Color(0xFF555555)) }
+                    val memScroll = rememberScrollState()
+                    Box(Modifier.fillMaxWidth().heightIn(max = 160.dp)) {
+                        Column(Modifier.fillMaxWidth().padding(end = 12.dp).verticalScroll(memScroll)) {
+                            if (mem.goal.isNotBlank()) Text("Цель: ${mem.goal}", fontSize = 11.sp, color = Color(0xFF333333))
+                            mem.facts.forEach { f -> Text("• $f", fontSize = 11.sp, color = Color(0xFF555555)) }
+                        }
+                        VerticalScrollbar(
+                            adapter = rememberScrollbarAdapter(memScroll),
+                            modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight(),
+                        )
+                    }
                 }
             }
         }
@@ -277,20 +294,26 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
         LaunchedEffect(chat.id, messages.size, st.busy) {
             if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
         }
-        LazyColumn(state = listState, modifier = Modifier.weight(1f).fillMaxWidth().padding(horizontal = 12.dp)) {
-            items(messages, key = { it.id }) { m -> MessageBubble(m) }
-            if (st.busy) {
-                item(key = "typing") {
-                    Text("Печатает…", fontSize = 14.sp, color = Color.Gray, modifier = Modifier.padding(vertical = 6.dp))
+        Box(Modifier.weight(1f).fillMaxWidth()) {
+            LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(start = 12.dp, end = 20.dp)) {
+                items(messages, key = { it.id }) { m -> MessageBubble(m) }
+                if (st.busy) {
+                    item(key = "typing") {
+                        Text("Печатает…", fontSize = 14.sp, color = Color.Gray, modifier = Modifier.padding(vertical = 6.dp))
+                    }
                 }
             }
+            VerticalScrollbar(
+                adapter = rememberScrollbarAdapter(listState),
+                modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight().padding(end = 4.dp),
+            )
         }
         Row(Modifier.fillMaxWidth().padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
             OutlinedTextField(
                 value = st.input, onValueChange = vm::setInput,
                 modifier = Modifier.weight(1f).onPreviewKeyEvent { e ->
-                    // Enter — отправить, Shift+Enter — новая строка (дефолт текстового поля).
-                    if (e.key == Key.Enter && e.type == KeyEventType.KeyDown && !e.isShiftPressed) {
+                    // Enter / NumPadEnter — отправить, Shift+Enter — новая строка (дефолт текстового поля).
+                    if (isConfirmKey(e) && !e.isShiftPressed) {
                         vm.send()
                         true
                     } else false
@@ -558,8 +581,8 @@ fun CreateChatDialog(vm: AppViewModel) {
                 value = st.createName, onValueChange = vm::setCreateName,
                 label = { Text("Название") }, singleLine = true,
                 modifier = Modifier.onPreviewKeyEvent { e ->
-                    // Название всегда в одну строку — Enter сразу создаёт чат.
-                    if (e.key == Key.Enter && e.type == KeyEventType.KeyDown) {
+                    // Название всегда в одну строку — Enter / NumPadEnter сразу создаёт чат.
+                    if (isConfirmKey(e)) {
                         vm.commitCreateChat()
                         true
                     } else false
@@ -604,7 +627,14 @@ fun WikiDialog(vm: AppViewModel) {
                     value = st.wikiInput, onValueChange = vm::setWikiInput,
                     label = { Text("Название или URL") },
                     placeholder = { Text("Искусственный интеллект") },
-                    singleLine = true, modifier = Modifier.fillMaxWidth(),
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth().onPreviewKeyEvent { e ->
+                        // Enter / NumPadEnter — то же, что кнопка «Загрузить».
+                        if (isConfirmKey(e) && st.wikiInput.isNotBlank()) {
+                            vm.fetchWiki()
+                            true
+                        } else false
+                    },
                 )
                 ChunkStrategyPicker(st.addStrategy, vm::setAddStrategy)
             }
