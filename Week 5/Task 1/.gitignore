@@ -1,0 +1,7 @@
+# Week 5 Task 1 — локальная LLM (Ollama + Qwen, Kotlin Toolchain)
+build/
+*.class
+*.jar
+.DS_Store
+.idea/
+out/
