@@ -14,6 +14,25 @@ import io.ktor.serialization.kotlinx.json.json
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
+// Дефолт num_ctx=4096: гарантированно влезает в RTX 3060 12GB вместе с qwen2.5:7b.
+// Большие значения (8192/32768) на 12GB — лотерея: иногда стартуют, иногда
+// llama-server падает с cudaMalloc/out-of-memory (только один буфер под KV-cache
+// просит ~1.9 ГБ, итог зависит от свободной VRAM в момент загрузки).
+// Большой контекст стабилен только на машинах с запасом VRAM/RAM,
+// задаётся флагом --num-ctx / --ctx или env OLLAMA_NUM_CTX.
+const val DEFAULT_NUM_CTX: Int = 4_096
+const val MIN_NUM_CTX: Int = 2_048
+
+// Маркер OOM от llama-server (HTTP 500): подсказывает, что надо ретраить с меньшим ctx,
+// а не ронять запрос. Покрывает "out of memory", "out-of-memory", "cudaMalloc failed",
+// "failed to allocate ... kv cache".
+fun isOomError(detail: String): Boolean {
+    val d = detail.lowercase()
+    return d.contains("out of memory") || d.contains("out-of-memory") ||
+        d.contains("cudamalloc") || d.contains("failed to allocate") ||
+        (d.contains("kv cache") && (d.contains("failed") || d.contains("memory")))
+}
+
 data class ChatMessage(val role: String, val content: String)
 
 data class TokenUsage(
@@ -35,7 +54,7 @@ private data class WireMessage(val role: String, val content: String)
 @Serializable
 private data class OllamaOptions(
     val temperature: Double = 0.7,
-    val num_ctx: Int = 32_768,
+    val num_ctx: Int = DEFAULT_NUM_CTX,
 )
 
 // think=false глушит reasoning у qwen3 (иначе раздувает расход и ломает короткие ответы);
@@ -71,9 +90,15 @@ open class QwenClient(
     private val model: String = QwenModel.QWEN25_7B.apiId,
     private val temperature: Double = 0.7,
     baseUrl: String = "http://localhost:11434",
-    private val numCtx: Int = 32_768,
+    private val numCtx: Int = DEFAULT_NUM_CTX,
 ) {
     val modelName: String get() = model
+    val requestedCtx: Int get() = numCtx
+    // Фактический ctx последнего вызова (меньше запрошенного, если сработал OOM-фолбэк).
+    var lastUsedCtx: Int = numCtx
+        private set
+    // Липкий потолок: после успешного OOM-фолбэка новые вызовы стартуют сразу с рабочего ctx.
+    private var ctxCap: Int? = null
 
     private val base: String = baseUrl.trimEnd('/')
 
@@ -87,6 +112,25 @@ open class QwenClient(
     }
 
     suspend open fun complete(history: List<ChatMessage>): LlmResult {
+        // OOM-фолбэк: если llama-server не смог выделить KV-cache под запрошенный ctx
+        // (HTTP 500 + cudaMalloc/out-of-memory), повторяем с ctx вдвое меньше, вплоть до MIN_NUM_CTX.
+        // ctxCap липкий: раз не влезло — следующие вызовы этого клиента сразу стартуют
+        // с рабочего значения, без повторных неудачных попыток перегрузить модель в Ollama.
+        var ctx = minOf(numCtx.coerceAtLeast(MIN_NUM_CTX), ctxCap ?: Int.MAX_VALUE)
+        lastUsedCtx = ctx
+        while (true) {
+            val r = postChat(history, ctx)
+            if (r is LlmResult.HttpError && r.code == 500 && isOomError(r.detail) && ctx > MIN_NUM_CTX) {
+                ctx = (ctx / 2).coerceAtLeast(MIN_NUM_CTX)
+                lastUsedCtx = ctx
+                continue
+            }
+            if (r is LlmResult.Ok && ctx < numCtx) ctxCap = ctx
+            return r
+        }
+    }
+
+    private suspend fun postChat(history: List<ChatMessage>, ctx: Int): LlmResult {
         return try {
             val http = client.post("$base/api/chat") {
                 contentType(ContentType.Application.Json)
@@ -94,7 +138,7 @@ open class QwenClient(
                     OllamaChatRequest(
                         model = model,
                         messages = history.map { WireMessage(it.role, it.content) },
-                        options = OllamaOptions(temperature = temperature, num_ctx = numCtx),
+                        options = OllamaOptions(temperature = temperature, num_ctx = ctx),
                     )
                 )
             }

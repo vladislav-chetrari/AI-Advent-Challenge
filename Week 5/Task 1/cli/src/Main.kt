@@ -1,18 +1,21 @@
 package cli
 
 import core.llm.ChatMessage
+import core.llm.DEFAULT_NUM_CTX
 import core.llm.LlmResult
 import core.llm.QwenClient
 import core.llm.QwenModel
+import core.llm.isOomError
 import kotlinx.coroutines.runBlocking
 
 // Доступ к локальной Qwen через Ollama, та же команда на Mac и ПК.
 //
 //   week5 status [--model qwen2.5-7b] [--base-url http://localhost:11434]
-//   week5 ask <текст...> [--model ...] [--temperature 0.7] [--system "..."]
-//   week5 chat [--model ...] [--temperature 0.7] [--system "..."]
+//   week5 ask <текст...> [--model ...] [--temperature 0.7] [--num-ctx 8192] [--system "..."]
+//   week5 chat [--model ...] [--temperature 0.7] [--num-ctx 8192] [--system "..."]
 //   week5 demo [--model ...]   (3 запроса разной сложности для видео Task 1)
 fun main(args: Array<String>) = runBlocking {
+    ensureUtf8Console()
     if (args.isEmpty()) {
         usage()
         return@runBlocking
@@ -54,9 +57,10 @@ private suspend fun runCommand(args: Array<String>) {
             val model = QwenModel.resolve(flag(rest, "--model"))
             val baseUrl = flag(rest, "--base-url") ?: "http://localhost:11434"
             val temperature = flag(rest, "--temperature")?.toDoubleOrNull() ?: 0.7
+            val numCtx = numCtxFlag(rest)
             val system = flag(rest, "--system")
                 ?: "You are a helpful AI assistant. Always reply in the same language the user writes in (Russian for Russian messages)."
-            val client = QwenClient(model = model.apiId, temperature = temperature, baseUrl = baseUrl)
+            val client = QwenClient(model = model.apiId, temperature = temperature, baseUrl = baseUrl, numCtx = numCtx)
             try {
                 println(answerOnce(client, system, query))
             } finally {
@@ -68,16 +72,18 @@ private suspend fun runCommand(args: Array<String>) {
             val model = QwenModel.resolve(flag(rest, "--model"))
             val baseUrl = flag(rest, "--base-url") ?: "http://localhost:11434"
             var temperature = flag(rest, "--temperature")?.toDoubleOrNull() ?: 0.7
+            val numCtx = numCtxFlag(rest)
             var system = flag(rest, "--system")
                 ?: "You are a helpful AI assistant. Always reply in the same language the user writes in (Russian for Russian messages)."
-            var client = QwenClient(model = model.apiId, temperature = temperature, baseUrl = baseUrl)
+            var client = QwenClient(model = model.apiId, temperature = temperature, baseUrl = baseUrl, numCtx = numCtx)
             val history = mutableListOf(ChatMessage("system", system))
-            println("Чат: ${model.label} (${model.apiId}, ctx=${model.contextLimit}) @ $baseUrl")
+            println("Чат: ${model.label} (${model.apiId}, ctx=$numCtx) @ $baseUrl")
             println("Команды: /clear /temp <n> /system <текст> /exit")
             try {
                 while (true) {
                     print("вы> ")
-                    val line = readlnOrNull()?.trim() ?: break
+                    System.out.flush()
+                    val line = readLineUtf8()?.trim() ?: break
                     if (line.isEmpty()) continue
                     when {
                         line == "/exit" || line == "/quit" || line == "/q" -> break
@@ -95,7 +101,7 @@ private suspend fun runCommand(args: Array<String>) {
                             }
                             temperature = t
                             client.close()
-                            client = QwenClient(model = model.apiId, temperature = temperature, baseUrl = baseUrl)
+                            client = QwenClient(model = model.apiId, temperature = temperature, baseUrl = baseUrl, numCtx = numCtx)
                             println("(temperature=$temperature)")
                             continue
                         }
@@ -124,6 +130,7 @@ private suspend fun runCommand(args: Array<String>) {
             val model = QwenModel.resolve(flag(rest, "--model"))
             val baseUrl = flag(rest, "--base-url") ?: "http://localhost:11434"
             val temperature = flag(rest, "--temperature")?.toDoubleOrNull() ?: 0.7
+            val numCtx = numCtxFlag(rest)
             val system = flag(rest, "--system")
                 ?: "You are a helpful AI assistant. Always reply in the same language the user writes in (Russian for Russian messages)."
             val prompts = listOf(
@@ -131,7 +138,7 @@ private suspend fun runCommand(args: Array<String>) {
                 "2 (средний): Объясни за 5-7 предложений, чем sliding window отличается от хранения фактов (sticky facts) при управлении контекстом диалога. Приведи пример потери факта.",
                 "3 (сложный): Составь мини-ТЗ из 5 пунктов для CLI к локальной LLM (команды status/ask/chat), затем самокритично укажи 2 слабых места этого ТЗ.",
             )
-            val client = QwenClient(model = model.apiId, temperature = temperature, baseUrl = baseUrl)
+            val client = QwenClient(model = model.apiId, temperature = temperature, baseUrl = baseUrl, numCtx = numCtx)
             try {
                 println("Демо: ${model.label} (${model.apiId}) @ $baseUrl\n")
                 for (p in prompts) {
@@ -164,13 +171,18 @@ private suspend fun answerOnce(
             buildString {
                 append(r.text)
                 val u = r.usage
-                if (u.totalTokens > 0) append("\n[in=${u.promptTokens} out=${u.completionTokens} total=${u.totalTokens}]")
+                if (u.totalTokens > 0) append("\n[in=${u.promptTokens} out=${u.completionTokens} total=${u.totalTokens} ctx=${client.lastUsedCtx}]")
             }
         }
         is LlmResult.HttpError -> {
             if (convo.lastOrNull()?.role == "user") convo.removeLastOrNull()
             if (r.code == 404 && r.detail.contains("not found", ignoreCase = true))
                 "ОШИБКА HTTP 404: модель ${client.modelName} не скачана — выполни `ollama pull ${client.modelName}`"
+            else if (r.code == 500 && isOomError(r.detail))
+                "ОШИБКА HTTP 500: Ollama не хватило видеопамяти (num_ctx=${client.lastUsedCtx} слишком большой для этой GPU). " +
+                    "Что делать: 1) перезапусти с меньшим контекстом — `week5 ask ... --num-ctx 4096`; " +
+                    "2) выгрузи лишние модели (`ollama ps`) или перезапусти `ollama serve`; " +
+                    "3) на 12GB для больших контекстов возьми модель поменьше — `ollama pull qwen2.5:1.5b`"
             else "ОШИБКА HTTP ${r.code}${if (r.detail.isNotBlank()) ": ${r.detail}" else ""}"
         }
         is LlmResult.NetworkError ->
@@ -191,14 +203,56 @@ private fun fail(msg: String): Nothing {
 private fun usage() {
     println("week5 status [--model qwen2.5-7b] [--base-url http://localhost:11434]")
     println("  проверка: сервер доступен + какие модели скачаны (`ollama list` через API)")
-    println("week5 ask <текст...> [--model qwen2.5-7b|qwen3-8b] [--temperature 0.7] [--system \"...\"] [--base-url ...]")
-    println("  разовый запрос, ответ + [in/out/total токены]")
-    println("week5 chat [--model ...] [--temperature 0.7] [--system \"...\"]")
+    println("week5 ask <текст...> [--model qwen2.5-7b|qwen3-8b] [--temperature 0.7] [--num-ctx 4096] [--system \"...\"] [--base-url ...]")
+    println("  разовый запрос, ответ + [in/out/total/ctx токены]")
+    println("week5 chat [--model ...] [--temperature 0.7] [--num-ctx 4096] [--system \"...\"]")
     println("  REPL-чат с историей; команды: /clear /temp <n> /system <текст> /exit")
-    println("week5 demo [--model ...]")
+    println("week5 demo [--model ...] [--num-ctx 4096]")
     println("  3 запроса разной сложности одним прогоном (простой/средний/сложный) для видео Task 1")
-    println("Модели: " + QwenModel.ALL.joinToString { "${it.id} (${it.apiId}, ctx=${it.contextLimit})" })
-    println("Сначала: `ollama serve` + `ollama pull qwen2.5:7b` (дефолт, ~4.7 ГБ — влезает в RTX 3060 12GB и летает на M4 Pro)")
+    println("Модели: " + QwenModel.ALL.joinToString { "${it.id} (${it.apiId})" })
+    println("Контекст: дефолт num_ctx=$DEFAULT_NUM_CTX (влезает в RTX 3060 12GB). 32768 — только для Mac 64GB / карт с запасом VRAM.")
+    println("  При OOM клиент сам повторит запрос с меньшим ctx (…→4096→2048) и запомнит рабочий лимит до конца сессии.")
+    println("Сначала: `ollama serve` + `ollama pull qwen2.5:7b` (дефолт, ~4.7 ГБ)")
+}
+
+// Windows-консоль по умолчанию работает в CP866, а JVM печатает не в UTF-8 —
+// из-за этого кириллица превращается в "???". Лечим с двух сторон:
+// 1) переключаем кодовую страницу консоли на 65001 (UTF-8),
+// 2) переподключаем stdout/stderr/stdin строго на UTF-8.
+// На Mac/Linux это no-op.
+private fun ensureUtf8Console() {
+    if (System.getProperty("os.name", "").startsWith("Windows", ignoreCase = true)) {
+        runCatching {
+            ProcessBuilder("cmd", "/c", "chcp", "65001")
+                .redirectOutput(ProcessBuilder.Redirect.DISCARD)
+                .redirectError(ProcessBuilder.Redirect.DISCARD)
+                .start().waitFor(5, java.util.concurrent.TimeUnit.SECONDS)
+        }
+    }
+    runCatching {
+        System.setOut(java.io.PrintStream(java.io.BufferedOutputStream(java.io.FileOutputStream(java.io.FileDescriptor.out)), true, Charsets.UTF_8))
+    }
+    runCatching {
+        System.setErr(java.io.PrintStream(java.io.BufferedOutputStream(java.io.FileOutputStream(java.io.FileDescriptor.err)), true, Charsets.UTF_8))
+    }
+}
+
+// Ввод строго в UTF-8: readlnOrNull() декодирует системной кодировкой (на Windows — CP866/1251),
+// поэтому набранная по-русски строка в чате приходила битой. Читаем через InputStreamReader(UTF-8).
+private val stdinUtf8: java.io.BufferedReader by lazy {
+    java.io.BufferedReader(java.io.InputStreamReader(System.`in`, Charsets.UTF_8))
+}
+
+private fun readLineUtf8(): String? = runCatching { stdinUtf8.readLine() }.getOrNull()
+
+// Размер контекста: --num-ctx <n> (алиас --ctx), иначе env OLLAMA_NUM_CTX, иначе дефолт 4096.
+// Меньше = меньше VRAM под KV-cache. На RTX 3060 12GB 4096 влезает всегда,
+// 8192+ — лотерея от свободной VRAM (при OOM клиент сам откатится вниз).
+private fun numCtxFlag(rest: Array<String>): Int {
+    val raw = flag(rest, "--num-ctx") ?: flag(rest, "--ctx")
+        ?: System.getenv("OLLAMA_NUM_CTX")
+        ?: return DEFAULT_NUM_CTX
+    return raw.toIntOrNull()?.takeIf { it > 0 } ?: DEFAULT_NUM_CTX
 }
 
 private fun flag(args: Array<String>, name: String): String? {

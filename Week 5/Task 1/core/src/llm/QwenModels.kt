@@ -1,8 +1,12 @@
 package core.llm
 
 // Профиль локальной модели. Один и тот же apiId работает и на Mac (M4 Pro 64GB),
-// и на ПК (RTX 3060 12GB) — дефолт qwen2.5:7b (~4.7 ГБ Q4) целиком влезает в 12 ГБ VRAM
-// даже с num_ctx 32768, а qwen3:8b (~5.2 ГБ) — запасной вариант с лучшим русским.
+// и на ПК (RTX 3060 12GB) — дефолт qwen2.5:7b (~4.7 ГБ Q4).
+// ВАЖНО: contextLimit ниже — это потолок модели, а НЕ размер рабочего контекста.
+// Рабочий num_ctx по умолчанию 8192 (DEFAULT_NUM_CTX в QwenClient.kt): 32768 на
+// RTX 3060 12GB не стартует — llama-server падает с cudaMalloc/out-of-memory,
+// т.к. только один буфер под KV-cache просит ~1.9 ГБ. 32768 — только для Mac 64GB
+// или карт с запасом VRAM, включается флагом --num-ctx.
 data class QwenModel(
     val id: String,
     val label: String,
