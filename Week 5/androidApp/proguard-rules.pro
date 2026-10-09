@@ -1,0 +1,2 @@
+-keep class task2.llama.JniLlamaBridge { *; }
+-keep class task2.llama.** { *; }

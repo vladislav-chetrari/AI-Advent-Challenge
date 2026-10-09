@@ -1,0 +1,24 @@
+product:
+  type: kmp/lib
+  platforms: [jvm, android]
+
+dependencies:
+  - $compose.foundation: exported
+  - $compose.material3: exported
+  - $compose.runtime: exported
+  - org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2
+  - org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0
+  - org.jetbrains.kotlinx:kotlinx-serialization-core:1.11.0
+  # Room KMP: рантайм и драйвер видны потребителям (билдер БД создают
+  # платформенные entry-point'ы: MainActivity / desktop main).
+  - androidx.room:room-runtime:2.8.5: exported
+  - androidx.sqlite:sqlite-bundled:2.7.1: exported
+
+settings:
+  compose:
+    enabled: true
+  kotlin:
+    serialization: json
+    ksp:
+      processors:
+        - androidx.room:room-compiler:2.8.5

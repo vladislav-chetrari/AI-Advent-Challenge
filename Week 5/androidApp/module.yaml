@@ -1,0 +1,16 @@
+product: android/app
+
+dependencies:
+  - ../shared
+  - androidx.activity:activity-compose:1.8.2
+
+settings:
+  compose: enabled
+  android:
+    namespace: com.aiadvent.task2
+    applicationId: com.aiadvent.task2
+    versionCode: 1
+    versionName: "1.0"
+    minSdk: 24
+  kotlin:
+    serialization: json

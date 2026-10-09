@@ -1,0 +1,20 @@
+# Week 5 Task 2 — embedded LLM (llama.cpp + Qwen2.5-0.5B-Q4)
+build/
+*.class
+*.jar
+*.apk
+*.aab
+*.so
+.DS_Store
+.idea/
+out/
+# GGUF-модели качаются при первом запуске, в git не коммитим
+*.gguf
+# Локальный релизный кейстор
+release.keystore
+keystore.properties
+# Исходники llama.cpp (3700+ файлов, клонируются скриптом tools/build-llama.sh)
+androidApp/cpp/llama.cpp/
+# Логи сборок и adb-дампы
+*.log
+ui*.xml
