@@ -4,8 +4,9 @@ import kotlinx.coroutines.delay
 import task3.data.hashingEmbed
 
 /**
- * Десктоп-заглушка: детерминированные хэш-вектора нужной размерности
- * (dim угадываем по имени файла, как в каталоге).
+ * Десктоп-заглушка: детерминированные хэш-вектора размерности каталога.
+ * На JVM нет embedding-рантайма, поэтому desktopApp показывает
+ * тот же UI индексации на мусорных, но стабильных векторах.
  */
 class FakeEmbedBridge : EmbedBridge {
     private var modelPath: String? = null
@@ -17,7 +18,7 @@ class FakeEmbedBridge : EmbedBridge {
     override suspend fun load(modelPath: String, nThreads: Int) {
         delay(300)
         this.modelPath = modelPath
-        this.modelDim = if (modelPath.contains("minilm", ignoreCase = true)) 384 else 768
+        this.modelDim = 768
     }
 
     override suspend fun embed(texts: List<String>): List<FloatArray> {

@@ -3,38 +3,31 @@ package task2.data
 import task2.domain.AiModel
 
 /**
- * Каталог из 3 моделей, все ChatML-совместимые (единый PromptBuilder).
- * Дефолт — qwen3-1.7b-q4 (баланс ум/ОЗУ для живого диалога).
- * URL указывают на HuggingFace GGUF-кванты Q4_K_M.
+ * Локальные модели под LiteRT-LM (.litertlm из litert-community, Apache-2.0,
+ * скачивание без логина). Шаблон чата применяет сам рантайм —
+ * ChatML-хаки PromptBuilder больше не нужны.
+ * Дефолт — Qwen2.5 1.5B Q8 (инструктивная, тянет RAG с цитатами).
  */
 object ModelCatalog {
-    val QWEN3_06B_Q4 = AiModel(
-        id = "qwen3-0.6b-q4",
-        label = "Qwen3 0.6B Q4 (~500 МБ, лёгкая)",
-        fileName = "Qwen_Qwen3-0.6B-Q4_K_M.gguf",
-        downloadUrl = "https://huggingface.co/bartowski/Qwen_Qwen3-0.6B-GGUF/resolve/main/Qwen_Qwen3-0.6B-Q4_K_M.gguf",
-        sizeMb = 500,
-        defaultCtx = 2048,
+    val QWEN25_15B_Q8 = AiModel(
+        id = "qwen25-1.5b-q8",
+        label = "Qwen2.5 1.5B Q8 (дефолт, ~1.5 ГБ)",
+        fileName = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
+        downloadUrl = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
+        sizeMb = 1524,
+        defaultCtx = 4096,
     )
-    val QWEN3_17B_Q4 = AiModel(
-        id = "qwen3-1.7b-q4",
-        label = "Qwen3 1.7B Q4 (дефолт, ~1.3 ГБ)",
-        fileName = "Qwen_Qwen3-1.7B-Q4_K_M.gguf",
-        downloadUrl = "https://huggingface.co/bartowski/Qwen_Qwen3-1.7B-GGUF/resolve/main/Qwen_Qwen3-1.7B-Q4_K_M.gguf",
-        sizeMb = 1300,
-        defaultCtx = 2048,
-    )
-    val SMOLLM3_3B_Q4 = AiModel(
-        id = "smollm3-3b-q4",
-        label = "SmolLM3 3B Q4 (качество, ~1.9 ГБ)",
-        fileName = "SmolLM3-3B-Q4_K_M.gguf",
-        downloadUrl = "https://huggingface.co/lmstudio-community/SmolLM3-3B-GGUF/resolve/main/SmolLM3-3B-Q4_K_M.gguf",
-        sizeMb = 1920,
-        defaultCtx = 2048,
+    val QWEN3_06B_INT4 = AiModel(
+        id = "qwen3-0.6b-int4",
+        label = "Qwen3 0.6B int4 (лёгкая, ~330 МБ)",
+        fileName = "qwen3_0.6b_q4_block32_ekv1280.litertlm",
+        downloadUrl = "https://huggingface.co/litert-community/Qwen3-0.6B-int4/resolve/main/qwen3_0.6b_q4_block32_ekv1280.litertlm",
+        sizeMb = 331,
+        defaultCtx = 1280,
     )
 
-    val ALL: List<AiModel> = listOf(QWEN3_06B_Q4, QWEN3_17B_Q4, SMOLLM3_3B_Q4)
-    val DEFAULT: AiModel = QWEN3_17B_Q4
+    val ALL: List<AiModel> = listOf(QWEN25_15B_Q8, QWEN3_06B_INT4)
+    val DEFAULT: AiModel = QWEN25_15B_Q8
 
     fun resolve(id: String?): AiModel = ALL.firstOrNull { it.id == id } ?: DEFAULT
 }

@@ -23,6 +23,15 @@ dependencies:
   - androidx.room:room-runtime:2.8.5: exported
   - androidx.sqlite:sqlite-bundled:2.7.1: exported
 
+# Платформенные рантаймы: LiteRT-LM отдельно под Android (AAR)
+# и под JVM-десктоп (jar с нативами). Общий код их не видит —
+# только src@android / src@jvm actuals.
+dependencies@android:
+  - com.google.ai.edge.litertlm:litertlm-android:0.18.0
+
+dependencies@jvm:
+  - com.google.ai.edge.litertlm:litertlm-jvm:0.18.0
+
 settings:
   compose:
     enabled: true

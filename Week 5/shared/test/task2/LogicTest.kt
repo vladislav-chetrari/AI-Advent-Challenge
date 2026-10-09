@@ -11,26 +11,28 @@ import kotlin.test.assertTrue
 
 class LogicTest {
     @Test
-    fun defaultModelIsQwen317b() {
-        assertEquals("qwen3-1.7b-q4", ModelCatalog.DEFAULT.id)
-        assertEquals(3, ModelCatalog.ALL.size)
+    fun defaultModelIsQwen2515b() {
+        assertEquals("qwen25-1.5b-q8", ModelCatalog.DEFAULT.id)
+        assertEquals(2, ModelCatalog.ALL.size)
     }
 
     @Test
-    fun promptUsesQwenChatMl() {
+    fun chatPromptHasNoChatMl() {
         val history = listOf(ChatMessage(1, ChatMessage.Role.USER, "привет"))
-        val p = PromptBuilder.build(history, "как дела?")
-        assertTrue(p.contains("<|im_start|>system"))
-        assertTrue(p.contains("<|im_start|>user\nкак дела?"))
-        assertTrue(p.endsWith(PromptBuilder.NO_THINK_SUFFIX))
+        val system = PromptBuilder.chatSystem()
+        val user = PromptBuilder.chatUser(history, "как дела?")
+        assertTrue(!system.contains("<|im_start|>"), "LiteRT сам применяет шаблон")
+        assertTrue(!user.contains("<|im_start|>"))
+        assertTrue(user.contains("Пользователь: как дела?"))
+        assertTrue(user.contains("Пользователь: привет"))
     }
 
     @Test
     fun promptDetectsLanguageFromDialogue() {
-        val p = PromptBuilder.build(emptyList(), "Hello, how are you?")
-        assertTrue(p.contains("на том же языке"))
-        assertTrue(!p.contains("Отвечай по-русски"))
-        assertTrue(p.contains("/no_think"))
+        val s = PromptBuilder.chatSystem()
+        assertTrue(s.contains("на том же языке"))
+        assertTrue(!s.contains("Отвечай по-русски"))
+        assertTrue(!s.contains("/no_think"))
     }
 
     @Test
@@ -55,22 +57,17 @@ class LogicTest {
             val role = if (i % 2 == 0) ChatMessage.Role.USER else ChatMessage.Role.ASSISTANT
             ChatMessage(i.toLong(), role, "msg-$i")
         }
-        val p = PromptBuilder.build(history, "вопрос")
-        assertTrue(p.contains("msg-13"))
-        assertTrue(p.contains("msg-4"))
-        assertTrue(!p.contains("msg-3"), "окно 10 должно вытеснить старые реплики")
+        val u = PromptBuilder.chatUser(history, "вопрос")
+        assertTrue(u.contains("msg-13"))
+        assertTrue(u.contains("msg-4"))
+        assertTrue(!u.contains("msg-3"), "окно 10 должно вытеснить старые реплики")
     }
 
     @Test
     fun factsInjectedIntoSystem() {
-        val p = PromptBuilder.build(
-            history = emptyList(),
-            userPrompt = "как меня зовут?",
-            facts = listOf("Имя пользователя — Влад"),
-        )
-        assertTrue(p.contains("Факты о собеседнике"))
-        assertTrue(p.contains("- Имя пользователя — Влад"))
-        assertTrue(p.indexOf("Факты о собеседнике") < p.indexOf("<|im_start|>user"))
+        val s = PromptBuilder.chatSystem(facts = listOf("Имя пользователя — Влад"))
+        assertTrue(s.contains("Факты о собеседнике"))
+        assertTrue(s.contains("- Имя пользователя — Влад"))
     }
 
     @Test

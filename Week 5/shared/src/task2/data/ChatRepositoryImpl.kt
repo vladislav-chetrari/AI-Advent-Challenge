@@ -68,7 +68,7 @@ class ChatRepositoryImpl(
                 bridge.load(dest, model.defaultCtx, platformCpuThreads())
                 loadedPath = dest
             } catch (e: CancellationException) { throw e } catch (e: Exception) {
-                _status.value = EngineStatus.Error("Не загрузилась в llama.cpp: ${e.message}")
+                _status.value = EngineStatus.Error("Не загрузилась в LiteRT: ${e.message}")
                 return
             }
         }
@@ -96,13 +96,13 @@ class ChatRepositoryImpl(
         }
         _status.value = EngineStatus.Generating
         try {
-            val full = PromptBuilder.build(
+            val system = PromptBuilder.chatSystem(facts = memory.facts.value.map { it.text })
+            val user = PromptBuilder.chatUser(
                 history = _messages.value.dropLast(2),
                 userPrompt = clean,
-                facts = memory.facts.value.map { it.text },
             )
             var acc = ""
-            bridge.generate(full).collect { delta ->
+            bridge.generateChat(system, user).collect { delta ->
                 acc += delta
                 _messages.update { list ->
                     list.map { if (it.id == draftId) it.copy(text = acc) else it }

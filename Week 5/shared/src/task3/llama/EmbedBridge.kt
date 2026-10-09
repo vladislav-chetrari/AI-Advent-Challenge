@@ -1,10 +1,9 @@
 package task3.llama
 
 /**
- * Тонкий порт к embedding-режиму llama.cpp (pooling MEAN).
- * Генеративная модель и эмбеддинг живут в разных бриджах и разных
- * нативных хэндлах: держать оба GGUF в RAM одновременно тяжело,
- * поэтому репозиторий выгружает один при долгой работе другого (см. RagRepository).
+ * Тонкий порт к embedding-рантайму. Android — LiteRT-LM EmbeddingEngine
+ * (бандл EmbeddingGemma), JVM-десктоп — Fake (хеш-вектора для превью).
+ * Тексты уже с префиксами, если они нужны модели (EmbeddingGemma — без).
  */
 interface EmbedBridge {
     val isReady: Boolean

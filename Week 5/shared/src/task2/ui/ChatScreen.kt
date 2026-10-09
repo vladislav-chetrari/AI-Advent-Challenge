@@ -48,7 +48,7 @@ fun ChatScreen(vm: ChatViewModel) {
     }
 
     // Писать можно только когда модель готова (или уже идёт генерация).
-    // Иначе очередь запросов упиралась бы в скачивание/загрузку GGUF.
+    // Иначе очередь запросов упиралась бы в скачивание/загрузку модели.
     val canChat = ui.status is EngineStatus.Ready || ui.status is EngineStatus.Generating
 
     Column(
@@ -77,7 +77,7 @@ fun ChatScreen(vm: ChatViewModel) {
         }
 
         Text(
-            "Offline • llama.cpp • ${ui.model.id} • без облака",
+            "Offline • LiteRT • ${ui.model.id} • без облака",
             style = MaterialTheme.typography.labelSmall,
         )
 
@@ -87,7 +87,7 @@ fun ChatScreen(vm: ChatViewModel) {
                 LinearProgressIndicator(progress = { s.progress / 100f }, modifier = Modifier.fillMaxWidth())
             }
             EngineStatus.LoadingModel -> {
-                Text("Загружаю GGUF в llama.cpp…")
+                Text("Загружаю модель в LiteRT…")
                 LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
             }
             EngineStatus.Generating -> {

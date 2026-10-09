@@ -13,7 +13,7 @@ import task2.llama.createLlamaBridge
 
 /**
  * DI-контейнер задачи 3. Генеративный бридж общий с задачей 2
- * (тот же libllama.so), эмбеддинг-бридж — новый (тот же .so, другой хэндл).
+ * (тот же LiteRT Engine), эмбеддинг-бридж — EmbeddingEngine.
  */
 class Task3Container(
     val modelsDir: String,

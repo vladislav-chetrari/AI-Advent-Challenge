@@ -46,7 +46,7 @@ class ChatViewModel(
                 _ui.value = _ui.value.copy(messages = m, status = s)
             }
         }
-        // Прогрев: докачать дефолтную модель заранее (Qwen3-1.7B-Q4).
+        // Прогрев: докачать дефолтную модель заранее (Qwen2.5-1.5B-Q8).
         scope.launch {
             runCatching { repo.ensureModel(_ui.value.model, _ui.value.modelsDir) }
         }

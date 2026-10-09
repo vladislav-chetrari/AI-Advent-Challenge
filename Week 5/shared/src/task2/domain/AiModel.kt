@@ -1,8 +1,8 @@
 package task2.domain
 
 /**
- * Зашитый каталог GGUF-моделей (без произвольных URL — KISS).
- * Дефолт для задачи: qwen3-1.7b-q4.
+ * Зашитый каталог .litertlm-моделей под LiteRT-LM (без произвольных URL — KISS).
+ * Дефолт для задачи: qwen25-1.5b-q8.
  */
 data class AiModel(
     val id: String,

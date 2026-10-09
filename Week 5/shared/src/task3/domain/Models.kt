@@ -1,6 +1,6 @@
 package task3.domain
 
-/** Выбор LLM: одна локальная GGUF из каталога или облачный DeepSeek. */
+/** Выбор LLM: одна локальная .litertlm из каталога или облачный DeepSeek. */
 sealed interface LlmChoice {
     data class Local(val id: String) : LlmChoice
     data object DeepSeek : LlmChoice

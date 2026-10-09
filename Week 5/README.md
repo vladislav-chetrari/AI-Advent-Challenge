@@ -1,10 +1,12 @@
-# Week 5 Task 2 — on-device LLM (llama.cpp + Qwen3-1.7B-Q4)
+# Week 5 — on-device LLM + RAG (LiteRT-LM)
 
 День 27: приложение отправляет запросы во **встроенную** LLM, получает и отображает ответы, работает **без облака**.
 
 Стек: **Compose Multiplatform (Kotlin) + Kotlin Toolchain 0.12.0 (Amper)**,
-Clean Architecture + MVVM + SSOT + SOLID/KISS. Движок — **llama.cpp через JNI**
-(`libllama.so` в `androidApp/jniLibs/`), модель — **Qwen3-1.7B-Instruct-Q4_K_M (~1.3 ГБ)**.
+Clean Architecture + MVVM + SSOT + SOLID/KISS. Рантайм — **LiteRT-LM
+(Google AI Edge, Maven: `litertlm-android` / `litertlm-jvm`)**, генерация —
+**Qwen2.5-1.5B-Instruct-Q8 (~1.5 ГБ)**, эмбеддинги для RAG —
+**EmbeddingGemma-270M (~165 МБ)**. Облачный путь — **DeepSeek через Koog**.
 
 ## Структура (корень проекта — `Week 5/`)
 
@@ -12,16 +14,16 @@ Clean Architecture + MVVM + SSOT + SOLID/KISS. Движок — **llama.cpp че
 project.yaml            # shared, androidApp, desktopApp
 shared/                 # общий код: domain / data / llama / presentation / ui
   src/                  # common: ChatRepository(SSOT), PromptBuilder, ModelCatalog, VM, ChatScreen
-  src@android/          # actual: JniLlamaBridge (libllama.so), Downloader на HttpURLConnection
-  src@jvm/              # actual: FakeLlamaBridge (десктоп-превью без натива)
-androidApp/             # product android/app, MainActivity, jniLibs/arm64-v8a/libllama.so
-  cpp/bridge.cpp        # JNI-мост (V1 stub + TODO под настоящий llama.cpp)
-desktopApp/             # product jvm/app, превью того же UI на десктопе
-tools/build-llama.sh    # сборка libllama.so через NDK 21.4 + CMake 3.22.1
+  src@android/          # actual: LiteRT-LM Engine/EmbeddingEngine, Downloader на HttpURLConnection
+  src@jvm/              # actual: LiteRT-LM (генерация), Fake-эмбеддинги (десктоп-превью RAG)
+androidApp/             # product android/app, MainActivity
+desktopApp/             # product jvm/app, превью на десктопе (настоящая генерация!)
 ```
-
-Каталог моделей зашит (`ModelCatalog`): дефолт `qwen3-1.7b-q4`, запасные
-`qwen3-0.6b-q4`, `smollm3-3b-q4`. Произвольных URL нет осознанно (KISS + OOM на телефоне).
+Каталог моделей зашит (`ModelCatalog`): дефолт `qwen25-1.5b-q8`, лёгкая
+`qwen3-0.6b-int4`. Эмбеддинги — `embedgemma-270m`. Всё тянется
+из `litert-community` на HuggingFace при первом запуске
+в `filesDir/models/` (или `./models/` на десктопе), дальше всё офлайн.
+`INTERNET` нужен только на докачку.
 
 ## Запуск
 
@@ -32,26 +34,20 @@ cd "Week 5"
 ./kotlin run -m androidApp   # установка на девайс/эмулятор
 ```
 
-Модель докачивается при первом запуске в `filesDir/models/` (~1.3 ГБ дефолт, прогресс в %),
+Модель докачивается при первом запуске в `filesDir/models/` (дефолт ~1.5 ГБ + эмбеддинги ~165 МБ, прогресс в %),
 дальше всё офлайн. `INTERNET` нужен только на докачку.
 
-## Нативная сборка llama.cpp
+## Нативный рантайм
 
-```sh
-git submodule add https://github.com/ggerganov/llama.cpp.git androidApp/cpp/llama.cpp
-sh tools/build-llama.sh arm64-v8a   # -> androidApp/jniLibs/arm64-v8a/libllama.so
-```
-
-Без `.so` приложение собирается и показывает понятную ошибку
-«libllama.so не найден…», а не падает. С заглушкой `bridge.cpp`
-`nativeInit` возвращает 0 — тоже честная ошибка «не открылось».
+Ничего собирать не надо: LiteRT-LM едет Maven-зависимостями
+(`litertlm-android` / `litertlm-jvm`), нативные библиотеки внутри AAR/jar.
 
 ## Проверка для видео
 
 1. Включить airplane-mode.
-2. Открыть приложение, выбрать `Qwen3 1.7B Q4`.
+2. Открыть приложение, выбрать `Qwen2.5 1.5B Q8`.
 3. Три запроса как в Task 1: простой / средний / сложный.
-4. Показать бейдж `Offline • llama.cpp • qwen3-1.7b-q4`.
+4. Показать бейдж `Offline • LiteRT • qwen25-1.5b-q8`.
 
 ## Архитектура
 

@@ -102,7 +102,7 @@ class RagRepository(
 
     val embedModel: EmbedModel? get() = EmbedCatalog.resolve(_embedId.value)
 
-    /** OOM и отмену пробрасываем, всё остальное (включая LinkageError из JNI) — в ошибку. */
+    /** OOM и отмену пробрасываем, всё остальное — в ошибку. */
     private fun rethrowIfFatal(e: Throwable) {
         if (e is OutOfMemoryError || e is kotlinx.coroutines.CancellationException) throw e
     }
@@ -180,7 +180,13 @@ class RagRepository(
                     _llmStatus.value = EngineStatus.Downloading(total?.let { ((done * 100) / it).toInt().coerceIn(0, 100) } ?: 0)
                 }
             }
-            // DEBUG: валидация GGUF отключена, копаем дальше.
+            // Проверка размера: оборванный .litertlm рантайм всё равно
+            // не откроет — лучше сказать сразу и убрать мусор.
+            validateModelFile(llmFile(model), model.sizeMb)?.let { problem ->
+                runCatching { deleteFile(llmFile(model)) }
+                if (isSelected()) _llmStatus.value = EngineStatus.Error(problem)
+                return
+            }
         } catch (e: Exception) {
             if (isSelected()) _llmStatus.value = EngineStatus.Error("Не скачалась модель: ${e.message}")
             return
@@ -211,7 +217,8 @@ class RagRepository(
             _llmStatus.value = EngineStatus.Error("Модель не скачана — скачай её в Настройках")
             return
         }
-        // DEBUG: валидация GGUF отключена.
+        // Размер уже проверен при скачивании; битый файл уронит load ниже
+        // с понятной ошибкой рантайма.
         if (loadedGenPath != dest || !genBridge.isReady) {
             _llmStatus.value = EngineStatus.LoadingModel
             try {
@@ -219,7 +226,7 @@ class RagRepository(
                 loadedGenPath = dest
             } catch (e: Throwable) {
                 rethrowIfFatal(e)
-                _llmStatus.value = EngineStatus.Error("Не загрузилась в llama.cpp: ${e.message}")
+                _llmStatus.value = EngineStatus.Error("Не загрузилась в LiteRT: ${e.message}")
                 return
             }
         }
@@ -264,7 +271,13 @@ class RagRepository(
                     _embedStatus.value = EmbedState.Downloading(total?.let { ((done * 100) / it).toInt().coerceIn(0, 100) } ?: 0)
                 }
             }
-            // DEBUG: валидация GGUF отключена, копаем дальше.
+            // Проверка размера: оборванный бандл рантайм всё равно
+            // не откроет — лучше сказать сразу и убрать мусор.
+            validateModelFile(embedFile(model), model.sizeMb)?.let { problem ->
+                runCatching { deleteFile(embedFile(model)) }
+                if (isSelected()) _embedStatus.value = EmbedState.Error(problem)
+                return
+            }
         } catch (e: Exception) {
             if (isSelected()) _embedStatus.value = EmbedState.Error("Не скачалась: ${e.message}")
             return
@@ -297,18 +310,15 @@ class RagRepository(
             _embedStatus.value = EmbedState.Error("Модель не скачана — скачай её в Настройках")
             return
         }
-        // DEBUG: валидация GGUF отключена.
+        // Размер уже проверен при скачивании; битый файл уронит load ниже
+        // с понятной ошибкой рантайма.
         if (loadedEmbPath != dest || !embBridge.isReady) {
             _embedStatus.value = EmbedState.Loading
             try {
                 embBridge.load(dest, platformCpuThreads())
                 loadedEmbPath = dest
-                if (embBridge.dim != model.dim) {
-                    _embedStatus.value = EmbedState.Error(
-                        "dim модели ${embBridge.dim} != ${model.dim} из каталога — поиск может врать",
-                    )
-                    return
-                }
+                // dim каталога — для подписи в UI; истина — embBridge.dim
+                // (чанк хранит свой dim, поиск фильтрует по факту).
             } catch (e: Throwable) {
                 rethrowIfFatal(e)
                 _embedStatus.value = EmbedState.Error("Не загрузилась: ${e.message}")
@@ -542,10 +552,16 @@ class RagRepository(
         if (_llmStatus.value !is EngineStatus.Ready && _llmStatus.value !is EngineStatus.Generating) {
             throw IllegalStateException("локальная модель не готова")
         }
-        val full = PromptBuilder.buildRag(history, query, contextBlock(context))
+        // Маленькой модели (KV 1280–4096) полный контекст не влезет —
+        // режем жёстче, чем для облака. Шаблон применяет сам LiteRT.
+        val system = PromptBuilder.ragSystem(context.size.coerceAtLeast(1))
+        val user = PromptBuilder.chatUser(
+            history = history.takeLast(6),
+            userPrompt = "Контекст:\n${contextBlock(context, perHit = 600)}\n\nВопрос: $query",
+        )
         var acc = ""
         _llmStatus.value = EngineStatus.Generating
-        genBridge.generate(full).collect { delta -> acc += delta }
+        genBridge.generateChat(system, user).collect { delta -> acc += delta }
         val text = PromptBuilder.cleanReply(acc).ifEmpty { acc.trim() }.ifEmpty { "(пустой ответ)" }
         return text + refsBlock(context)
     }
@@ -573,11 +589,11 @@ class RagRepository(
         }
     }
 
-    private fun contextBlock(context: List<ScoredChunk>): String =
+    private fun contextBlock(context: List<ScoredChunk>, perHit: Int = 1200): String =
         context.mapIndexed { i, h ->
             "[${i + 1}] ${h.title}" +
                 (if (h.section.isNotBlank()) " / ${h.section}" else "") +
-                ":\n${h.text.take(1200)}"
+                ":\n${h.text.take(perHit)}"
         }.joinToString("\n\n")
 
     private fun refsBlock(context: List<ScoredChunk>): String {

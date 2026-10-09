@@ -44,7 +44,7 @@ class RagStaleNativeTest {
             throw UnsatisfiedLinkError("fake missing symbol nativeInit")
         }
 
-        override fun generate(prompt: String): Flow<String> = flowOf()
+        override fun generateChat(system: String, user: String): Flow<String> = flowOf()
         override fun cancel() {}
         override fun close() {}
     }
@@ -67,11 +67,11 @@ class RagStaleNativeTest {
         try {
             val r = repo(modelsDir, db)
             r.init()
-            File("$modelsDir/embed/nomic-embed-text-v1.5.Q8_0.gguf").apply {
+            File("$modelsDir/embed/embeddinggemma-2-text-270m.litertlm").apply {
                 parentFile.mkdirs()
                 writeText("fake")
             }
-            r.selectEmbed("nomic-v15-q8")
+            r.selectEmbed("embedgemma-270m")
             // Не должно кидать — статус уходит в Error с подсказкой про пересборку.
             r.ensureEmbedLoaded()
             val st = r.embedStatus.value
@@ -91,11 +91,11 @@ class RagStaleNativeTest {
         try {
             val r = repo(modelsDir, db)
             r.init()
-            File("$modelsDir/llm/Qwen_Qwen3-1.7B-Q4_K_M.gguf").apply {
+            File("$modelsDir/llm/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm").apply {
                 parentFile.mkdirs()
                 writeText("fake")
             }
-            r.selectLlm(LlmChoice.Local("qwen3-1.7b-q4"))
+            r.selectLlm(LlmChoice.Local("qwen25-1.5b-q8"))
             // Не должно кидать — ошибка окажется текстом в чате и статусом.
             r.send("привет")
             val st = r.llmStatus.value

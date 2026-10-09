@@ -36,7 +36,7 @@ class DeleteDeselectTest {
         try {
             val r = repo(modelsDir, db)
             r.init()
-            val m = ModelCatalog.QWEN3_06B_Q4
+            val m = ModelCatalog.QWEN3_06B_INT4
             File("$modelsDir/llm/${m.fileName}").apply { parentFile.mkdirs(); writeText("fake") }
             r.selectLlm(LlmChoice.Local(m.id))
             r.deleteLlm(m)
@@ -56,7 +56,7 @@ class DeleteDeselectTest {
         try {
             val r = repo(modelsDir, db)
             r.init()
-            val m = EmbedCatalog.MINILM_L6_Q8
+            val m = EmbedCatalog.EMBEDGEMMA_270M
             File("$modelsDir/embed/${m.fileName}").apply { parentFile.mkdirs(); writeText("fake") }
             r.selectEmbed(m.id)
             r.deleteEmbed(m)

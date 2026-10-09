@@ -1,4 +1,4 @@
-# Week 5 Task 2 — embedded LLM (llama.cpp + Qwen2.5-0.5B-Q4)
+# Week 5 — on-device AI (LiteRT-LM + Qwen2.5-1.5B + EmbeddingGemma)
 build/
 *.class
 *.jar
@@ -8,13 +8,13 @@ build/
 .DS_Store
 .idea/
 out/
-# GGUF-модели качаются при первом запуске, в git не коммитим
+# Модели качаются при первом запуске, в git не коммитим
 *.gguf
+*.litertlm
+*.tflite
 # Локальный релизный кейстор
 release.keystore
 keystore.properties
-# Исходники llama.cpp (3700+ файлов, клонируются скриптом tools/build-llama.sh)
-androidApp/cpp/llama.cpp/
 # Логи сборок и adb-дампы
 *.log
 ui*.xml
