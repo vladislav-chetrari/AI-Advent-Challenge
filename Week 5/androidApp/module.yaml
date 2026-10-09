@@ -2,7 +2,7 @@ product: android/app
 
 dependencies:
   - ../shared
-  - androidx.activity:activity-compose:1.8.2
+  - $libs.activity.compose
 
 settings:
   compose: enabled
