@@ -5,6 +5,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.Json
+import task2.data.httpGet
+import task2.data.urlEncode
 
 /**
  * Загрузка статей Википедии (порт core.rag.WikiLoader из Недели 4).

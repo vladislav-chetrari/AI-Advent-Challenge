@@ -22,6 +22,7 @@ dependencies:
   - $libs.koog.http.ktor
   - $libs.ktor.client.core
   - $libs.ktor.client.cio
+  - $libs.okio
   # Room KMP: рантайм и драйвер видны потребителям (билдер БД создают
   # платформенные entry-point'ы: MainActivity / desktop main).
   - $libs.room.runtime: exported
