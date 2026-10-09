@@ -1,27 +1,11 @@
 package task3.data
 
-import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
-
-@Serializable
-private data class WireMessage(val role: String, val content: String)
-
-@Serializable
-private data class ChatRequest(
-    val model: String,
-    val messages: List<WireMessage>,
-    val temperature: Double = 0.3,
-    val stream: Boolean = false,
-)
-
-@Serializable
-private data class ChatChoiceMessage(val content: String? = null)
-
-@Serializable
-private data class ChatChoice(val message: ChatChoiceMessage? = null)
-
-@Serializable
-private data class ChatResponse(val choices: List<ChatChoice> = emptyList())
+import ai.koog.prompt.dsl.prompt
+import ai.koog.prompt.executor.clients.LLMClient
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekParams
+import ai.koog.prompt.llm.LLMCapability
+import ai.koog.prompt.llm.LLMProvider
+import ai.koog.prompt.llm.LLModel
 
 sealed interface DeepSeekResult {
     data class Ok(val text: String) : DeepSeekResult
@@ -29,11 +13,55 @@ sealed interface DeepSeekResult {
     data class NetworkError(val detail: String) : DeepSeekResult
 }
 
-/** DeepSeek через OpenAI-совместимый endpoint (транспорт — HttpURLConnection, без Ktor). */
+/**
+ * DeepSeek через Koog (ai.koog:prompt-executor-deepseek-client).
+ * Промпт собирается Koog DSL, параметры (temperature) едут внутри Prompt,
+ * транспорт/сериализация/таймауты — на Koog (раньше был голый
+ * HttpURLConnection + ручной JSON).
+ *
+ * Создание клиента — платформенное: дефолтный KoogHttpClient доступен
+ * только в jvmCommon, поэтому см. expect/actual createDeepSeekExecutor.
+ * Контракт для RagRepository не менялся.
+ */
 object DeepSeekClient {
     const val MODEL = "deepseek-chat"
-    private const val BASE_URL = "https://api.deepseek.com"
-    private val json = Json { ignoreUnknownKeys = true }
+
+    /**
+     * deepseek-chat нет в предустановленных DeepSeekModels beta-клиента
+     * (там только V4-флагманы), поэтому описываем его сами. Capabilities —
+     * как у V4Flash: temperature/tools нужны исполнителю для валидации.
+     */
+    private val deepSeekChat = LLModel(
+        provider = LLMProvider.DeepSeek,
+        id = MODEL,
+        capabilities = listOf(
+            LLMCapability.Completion,
+            LLMCapability.Temperature,
+            LLMCapability.Tools,
+            LLMCapability.ToolChoice,
+            LLMCapability.Schema.JSON.Basic,
+            LLMCapability.Schema.JSON.Standard,
+            LLMCapability.MultipleChoices,
+            LLMCapability.Thinking,
+        ),
+    )
+
+    // Один клиент на ключ на всё время жизни приложения (создание Ktor-клиента
+    // под каждый запрос — лишние потоки/сокеты).
+    @Volatile
+    private var cachedKey: String? = null
+
+    @Volatile
+    private var cached: LLMClient? = null
+
+    private fun executor(apiKey: String): LLMClient {
+        val c = cached
+        if (c != null && cachedKey == apiKey) return c
+        return createDeepSeekExecutor(apiKey).also {
+            cached = it
+            cachedKey = apiKey
+        }
+    }
 
     suspend fun complete(
         system: String,
@@ -42,29 +70,26 @@ object DeepSeekClient {
         apiKey: String?,
     ): DeepSeekResult {
         if (apiKey.isNullOrBlank()) return DeepSeekResult.NetworkError("Нет API-ключа DeepSeek")
-        val messages = mutableListOf(WireMessage("system", system))
-        history.takeLast(12).forEach { (role, content) -> messages += WireMessage(role, content) }
-        messages += WireMessage("user", user)
-        val body = json.encodeToString(
-            ChatRequest.serializer(),
-            ChatRequest(model = MODEL, messages = messages),
-        )
-        val res = try {
-            httpPostJson(
-                "$BASE_URL/chat/completions",
-                body,
-                mapOf("Authorization" to "Bearer $apiKey", "Content-Type" to "application/json"),
-            )
-        } catch (e: Exception) {
-            return DeepSeekResult.NetworkError(e.message ?: e.javaClass.simpleName)
-        }
-        if (res.code !in 200..299) return DeepSeekResult.HttpError(res.code, res.body.take(300))
         return try {
-            val parsed = json.decodeFromString(ChatResponse.serializer(), res.body)
-            val text = parsed.choices.firstOrNull()?.message?.content?.trim().orEmpty()
-            if (text.isEmpty()) DeepSeekResult.NetworkError("Пустой ответ модели") else DeepSeekResult.Ok(text)
+            val response = executor(apiKey).execute(
+                prompt("rag-answer", DeepSeekParams(temperature = 0.3)) {
+                    system(system)
+                    history.takeLast(12).forEach { (role, content) ->
+                        if (role == "assistant") assistant(content) else user(content)
+                    }
+                    user(user)
+                },
+                deepSeekChat,
+                emptyList(),
+            )
+            val text = response.textContent().trim()
+            if (text.isEmpty()) DeepSeekResult.NetworkError("Пустой ответ модели")
+            else DeepSeekResult.Ok(text)
         } catch (e: Exception) {
-            DeepSeekResult.NetworkError("Не разобрал ответ: ${e.message}")
+            DeepSeekResult.NetworkError(e.message?.takeIf { it.isNotBlank() } ?: "запрос не удался")
         }
     }
 }
+
+/** Платформенное создание Koog-исполнителя (default HttpClient — только jvmCommon). */
+expect fun createDeepSeekExecutor(apiKey: String): LLMClient
