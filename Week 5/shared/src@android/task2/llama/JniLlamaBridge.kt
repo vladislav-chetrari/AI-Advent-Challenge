@@ -37,8 +37,8 @@ class JniLlamaBridge : LlamaBridge {
     override suspend fun load(modelPath: String, nCtx: Int, nThreads: Int) =
         withContext(Dispatchers.IO) {
             libMissing?.let { throw IllegalStateException(it) }
-            if (handle != 0L) nativeFree(handle)
-            handle = nativeInit(modelPath, nCtx, nThreads)
+            if (handle != 0L) runCatching { nativeFree(handle) }
+            handle = wrapNative { nativeInit(modelPath, nCtx, nThreads) }
             if (handle == 0L) throw IllegalStateException("llama.cpp не смог открыть $modelPath (OOM или битый GGUF)")
             ready = true
         }
@@ -47,7 +47,7 @@ class JniLlamaBridge : LlamaBridge {
         if (!isReady) throw IllegalStateException("Модель не загружена")
         // V1: натив возвращает полный текст, стриммим в UI пословно.
         // V2: заменить на token-callback из common/sampling.
-        val full = nativeGenerate(handle, prompt)
+        val full = wrapNative { nativeGenerate(handle, prompt) }
         val words = full.split(" ")
         for (w in words) {
             ensureActive()
@@ -65,6 +65,21 @@ class JniLlamaBridge : LlamaBridge {
             handle = 0L
             ready = false
         }
+    }
+
+    /**
+     * Пропавший символ = .so собран из старого bridge.cpp.
+     * UnsatisfiedLinkError — это Error и сквозь catch(Exception) ронял бы
+     * приложение, поэтому транслируем в понятное исключение на границе JNI.
+     */
+    private inline fun <T> wrapNative(block: () -> T): T = try {
+        block()
+    } catch (e: UnsatisfiedLinkError) {
+        throw IllegalStateException(
+            "нативный мост устарел (нет символа ${e.message}): " +
+                "пересобери libtask2bridge через tools/build-llama.sh",
+            e,
+        )
     }
 
     private suspend fun ensureActive() {

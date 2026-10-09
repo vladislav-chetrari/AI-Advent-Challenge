@@ -26,7 +26,7 @@ set(BUILD_SHARED_LIBS    ON  CACHE BOOL "" FORCE)
 add_subdirectory(${LLAMA_SRC} llama.cpp)
 
 add_library(bridge SHARED bridge.cpp)
-target_link_libraries(bridge PRIVATE llama)
+target_link_libraries(bridge PRIVATE llama log)
 target_include_directories(bridge PRIVATE ${LLAMA_SRC}/include)
 # Имя отличается от libllama.so самой llama.cpp (та линкуется shared отдельно).
 set_target_properties(bridge PROPERTIES OUTPUT_NAME task2bridge)

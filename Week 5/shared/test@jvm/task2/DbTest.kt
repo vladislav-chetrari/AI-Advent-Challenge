@@ -84,26 +84,32 @@ class DbTest {
     @Test
     fun migrate1to2KeepsDataAndDefaultsSource() = runBlocking {
         val path = tmpDb().absolutePath
-        Room.databaseBuilder<ChatDatabaseV1>(name = path)
+        val v1 = Room.databaseBuilder<ChatDatabaseV1>(name = path)
             .setDriver(BundledSQLiteDriver())
-            .build().use { v1 ->
-                v1.dao().insertMessages(
-                    listOf(MessageV1(role = "USER", text = "hi", createdAt = 1)),
-                )
-                v1.dao().insertFacts(
-                    listOf(FactV1(text = "Имя — Влад", createdAt = 2)),
-                )
-            }
-        Room.databaseBuilder<ChatDatabase>(name = path)
+            .build()
+        try {
+            v1.dao().insertMessages(
+                listOf(MessageV1(role = "USER", text = "hi", createdAt = 1)),
+            )
+            v1.dao().insertFacts(
+                listOf(FactV1(text = "Имя — Влад", createdAt = 2)),
+            )
+        } finally {
+            v1.close()
+        }
+        val v2 = Room.databaseBuilder<ChatDatabase>(name = path)
             .setDriver(BundledSQLiteDriver())
             .addMigrations(MIGRATION_1_2)
-            .build().use { v2 ->
-                val dao = v2.chatDao()
-                assertEquals(listOf("hi"), dao.getMessages().map { it.text })
-                val facts = dao.getFacts()
-                assertEquals(1, facts.size)
-                assertEquals("Имя — Влад", facts[0].text)
-                assertEquals("rules", facts[0].source)
-            }
+            .build()
+        try {
+            val dao = v2.chatDao()
+            assertEquals(listOf("hi"), dao.getMessages().map { it.text })
+            val facts = dao.getFacts()
+            assertEquals(1, facts.size)
+            assertEquals("Имя — Влад", facts[0].text)
+            assertEquals("rules", facts[0].source)
+        } finally {
+            v2.close()
+        }
     }
 }

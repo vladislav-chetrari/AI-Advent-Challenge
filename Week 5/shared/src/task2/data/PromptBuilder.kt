@@ -77,4 +77,41 @@ object PromptBuilder {
             append("<|im_start|>user\n$userPrompt\n<|im_end|>\n<|im_start|>assistant\n$NO_THINK_SUFFIX")
         }
     }
+
+    /**
+     * RAG-вариант для задачи 3: тот же ChatML, но в system добавлен блок
+     * контекста из базы знаний. Без контекста — обычный build.
+     */
+    fun buildRag(
+        history: List<ChatMessage>,
+        userPrompt: String,
+        context: String,
+        maxMessages: Int = MAX_MESSAGES,
+    ): String {
+        if (context.isBlank()) return build(history, userPrompt, emptyList(), maxMessages)
+        val tail = history.takeLast(maxMessages)
+        val system = SYSTEM + "\nНиже — фрагменты из базы знаний [1..N]. " +
+            "Используй ТОЛЬКО их для ответа. После каждого факта ставь ссылку вида [1]. " +
+            "Если ответа нет во фрагментах — так и скажи."
+        return buildString {
+            append("<|im_start|>system\n$system<|im_end|>\n")
+            for (m in tail) {
+                val role = when (m.role) {
+                    ChatMessage.Role.USER -> "user"
+                    ChatMessage.Role.ASSISTANT -> "assistant"
+                    ChatMessage.Role.SYSTEM -> "system"
+                }
+                append("<|im_start|>$role\n${m.text}\n<|im_end|>\n")
+            }
+            append("<|im_start|>user\nКонтекст:\n$context\n\nВопрос: $userPrompt\n<|im_end|>\n")
+            append("<|im_start|>assistant\n$NO_THINK_SUFFIX")
+        }
+    }
+
+    /** System-промпт для облачной модели с RAG-контекстом. */
+    fun ragSystem(n: Int): String =
+        "Ты отвечаешь на вопросы по локальной базе знаний. " +
+            "Используй ТОЛЬКО приведённые фрагменты [1..$n]. " +
+            "После каждого факта ставь короткую ссылку вида [1]. " +
+            "Не выдумывай факты и цитаты. Если ответа нет во фрагментах — так и скажи."
 }

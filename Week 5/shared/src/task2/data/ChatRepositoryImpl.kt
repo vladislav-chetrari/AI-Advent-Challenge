@@ -53,7 +53,8 @@ class ChatRepositoryImpl(
         if (!platformFileExists(dest)) {
             _status.value = EngineStatus.Downloading(0)
             try {
-                downloadFile(model.downloadUrl, dest) { p ->
+                downloadFile(model.downloadUrl, dest) { done, total ->
+                    val p = total?.let { ((done * 100) / it).toInt().coerceIn(0, 100) } ?: 0
                     _status.value = EngineStatus.Downloading(p)
                 }
             } catch (e: CancellationException) { throw e } catch (e: Exception) {

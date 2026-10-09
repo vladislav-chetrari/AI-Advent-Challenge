@@ -5,6 +5,7 @@ product:
 dependencies:
   - $compose.foundation: exported
   - $compose.material3: exported
+  - org.jetbrains.compose.material:material-icons-core:1.7.3: exported
   - $compose.runtime: exported
   - org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2
   - org.jetbrains.kotlinx:kotlinx-serialization-json:1.11.0
