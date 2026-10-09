@@ -1,11 +1,15 @@
 package task3.data
 
+import ai.koog.http.client.ktor.KtorKoogHttpClient
 import ai.koog.prompt.dsl.prompt
 import ai.koog.prompt.executor.clients.LLMClient
+import ai.koog.prompt.executor.clients.deepseek.DeepSeekLLMClient
 import ai.koog.prompt.executor.clients.deepseek.DeepSeekParams
 import ai.koog.prompt.llm.LLMCapability
 import ai.koog.prompt.llm.LLMProvider
 import ai.koog.prompt.llm.LLModel
+import io.ktor.client.HttpClient
+import io.ktor.client.engine.cio.CIO
 
 sealed interface DeepSeekResult {
     data class Ok(val text: String) : DeepSeekResult
@@ -19,8 +23,9 @@ sealed interface DeepSeekResult {
  * транспорт/сериализация/таймауты — на Koog (раньше был голый
  * HttpURLConnection + ручной JSON).
  *
- * Создание клиента — платформенное: дефолтный KoogHttpClient доступен
- * только в jvmCommon, поэтому см. expect/actual createDeepSeekExecutor.
+ * Создание клиента — напрямую в common-коде с явной фабрикой
+ * (KtorKoogHttpClient.Factory + CIO): автообнаружение фабрики через
+ * ServiceLoader в APK не срабатывает, поэтому явно — детерминированно.
  * Контракт для RagRepository не менялся.
  */
 object DeepSeekClient {
@@ -57,7 +62,16 @@ object DeepSeekClient {
     private fun executor(apiKey: String): LLMClient {
         val c = cached
         if (c != null && cachedKey == apiKey) return c
-        return createDeepSeekExecutor(apiKey).also {
+        // Фабрику передаём явно: ServiceLoader-автопоиск в APK ненадёжен
+        // (META-INF/services режется упаковкой). Движок CIO — тоже явно,
+        // без автоопределения. withSse=false: стриминг не используем.
+        return DeepSeekLLMClient(
+            apiKey = apiKey,
+            httpClientFactory = KtorKoogHttpClient.Factory(
+                baseClient = HttpClient(CIO),
+                withSse = false,
+            ),
+        ).also {
             cached = it
             cachedKey = apiKey
         }
@@ -90,6 +104,3 @@ object DeepSeekClient {
         }
     }
 }
-
-/** Платформенное создание Koog-исполнителя (default HttpClient — только jvmCommon). */
-expect fun createDeepSeekExecutor(apiKey: String): LLMClient
