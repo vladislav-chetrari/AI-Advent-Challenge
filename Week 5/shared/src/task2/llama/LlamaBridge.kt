@@ -19,3 +19,27 @@ interface LlamaBridge {
 }
 
 expect fun createLlamaBridge(): LlamaBridge
+
+/**
+ * Минимальный ChatML-темплейт вместо встроенного в бандл.
+ * Штатный Qwen-шаблон падает на системном сообщении: делает
+ * '<|im_start|>system\n' + messages[0].content, а LiteRT отдаёт контент
+ * списком блоков (sequence), не строкой — MiniJinja роняет рендер
+ * ("tried to use + operator on unsupported types string and sequence").
+ * Здесь контент забираем явно: строка — как есть, список — склейкой
+ * текстовых блоков. Роли LiteRT ("system"/"user"/"assistant") уже ChatML.
+ */
+internal const val CHATML_TEMPLATE: String =
+    "{%- for message in messages -%}" +
+        "{{- '<|im_start|>' + message.role + '\n' -}}" +
+        "{%- if message.content is string -%}" +
+        "{{- message.content -}}" +
+        "{%- else -%}" +
+        "{%- for block in message.content -%}{{- block.text -}}{%- endfor -%}" +
+        "{%- endif -}}" +
+        "{{- '<|im_end|>\n' -}}" +
+        "{%- endfor -}}" +
+        "{%- if add_generation_prompt -%}" +
+        "{{- '<|im_start|>assistant\n' -}}" +
+        "{%- endif -}}"
+

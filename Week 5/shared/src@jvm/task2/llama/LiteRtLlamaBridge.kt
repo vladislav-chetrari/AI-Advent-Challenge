@@ -19,6 +19,8 @@ import kotlinx.coroutines.withContext
 /**
  * Десктоп-реализация поверх litertlm-jvm: тот же код, что на Android,
  * настоящий инференс (больше никакого Fake на JVM).
+ * Бэкенд: сначала GPU, при отказе — молча CPU (см. android-версию).
+ * Темплейт свой (CHATML_TEMPLATE, общая константа), а не из бандла.
  */
 class LiteRtLlamaBridge : LlamaBridge {
     private var engine: Engine? = null
@@ -31,20 +33,22 @@ class LiteRtLlamaBridge : LlamaBridge {
     override suspend fun load(modelPath: String, nCtx: Int, nThreads: Int) =
         withContext(Dispatchers.IO) {
             close()
-            val e = Engine(
-                EngineConfig(
-                    modelPath = modelPath,
-                    backend = Backend.CPU(threadCount = nThreads.takeIf { it > 0 }),
-                ),
-            )
-            try {
-                e.initialize()
-            } catch (t: Throwable) {
-                runCatching { e.close() }
-                throw IllegalStateException("LiteRT не смог открыть $modelPath: ${t.message}")
+            val gpuError = runCatching { open(modelPath, Backend.GPU()) }.exceptionOrNull()
+            if (gpuError != null) {
+                open(modelPath, Backend.CPU(threadCount = nThreads.takeIf { it > 0 }))
             }
-            engine = e
         }
+
+    private fun open(modelPath: String, backend: Backend) {
+        val e = Engine(EngineConfig(modelPath = modelPath, backend = backend))
+        try {
+            e.initialize()
+        } catch (t: Throwable) {
+            runCatching { e.close() }
+            throw IllegalStateException("LiteRT не смог открыть $modelPath: ${t.message}")
+        }
+        engine = e
+    }
 
     override fun generateChat(system: String, user: String): Flow<String> = flow {
         val e = engine?.takeIf { it.isInitialized() }
@@ -53,6 +57,7 @@ class LiteRtLlamaBridge : LlamaBridge {
             ConversationConfig(
                 systemInstruction = Contents.of(system),
                 samplerConfig = SamplerConfig(topK = 40, topP = 0.9, temperature = 0.5),
+                chatTemplate = CHATML_TEMPLATE,
             ),
         )
         active = conv
