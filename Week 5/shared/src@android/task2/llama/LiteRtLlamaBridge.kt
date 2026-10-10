@@ -20,8 +20,11 @@ import kotlinx.coroutines.withContext
  * Инференс через LiteRT-LM (Google AI Edge): Engine на .litertlm-модели,
  * свежий Conversation на каждый запрос (история уже вшита в user-текст),
  * дельты из sendMessageAsync стримятся в UI как есть.
- * Бэкенд: сначала GPU (на флагманах префилл быстрее в разы),
- * при отказе (эмулятор, старый девайс) — молча CPU.
+ * Бэкенд: сначала GPU (на флагманах префилл быстрее в разы). GPU-движок
+ * может проинициализироваться, но упасть только на первой генерации
+ * ("Can not find OpenCL library"), поэтому при загрузке делаем пробную
+ * микрогенерацию; не взлетела — пересоздаём движок на CPU, пока висит
+ * статус загрузки, а не посреди чата. CPU работает везде.
  * Темплейт свой (CHATML_TEMPLATE): встроенный в бандл падает на
  * системном сообщении, см. комментарий к константе.
  */
@@ -36,24 +39,50 @@ class LiteRtLlamaBridge : LlamaBridge {
     override suspend fun load(modelPath: String, nCtx: Int, nThreads: Int) =
         withContext(Dispatchers.IO) {
             close()
-            // GPU быстрее на разы, но есть не везде — пробуем первым,
-            // при отказе уходим на CPU (всегда работает).
-            val gpuError = runCatching { open(modelPath, Backend.GPU()) }.exceptionOrNull()
-            if (gpuError != null) {
-                open(modelPath, Backend.CPU(threadCount = nThreads.takeIf { it > 0 }))
+            // GPU быстрее на разы, но есть не везде — пробуем первым
+            // с проверкой полного пути (инициализация + микрогенерация).
+            // При отказе уходим на CPU (всегда работает).
+            val gpuOk = tryOpen(modelPath, Backend.GPU(), probe = true)
+            if (!gpuOk) {
+                tryOpen(
+                    modelPath,
+                    Backend.CPU(threadCount = nThreads.takeIf { it > 0 }),
+                    probe = false,
+                )
             }
         }
 
-    private fun open(modelPath: String, backend: Backend) {
+    /**
+     * Открыть движок; true — работает полностью. `probe=true` дополнительно
+     * гоняет микрогенерацию: GPU-инициализация бывает ленивой и умирает
+     * только на первом запросе — ловим это здесь, а не в чате.
+     * Исключение наружу — только если упал CPU-вариант.
+     */
+    private fun tryOpen(modelPath: String, backend: Backend, probe: Boolean): Boolean {
         val e = Engine(EngineConfig(modelPath = modelPath, backend = backend))
         try {
             // Грузится до ~10 секунд на больших моделях — статус LoadingModel уже висит.
             e.initialize()
+            if (probe) {
+                e.createConversation(
+                    ConversationConfig(
+                        samplerConfig = SamplerConfig(topK = 40, topP = 0.9, temperature = 0.5),
+                        maxOutputToken = 16,
+                        chatTemplate = CHATML_TEMPLATE,
+                    ),
+                ).use { conv ->
+                    conv.sendMessage(Message.user("hi"))
+                }
+            }
         } catch (t: Throwable) {
             runCatching { e.close() }
-            throw IllegalStateException("LiteRT не смог открыть $modelPath: ${t.message}")
+            if (backend is Backend.CPU) {
+                throw IllegalStateException("LiteRT не смог открыть $modelPath: ${t.message}")
+            }
+            return false
         }
         engine = e
+        return true
     }
 
     override fun generateChat(system: String, user: String): Flow<String> = flow {
