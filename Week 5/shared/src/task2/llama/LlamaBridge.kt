@@ -10,10 +10,22 @@ import kotlinx.coroutines.flow.Flow
  * Промпт идёт парой (system, user): шаблон чата применяет сам рантайм
  * (LiteRT-LM), ChatML-строки из прошлого (llama.cpp) больше не нужны.
  */
+/** Параметры сэмплирования для LiteRT-LM. Дефолт = бывший хардкод (Balanced). */
+data class GenParams(
+    val temperature: Float = 0.5f,
+    val topK: Int = 40,
+    val topP: Float = 0.9f,
+    val maxTokens: Int = 512,
+) {
+    companion object {
+        val DEFAULT = GenParams()
+    }
+}
+
 interface LlamaBridge {
     val isReady: Boolean
     suspend fun load(modelPath: String, nCtx: Int = 2048, nThreads: Int = 4)
-    fun generateChat(system: String, user: String): Flow<String>
+    fun generateChat(system: String, user: String, params: GenParams = GenParams.DEFAULT): Flow<String>
     fun cancel()
     fun close()
 }

@@ -17,6 +17,7 @@ import task3.data.EmbedState
 import task3.data.DownloadProgress
 import task3.data.RagRepository
 import task3.domain.DocInfo
+import task3.domain.GenPreset
 import task3.domain.LlmChoice
 
 enum class Tab { CHAT, DOCS, SETTINGS }
@@ -53,6 +54,11 @@ data class Task3UiState(
     // экран моделей
     val showLlmScreen: Boolean = false,
     val showEmbedScreen: Boolean = false,
+    // пресет генерации Task 4
+    val preset: GenPreset = GenPreset.DEFAULT,
+    // диагностика retrieval для видео: max cosine последнего запроса
+    val lastScore: Float? = null,
+    val showPresetDialog: Boolean = false,
 )
 
 sealed interface Task3Intent {
@@ -89,6 +95,10 @@ sealed interface Task3Intent {
     data class KeyInputChanged(val text: String) : Task3Intent
     data object KeySaved : Task3Intent
     data object KeyDeleted : Task3Intent
+    // пресет генерации
+    data object PresetDialogOpen : Task3Intent
+    data object PresetDialogDismissed : Task3Intent
+    data class PresetSelected(val preset: GenPreset) : Task3Intent
 }
 
 class Task3ViewModel(
@@ -107,6 +117,7 @@ class Task3ViewModel(
                 repo.messages, repo.llmStatus, repo.llmChoice,
                 repo.docs, repo.indexProgress, repo.embedId, repo.embedStatus,
                 repo.downloadedLlm, repo.downloadedEmbed, repo.downloading, repo.deepSeekKey,
+                repo.preset, repo.lastMaxScore,
             ) { args ->
                 @Suppress("UNCHECKED_CAST")
                 val messages = args[0] as List<ChatMessage>
@@ -120,9 +131,11 @@ class Task3ViewModel(
                 val dlEmbed = args[8] as Set<String>
                 val downloading = args[9] as Map<String, DownloadProgress>
                 val key = args[10] as String
+                val preset = args[11] as GenPreset
+                val lastScore = args[12] as Float?
                 collect(
                     messages, llmStatus, choice, docs, progress,
-                    embedId, embedStatus, dlLlm, dlEmbed, downloading, key,
+                    embedId, embedStatus, dlLlm, dlEmbed, downloading, key, preset, lastScore,
                 )
             }.collect { partial ->
                 val cur = _ui.value
@@ -143,6 +156,8 @@ class Task3ViewModel(
                     downloadedEmbed = partial.dlEmbed,
                     downloading = partial.downloading,
                     hasDeepSeekKey = partial.key.isNotBlank(),
+                    preset = partial.preset,
+                    lastScore = partial.lastScore,
                 )
             }
         }
@@ -165,6 +180,8 @@ class Task3ViewModel(
         val dlEmbed: Set<String>,
         val downloading: Map<String, DownloadProgress>,
         val key: String,
+        val preset: GenPreset,
+        val lastScore: Float?,
     )
 
     private fun collect(
@@ -179,6 +196,8 @@ class Task3ViewModel(
         dlEmbed: Set<String>,
         downloading: Map<String, DownloadProgress>,
         key: String,
+        preset: GenPreset,
+        lastScore: Float?,
     ): Partial {
         val (label, canChat, hint) = when (choice) {
             null -> Triple("Модель не выбрана", false, "Выбери модель в Настройках")
@@ -206,7 +225,7 @@ class Task3ViewModel(
         return Partial(
             messages, llmStatus, choice, label, canChat, hint,
             docs, progress, canAdd, docsHint, embedId, embedStatus,
-            dlLlm, dlEmbed, downloading, key,
+            dlLlm, dlEmbed, downloading, key, preset, lastScore,
         )
     }
 
@@ -290,6 +309,12 @@ class Task3ViewModel(
                 scope.launch { repo.saveDeepSeekKey(k) }
             }
             Task3Intent.KeyDeleted -> scope.launch { repo.saveDeepSeekKey("") }
+            Task3Intent.PresetDialogOpen -> _ui.value = _ui.value.copy(showPresetDialog = true)
+            Task3Intent.PresetDialogDismissed -> _ui.value = _ui.value.copy(showPresetDialog = false)
+            is Task3Intent.PresetSelected -> {
+                _ui.value = _ui.value.copy(showPresetDialog = false)
+                scope.launch { repo.selectPreset(intent.preset) }
+            }
         }
     }
 }

@@ -10,8 +10,12 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.Star
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -21,14 +25,17 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.RadioButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import task2.domain.ChatMessage
 import task2.domain.EngineStatus
+import task3.domain.GenPreset
 import task3.presentation.Task3Intent
 import task3.presentation.Task3UiState
 
@@ -45,12 +52,21 @@ fun ChatTab(ui: Task3UiState, send: (Task3Intent) -> Unit, modifier: Modifier = 
         verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Text(
-                ui.llmLabel,
-                style = MaterialTheme.typography.titleSmall,
-                modifier = Modifier.weight(1f).padding(top = 10.dp),
-                maxLines = 2,
-            )
+            Column(Modifier.weight(1f).padding(top = 6.dp)) {
+                Text(
+                    ui.llmLabel,
+                    style = MaterialTheme.typography.titleSmall,
+                    maxLines = 2,
+                )
+                Text(
+                    "Пресет: ${ui.preset.label}",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            IconButton(onClick = { send(Task3Intent.PresetDialogOpen) }) {
+                Icon(Icons.Filled.Star, contentDescription = "Пресет генерации: ${ui.preset.label}")
+            }
             IconButton(onClick = { send(Task3Intent.ClearRequested) }) {
                 Icon(Icons.Filled.Delete, contentDescription = "Очистить чат")
             }
@@ -125,6 +141,46 @@ fun ChatTab(ui: Task3UiState, send: (Task3Intent) -> Unit, modifier: Modifier = 
             },
             dismissButton = {
                 TextButton(onClick = { send(Task3Intent.ClearDismissed) }) { Text("Отмена") }
+            },
+        )
+    }
+
+    if (ui.showPresetDialog) {
+        AlertDialog(
+            onDismissRequest = { send(Task3Intent.PresetDialogDismissed) },
+            title = { Text("Пресет генерации") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    for (p in GenPreset.entries) {
+                        Row(
+                            Modifier.fillMaxWidth().clickable { send(Task3Intent.PresetSelected(p)) }
+                                .padding(vertical = 2.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        ) {
+                            RadioButton(
+                                selected = ui.preset == p,
+                                onClick = { send(Task3Intent.PresetSelected(p)) },
+                            )
+                            Column(Modifier.weight(1f)) {
+                                Text(p.label, style = MaterialTheme.typography.bodyMedium)
+                                Text(
+                                    p.description,
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                                Text(
+                                    "temp ${p.temperature} • topK ${p.topK} • topP ${p.topP}",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { send(Task3Intent.PresetDialogDismissed) }) { Text("Закрыть") }
             },
         )
     }

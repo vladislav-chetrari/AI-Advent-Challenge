@@ -44,6 +44,7 @@ data class DownloadProgress(val doneBytes: Long, val totalBytes: Long?) {
 private const val K_LLM = "llm"
 private const val K_EMBED = "embed"
 private const val K_DEEPSEEK = "deepseek_key"
+private const val K_PRESET = "gen_preset"
 
 /**
  * SSOT задачи 3: настройки моделей, документы, индекс, переписка.
@@ -66,6 +67,10 @@ class RagRepository(
 
     private val _deepSeekKey = MutableStateFlow("")
     val deepSeekKey: StateFlow<String> = _deepSeekKey.asStateFlow()
+
+    // --- пресет генерации Task 4 (дефолт — Balanced) ---
+    private val _preset = MutableStateFlow(task3.domain.GenPreset.DEFAULT)
+    val preset: StateFlow<task3.domain.GenPreset> = _preset.asStateFlow()
 
     // --- статусы ---
     private val _llmStatus = MutableStateFlow<EngineStatus>(EngineStatus.Idle)
@@ -114,6 +119,7 @@ class RagRepository(
         _llmChoice.value = LlmChoice.fromStored(dao.getSetting(K_LLM))
         _embedId.value = dao.getSetting(K_EMBED)?.ifBlank { null }
         _deepSeekKey.value = dao.getSetting(K_DEEPSEEK).orEmpty()
+        _preset.value = task3.domain.GenPreset.fromId(dao.getSetting(K_PRESET))
         refreshDownloaded()
         runCatching {
             _messages.value = dao.getMessages().map { ChatMessage(idSeq++, mapRole(it.role), it.text) }
@@ -335,6 +341,13 @@ class RagRepository(
         _deepSeekKey.value = key.trim()
     }
 
+    // --- пресет генерации ---
+
+    suspend fun selectPreset(preset: task3.domain.GenPreset) {
+        dao.setSetting(SettingEntity(K_PRESET, preset.id))
+        _preset.value = preset
+    }
+
     // --- документы ---
 
     suspend fun refreshDocs() {
@@ -485,7 +498,9 @@ class RagRepository(
         _llmStatus.value = EngineStatus.Generating
         try {
             val history = _messages.value.dropLast(2)
-            val context = retrieve(clean)
+            // Фаза 2: small-talk — свободный ответ без retrieval
+            // (не дёргаем EmbeddingGemma, не подсовываем мусорный контекст).
+            val context = if (QueryRouter.isSmallTalk(clean)) emptyList() else retrieve(clean)
             val answer = when (choice) {
                 is LlmChoice.DeepSeek -> answerCloud(history, clean, context)
                 is LlmChoice.Local -> answerLocal(ModelCatalog.resolve(choice.id), history, clean, context)
@@ -521,6 +536,20 @@ class RagRepository(
         runCatching { dao.clearMessages() }
     }
 
+    /**
+     * Фаза 1: score-gating. Без порога out-of-domain запрос ("дрозды" при базе
+     * про ворон) получал 5 мусорных чанков и вынужденный фолбэк.
+     * Старт 0.55 — подобрать на 3-5 запросах для видео Task 4.
+     * _lastMaxScore — диагностика для видео/демо (видно, что пресет влияет,
+     * а дрозды просто вне базы).
+     */
+    companion object {
+        const val MIN_SCORE: Float = 0.55f
+    }
+
+    private val _lastMaxScore = MutableStateFlow<Float?>(null)
+    val lastMaxScore: StateFlow<Float?> = _lastMaxScore.asStateFlow()
+
     private suspend fun retrieve(query: String, topK: Int = 5): List<ScoredChunk> {
         val emb = embedModel ?: return emptyList()
         if (_embedStatus.value !is EmbedState.Ready) {
@@ -536,9 +565,34 @@ class RagRepository(
             all.mapIndexed { i, e -> i to e.embedding.toFloatArray() },
             topK,
         )
-        return scored.map { (i, s) ->
+        _lastMaxScore.value = scored.maxOfOrNull { it.second }
+        // Гейт 1: косинус ниже порога — нерелевантно, отдаём пусто.
+        val above = scored.filter { it.second >= MIN_SCORE }
+        if (above.isEmpty()) return emptyList()
+        val hits = above.map { (i, s) ->
             val e = all[i]
             ScoredChunk(e.title, e.section, e.source, e.text, s)
+        }
+        // Гейт 2 (hybrid-lite без новой модели): ни один корень запроса
+        // не встретился в текстах топ-хитов — тоже мимо (ворон vs дрозд).
+        if (!hasTokenOverlap(query, hits)) return emptyList()
+        return hits
+    }
+
+    /**
+     * Дешёвая keyword-проверка поверх dense: стемы запроса длиной 5+
+     * против нижних текстов хитов. Пересечений нет — запрос не про базу.
+     */
+    private fun hasTokenOverlap(query: String, hits: List<ScoredChunk>): Boolean {
+        val stems = query.lowercase()
+            .split(Regex("[^а-яa-zё]+"))
+            .filter { it.length >= 4 }
+            .map { it.take(5) }
+            .toSet()
+        if (stems.isEmpty()) return true
+        return hits.any { h ->
+            val text = h.text.lowercase()
+            stems.any { s -> s in text }
         }
     }
 
@@ -554,14 +608,31 @@ class RagRepository(
         }
         // Маленькой модели (KV 1280–4096) полный контекст не влезет —
         // режем жёстче, чем для облака. Шаблон применяет сам LiteRT.
-        val system = PromptBuilder.ragSystem(context.size.coerceAtLeast(1))
-        val user = PromptBuilder.chatUser(
-            history = history.takeLast(6),
-            userPrompt = "Контекст:\n${contextBlock(context, perHit = 600)}\n\nВопрос: $query",
-        )
+        // Пустой контекст (нет документов / small-talk) — свободный ответ
+        // без RAG-ограничений, иначе "привет" упирался в "в документах нет".
+        val preset = _preset.value
+        val system: String
+        val user: String
+        if (context.isEmpty()) {
+            // Фаза 4: пусто, но документы есть (= out-of-domain, а не small-talk) —
+            // подсказываем модели темы базы, чтобы фолбэк предлагал, а не сухо отказывал.
+            val topics = _docs.value.take(5).map { it.title }.filter { it.isNotBlank() }
+            val hint = if (topics.isEmpty()) "" else
+                " В локальной базе есть документы: ${topics.joinToString("; ")}. " +
+                "Если вопрос не по ним — ответь свободно по общим знаниям, " +
+                "а в конце одним предложением предложи спросить про документы из списка."
+            system = PromptBuilder.chatSystem() + " " + preset.styleHint + hint
+            user = PromptBuilder.chatUser(history = history.takeLast(6), userPrompt = query)
+        } else {
+            system = PromptBuilder.ragSystem(context.size) + " " + preset.styleHint
+            user = PromptBuilder.chatUser(
+                history = history.takeLast(6),
+                userPrompt = "Контекст:\n${contextBlock(context, perHit = 600)}\n\nВопрос: $query",
+            )
+        }
         var acc = ""
         _llmStatus.value = EngineStatus.Generating
-        genBridge.generateChat(system, user).collect { delta -> acc += delta }
+        genBridge.generateChat(system, user, preset.toGenParams()).collect { delta -> acc += delta }
         val text = PromptBuilder.cleanReply(acc).ifEmpty { acc.trim() }.ifEmpty { "(пустой ответ)" }
         return text + refsBlock(context)
     }

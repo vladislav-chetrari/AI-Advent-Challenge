@@ -69,13 +69,14 @@ class LiteRtLlamaBridge : LlamaBridge {
         return true
     }
 
-    override fun generateChat(system: String, user: String): Flow<String> = flow {
+    override fun generateChat(system: String, user: String, params: GenParams): Flow<String> = flow {
         val e = engine?.takeIf { it.isInitialized() }
             ?: throw IllegalStateException("Модель не загружена")
         val conv = e.createConversation(
             ConversationConfig(
                 systemInstruction = Contents.of(system),
-                samplerConfig = SamplerConfig(topK = 40, topP = 0.9, temperature = 0.5),
+                samplerConfig = SamplerConfig(topK = params.topK, topP = params.topP.toDouble(), temperature = params.temperature.toDouble()),
+                maxOutputToken = params.maxTokens,
                 chatTemplate = CHATML_TEMPLATE,
             ),
         )

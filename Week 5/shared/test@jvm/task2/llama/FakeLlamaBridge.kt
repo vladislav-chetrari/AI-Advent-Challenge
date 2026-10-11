@@ -16,7 +16,7 @@ class FakeLlamaBridge : LlamaBridge {
         this.modelPath = modelPath
     }
 
-    override fun generateChat(system: String, user: String): Flow<String> = flow {
+    override fun generateChat(system: String, user: String, params: GenParams): Flow<String> = flow {
         emit("fake-reply")
     }
 

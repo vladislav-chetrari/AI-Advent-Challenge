@@ -44,7 +44,7 @@ class RagStaleNativeTest {
             throw UnsatisfiedLinkError("fake missing symbol nativeInit")
         }
 
-        override fun generateChat(system: String, user: String): Flow<String> = flowOf()
+        override fun generateChat(system: String, user: String, params: task2.llama.GenParams): Flow<String> = flowOf()
         override fun cancel() {}
         override fun close() {}
     }
