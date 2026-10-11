@@ -11,7 +11,7 @@ import task2.domain.AiModel
 object ModelCatalog {
     val QWEN25_15B_Q8 = AiModel(
         id = "qwen25-1.5b-q8",
-        label = "Qwen2.5 1.5B Q8 (дефолт, ~1.5 ГБ)",
+        label = "Qwen2.5 1.5B Q8",
         fileName = "Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
         downloadUrl = "https://huggingface.co/litert-community/Qwen2.5-1.5B-Instruct/resolve/main/Qwen2.5-1.5B-Instruct_multi-prefill-seq_q8_ekv4096.litertlm",
         sizeMb = 1524,
@@ -19,7 +19,7 @@ object ModelCatalog {
     )
     val QWEN3_06B_INT4 = AiModel(
         id = "qwen3-0.6b-int4",
-        label = "Qwen3 0.6B int4 (лёгкая, ~330 МБ)",
+        label = "Qwen3 0.6B",
         fileName = "qwen3_0.6b_q4_block32_ekv1280.litertlm",
         downloadUrl = "https://huggingface.co/litert-community/Qwen3-0.6B-int4/resolve/main/qwen3_0.6b_q4_block32_ekv1280.litertlm",
         sizeMb = 331,
