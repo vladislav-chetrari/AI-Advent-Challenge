@@ -22,7 +22,6 @@ import core.llm.EmbedClient
 import core.llm.EmbedDefaults
 import core.llm.LlmResult
 import core.llm.QwenClient
-import core.llm.QwenModel
 import core.rag.ChatMsg
 import core.rag.Prompts
 import core.rag.QueryRouter
@@ -64,12 +63,14 @@ import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 
-// Конфиг через env (всё с дефолтами под RTX 3060 12GB).
+// Конфиг через env. Дефолт LLM — gemma3:12b (~8 ГБ Q4, контекст модели 128k).
+// На RTX 3060 12GB связка gemma3:12b + num_ctx=4096 встаёт впритык (~10 ГБ),
+// при OOM QwenClient сам ретраит с вдвое меньшим ctx (до MIN_NUM_CTX=2048).
 private data class Config(
     val port: Int = System.getenv("TASK5_PORT")?.toIntOrNull() ?: 8080,
     val ollamaUrl: String = System.getenv("OLLAMA_URL") ?: "http://localhost:11434",
     val apiKey: String = System.getenv("TASK5_API_KEY").orEmpty(),
-    val llmModel: String = System.getenv("TASK5_LLM") ?: QwenModel.QWEN25_7B.apiId,
+    val llmModel: String = System.getenv("TASK5_LLM") ?: "gemma3:12b",
     val embedModel: String = System.getenv("TASK5_EMBED") ?: EmbedDefaults.MODEL,
     val numCtx: Int = System.getenv("TASK5_NUM_CTX")?.toIntOrNull() ?: DEFAULT_NUM_CTX,
     val maxTokensCap: Int = System.getenv("TASK5_MAX_TOKENS")?.toIntOrNull() ?: 1024,
@@ -442,7 +443,12 @@ private fun Application.task5Module(
                     }
                     val computed = mutableMapOf<Int, FloatArray>()
                     if (missing.isNotEmpty()) {
-                        val vecs = embed.embed(missing.map { chunks[it].text })
+                        // Большие статьи (напр. «Эстония» — 86 чанков) не влезают в
+                        // EmbedClient.MAX_INPUTS за один вызов — режем на батчи.
+                        // Внутри embed() и так батчи по 16, здесь — только защита лимита.
+                        val vecs = missing.map { chunks[it].text }
+                            .chunked(EmbedClient.MAX_INPUTS)
+                            .flatMap { embed.embed(it) }
                         for ((k, idx) in missing.withIndex()) computed[idx] = l2normalize(vecs[k])
                     }
                     val stored = chunks.mapIndexed { i, c ->
