@@ -1,0 +1,10 @@
+# Week 5 Task 5 — приватный AI-сервис (Kotlin + Ollama + OpenAI API)
+build/
+*.class
+*.jar
+.DS_Store
+.idea/
+out/
+# RAG-индекс пересоздаётся из /v1/docs, в git не тащим
+models/*.db*
+models/*.db-journal

@@ -1,0 +1,18 @@
+product: jvm/lib
+
+dependencies:
+  - $libs.ktor.client.core
+  - $libs.ktor.client.cio
+  - $libs.ktor.client.content.negotiation
+  - $libs.ktor.serialization.kotlinx.json
+  - $libs.serialization.json
+  - $libs.serialization.core
+  - $libs.coroutines.core
+  - $libs.sqlite.jdbc
+  # NOP-реализация SLF4J: ktor тянет slf4j-api, без провайдера каждый запуск
+  # печатает "SLF4J(W): No SLF4J providers were found". Логи нам не нужны — глушим.
+  - $libs.slf4j.nop
+
+settings:
+  kotlin:
+    serialization: json

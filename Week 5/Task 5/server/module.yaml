@@ -1,0 +1,18 @@
+product: jvm/app
+
+dependencies:
+  - ../core
+  - $libs.ktor.server.core
+  - $libs.ktor.server.cio
+  - $libs.ktor.server.content.negotiation
+  - $libs.ktor.server.status.pages
+  - $libs.ktor.server.call.logging
+  - $libs.ktor.serialization.kotlinx.json
+  - $libs.serialization.json
+  - $libs.serialization.core
+  - $libs.coroutines.core
+  - $libs.slf4j.nop
+
+settings:
+  kotlin:
+    serialization: json
