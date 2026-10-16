@@ -1,0 +1,7 @@
+# Week 4 — локальный RAG: индексация + поиск + ответы (Kotlin Toolchain + Compose Desktop)
+build/
+*.class
+*.jar
+.DS_Store
+.idea/
+out/
