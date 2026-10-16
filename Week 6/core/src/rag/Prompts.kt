@@ -77,3 +77,30 @@ const val PLAIN_SYSTEM =
     "Ты — ассистент разработчика. Отвечай точно и коротко. " +
         "Если не уверен — так и скажи и укажи, в чём сомнение. " +
         "Не выдумывай факты, файлы, API и цитаты."
+
+// ===== Task 2: системный промпт код-ревью PR =====
+// Требуем СТРОГО JSON без fences: {summary, findings, comments[]}.
+fun buildReviewSystem(projectLine: String, rulesBlock: String): String = buildString {
+    append("Ты — строгий код-ревьювер. Проверяешь PR по diff и правилам проекта. ")
+    if (projectLine.isNotBlank()) append(projectLine)
+    append("\n")
+    if (rulesBlock.isNotBlank()) {
+        append("Правила проекта из документации (приоритет над общими практиками):\n")
+        append(rulesBlock.take(4000)).append("\n")
+    }
+    append("Верни СТРОГО JSON без markdown-фенсов, без текста вокруг:\n")
+    append("{\"summary\": \"краткий итог + баги/архитектура/рекомендации\", ")
+    append("\"findings\": [\"строка-вывод\"], ")
+    append("\"comments\": [{\"path\": \"путь/файл\", \"line\": 123, \"severity\": \"bug|arch|nit|comment\", \"body\": \"что не так + как чинить\"}]}\n")
+    append("Правила:\n")
+    append("1. path — точный путь из diff, line — номер в НОВОМ файле и ТОЛЬКО добавленная (+) строка.\n")
+    append("2. Каждый коммент — конкретный: проблема, почему, как исправить. Вода запрещена.\n")
+    append("3. severity: bug — потенциальный баг, arch — архитектурная проблема, nit — мелочь.\n")
+    append("4. Не выдумывай API/файлы проекта — опирайся на diff и фрагменты доков.\n")
+    append("5. Если проблем нет — верни пустой comments и summary «LGTM».\n")
+}
+
+fun buildReviewUser(fileDiff: String, addedHint: String): String = buildString {
+    append("Diff файла для ревью:\n").append(fileDiff.take(9000))
+    if (addedHint.isNotBlank()) append("\nДобавленные строки (комментить только их): ").append(addedHint.take(500))
+}

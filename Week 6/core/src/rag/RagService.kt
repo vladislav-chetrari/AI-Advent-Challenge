@@ -705,4 +705,193 @@ class RagService(
         return chunks.filter { it.strategy == strat }.sortedBy { it.ord }
             .joinToString("\n\n") { it.text }.take(maxChars).ifBlank { null }
     }
+
+    // ===== Task 2: freshness RAG для ревью =====
+    // 1) есть ли доки 2) up-to-date ли индекс (indexedCommit vs HEAD + исчезнувшие файлы).
+    fun reviewFreshness(projectName: String?): Pair<ProjectEntry, ReviewFreshness> {
+        val entry = (projectName?.let { projects.get(it) } ?: selectedProject())
+            ?: throw IllegalStateException("проект не выбран — добавь через + или --project")
+        val dir = File(entry.localPath)
+        require(dir.isDirectory) { "папка проекта пропала: ${entry.localPath}" }
+        val sources = projectSources(entry.name)
+        val chunks = store.loadAllChunks().count { it.source.startsWith(ProjectLoader.prefix(entry.name)) }
+        val head = try { GitTools.commit(dir) } catch (_: Exception) { "—" }
+        val stale = try { ProjectLoader.staleSources(entry.name, dir, sources) } catch (_: Exception) { emptyList() }
+        val upToDate = stale.isEmpty() && (entry.indexedCommit.isNotBlank() && entry.indexedCommit == head)
+        val warn = buildList {
+            if (sources.isEmpty()) add("в RAG нет документов проекта — добавь и проиндексируй")
+            if (entry.indexedCommit.isBlank()) add("индекс без коммита — обнови проект (⟳)")
+            else if (entry.indexedCommit != head) add("индекс от ${entry.indexedCommit}, HEAD $head — обнови проект")
+            if (stale.isNotEmpty()) add("исчезло файлов: ${stale.size}")
+        }.joinToString("; ")
+        return entry to ReviewFreshness(
+            docsFound = sources.size, chunks = chunks,
+            indexedCommit = entry.indexedCommit, headCommit = head,
+            upToDate = upToDate, staleFiles = stale.take(20), warning = warn,
+        )
+    }
+
+    // ===== Task 2: ревью PR по diff + RAG-правила =====
+    // apiKey — per-request из GH Secrets (env DEEPSEEK_API_KEY), на диск не пишем.
+    // Пофайлово: поиск правил (path + кусок diff) -> LLM JSON -> валидация строк.
+    suspend fun review(
+        projectName: String?,
+        base: String,
+        head: String,
+        apiKey: String? = null,
+        maxFiles: Int = 15,
+        perFileTopK: Int = 4,
+    ): ReviewResult = withContext(Dispatchers.IO) {
+        val (entry, fresh) = reviewFreshness(projectName)
+        val dir = File(entry.localPath)
+        val pr = GitTools.prDiff(dir, base, head)
+        if (pr.files.isEmpty() || pr.diff.isBlank()) {
+            return@withContext ReviewResult(
+                summary = "Нет изменений $base...$head — ревью нечего.",
+                freshness = fresh, filesReviewed = 0, truncated = pr.truncated,
+            )
+        }
+        val key = llmApiKey(apiKey)
+        if (key == null && llmSettings.effective().provider != LlmSettings.PROVIDER_OLLAMA && explicitLlm == null) {
+            throw IllegalStateException("нет DEEPSEEK_API_KEY — задай secrets.DEEPSEEK_API_KEY в GitHub Actions")
+        }
+        val byFile = GitTools.splitDiffByFile(pr.diff)
+        val added = GitTools.parseAddedLines(pr.diff)
+        val effSources = try { projectOnlySources() } catch (_: Exception) { null }
+        val projLine = "Проект: ${entry.name}. Ветка: ${GitTools.branch(dir)}, коммит: ${fresh.headCommit}. "
+        val allComments = mutableListOf<ReviewComment>()
+        val allFindings = mutableListOf<String>()
+        val summaries = mutableListOf<String>()
+        var n = 0
+        for ((path, fdiff) in byFile.entries.take(maxFiles.coerceIn(1, 50))) {
+            n++
+            val q = "$path\n${fdiff.take(1500)}"
+            val hits = try {
+                val v = embedder().embed(listOf(q)).first()
+                store.search("both", v, perFileTopK.coerceIn(1, 8), effSources)
+            } catch (_: Exception) { emptyList() }
+            val system = buildReviewSystem(projLine, buildContextBlock(hits))
+            val hint = added[path]?.sorted()?.take(30)?.joinToString(",").orEmpty()
+            val user = buildReviewUser(fdiff, hint)
+            val raw = when (val r = llm().complete(listOf(ChatMsg("system", system), ChatMsg("user", user)), key, ANSWER_TEMPERATURE)) {
+                is LlmResult.Ok -> r.text
+                is LlmResult.HttpError -> throw IllegalStateException("${llmProviderLabel()} HTTP ${r.code}: ${r.detail.take(200)}")
+                is LlmResult.NetworkError -> throw IllegalStateException("Сеть: ${r.detail.take(200)}")
+                LlmResult.Empty -> throw IllegalStateException("Пустой ответ модели")
+            }
+            val (sum, findings, comments) = parseReviewJson(raw)
+            if (sum.isNotBlank()) summaries += "### $path\n$sum"
+            allFindings += findings.map { "[$path] $it".take(500) }
+            allComments += comments
+        }
+        val valid = validateComments(allComments, added)
+        val bugs = (valid.filter { it.severity == "bug" }.map { "[${it.path}:${it.line}] ${it.body}" } +
+            allFindings.filter { Regex("баг|bug|ошибк|nil|panic|race", RegexOption.IGNORE_CASE).containsMatchIn(it) })
+            .take(30)
+        val arch = (valid.filter { it.severity == "arch" }.map { "[${it.path}:${it.line}] ${it.body}" } +
+            allFindings.filter { Regex("архит|arch|слой|завис|зависим", RegexOption.IGNORE_CASE).containsMatchIn(it) })
+            .take(30)
+        val recs = (valid.filter { it.severity in setOf("nit", "comment") }.map { "[${it.path}:${it.line}] ${it.body}" } +
+            allFindings.filter { it !in bugs && it !in arch }).take(40)
+        val head_ = buildString {
+            if (fresh.warning.isNotBlank()) append("⚠ RAG: ${fresh.warning}\n\n")
+            if (summaries.isEmpty()) append("Замечаний нет — LGTM.")
+            else append(summaries.joinToString("\n\n").take(6000))
+            if (n < byFile.size) append("\n\n…проверено файлов $n из ${byFile.size} (лимит).")
+            if (pr.truncated) append(" Diff обрезан лимитом.")
+        }.trim()
+        ReviewResult(
+            summary = head_, bugs = bugs, arch = arch, recommendations = recs,
+            comments = valid, freshness = fresh, filesReviewed = n, truncated = pr.truncated || n < byFile.size,
+        )
+    }
+
+    // Best-effort обновление индекса проекта перед ревью (VPS-режим).
+    // Возвращает строку для warning (пусто — всё свежо). Никогда не бросает наружу.
+    private suspend fun tryRefreshProject(projectName: String?): String {
+        return try {
+            val entry = (projectName?.let { projects.get(it) } ?: selectedProject()) ?: return ""
+            if (entry.gitUrl.isBlank() && !File(entry.localPath, ".git").isDirectory) return ""
+            val strat = store.allDocs()
+                .filter { it.source.startsWith(ProjectLoader.prefix(entry.name)) }
+                .map { it.strategy }.groupingBy { it }.eachCount()
+                .maxByOrNull { it.value }?.key
+                .takeIf { it == "fixed" || it == "structure" } ?: "both"
+            updateProject(entry.name, strat)
+            ""
+        } catch (e: Exception) {
+            "автообновление доков не удалось: ${e.message?.take(120)}"
+        }
+    }
+
+    // ===== Task 2b: ревью готового diff-текста (VPS-режим) =====
+    // Action сам снимает diff и шлёт его на сервер — серверу не нужен git-checkout PR.
+    // apiKey — per-request из X-LLM-Key (GH Secrets), на диск не пишем.
+    // refresh=true: перед ревью best-effort подтягиваем доки проекта (git pull + доиндексация),
+    // чтобы ревью шло по свежим правилам; неудача — только строка в warning, не падение ревью.
+    suspend fun reviewDiff(
+        projectName: String?,
+        diffText: String,
+        apiKey: String? = null,
+        maxFiles: Int = 15,
+        perFileTopK: Int = 4,
+        refresh: Boolean = true,
+    ): ReviewResult = withContext(Dispatchers.IO) {
+        val refreshNote = if (refresh) tryRefreshProject(projectName) else ""
+        val (entry, baseFresh) = reviewFreshness(projectName)
+        val fresh = if (refreshNote.isNotBlank()) {
+            baseFresh.copy(warning = listOf(baseFresh.warning, refreshNote).filter { it.isNotBlank() }.joinToString("; "))
+        } else baseFresh
+        if (diffText.isBlank()) {
+            return@withContext ReviewResult(summary = "Пустой diff — ревью нечего.", freshness = fresh)
+        }
+        val key = llmApiKey(apiKey)
+        if (key == null && llmSettings.effective().provider != LlmSettings.PROVIDER_OLLAMA && explicitLlm == null) {
+            throw IllegalStateException("нет DEEPSEEK_API_KEY — Action должен слать X-LLM-Key из secrets")
+        }
+        val byFile = GitTools.splitDiffByFile(diffText).entries.take(maxFiles.coerceIn(1, 50))
+        val added = GitTools.parseAddedLines(diffText)
+        val effSources = try { projectOnlySources() } catch (_: Exception) { null }
+        val projLine = "Проект: ${entry.name}. "
+        val allComments = mutableListOf<ReviewComment>()
+        val allFindings = mutableListOf<String>()
+        val summaries = mutableListOf<String>()
+        for ((path, fdiff) in byFile) {
+            val q = "$path\n${fdiff.take(1500)}"
+            val hits = try {
+                val v = embedder().embed(listOf(q)).first()
+                store.search("both", v, perFileTopK.coerceIn(1, 8), effSources)
+            } catch (_: Exception) { emptyList() }
+            val system = buildReviewSystem(projLine, buildContextBlock(hits))
+            val hint = added[path]?.sorted()?.take(30)?.joinToString(",").orEmpty()
+            val user = buildReviewUser(fdiff, hint)
+            val raw = when (val r = llm().complete(listOf(ChatMsg("system", system), ChatMsg("user", user)), key, ANSWER_TEMPERATURE)) {
+                is LlmResult.Ok -> r.text
+                is LlmResult.HttpError -> throw IllegalStateException("${llmProviderLabel()} HTTP ${r.code}: ${r.detail.take(200)}")
+                is LlmResult.NetworkError -> throw IllegalStateException("Сеть: ${r.detail.take(200)}")
+                LlmResult.Empty -> throw IllegalStateException("Пустой ответ модели")
+            }
+            val (sum, findings, comments) = parseReviewJson(raw)
+            if (sum.isNotBlank()) summaries += "### $path\n$sum"
+            allFindings += findings.map { "[$path] $it".take(500) }
+            allComments += comments
+        }
+        val valid = validateComments(allComments, added)
+        val bugs = (valid.filter { it.severity == "bug" }.map { "[${it.path}:${it.line}] ${it.body}" } +
+            allFindings.filter { Regex("баг|bug|ошибк|nil|panic|race", RegexOption.IGNORE_CASE).containsMatchIn(it) }).take(30)
+        val arch = (valid.filter { it.severity == "arch" }.map { "[${it.path}:${it.line}] ${it.body}" } +
+            allFindings.filter { Regex("архит|arch|слой|завис|зависим", RegexOption.IGNORE_CASE).containsMatchIn(it) }).take(30)
+        val recs = (valid.filter { it.severity in setOf("nit", "comment") }.map { "[${it.path}:${it.line}] ${it.body}" } +
+            allFindings.filter { it !in bugs && it !in arch }).take(40)
+        val head_ = buildString {
+            if (fresh.warning.isNotBlank()) append("⚠ RAG: ${fresh.warning}\n\n")
+            if (summaries.isEmpty()) append("Замечаний нет — LGTM.")
+            else append(summaries.joinToString("\n\n").take(6000))
+            if (byFile.size >= maxFiles) append("\n\n…проверено файлов ${byFile.size} (лимит).")
+        }.trim()
+        ReviewResult(
+            summary = head_, bugs = bugs, arch = arch, recommendations = recs,
+            comments = valid, freshness = fresh, filesReviewed = byFile.size, truncated = diffText.length >= 100_000,
+        )
+    }
 }

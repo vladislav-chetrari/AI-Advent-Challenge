@@ -9,8 +9,14 @@ import core.rag.RagChat
 import core.rag.RagMessage
 import core.rag.RagService
 import core.rag.RerankModes
+import core.rag.ReviewResult
 import core.rag.newChatId
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.json.Json
+
+// Общий сериализатор для review.json: полные дефолты, чтобы post_review.py
+// и VPS всегда видели одинаковую схему.
+private val reviewOutJson = Json { prettyPrint = true; encodeDefaults = true }
 
 // Headless-доступ к тому же RagService, что и у desktop-приложения.
 // Единственный источник документов — статьи Википедии.
@@ -219,6 +225,93 @@ private suspend fun runCommand(args: Array<String>) {
                 }
             }
         }
+        // Task 2: pure-проверка парсинга diff/JSON без сети и БД (для CI без секретов).
+        //   review --verify
+        "verify-review" -> {
+            val diff = """
+                diff --git a/a.kt b/a.kt
+                --- a/a.kt
+                +++ b/a.kt
+                @@ -1,3 +1,4 @@
+                 line1
+                -old
+                +new1
+                +new2
+                 line3
+                diff --git a/b.kt b/b.kt
+                --- a/b.kt
+                +++ b/b.kt
+                @@ -10,2 +10,3 @@
+                 ctx
+                +added10
+                \ No newline at end of file
+            """.trimIndent()
+            val added = core.project.GitTools.parseAddedLines(diff)
+            check(added["a.kt"] == setOf(2, 3)) { "added a.kt: $added" }
+            check(added["b.kt"] == setOf(11)) { "added b.kt: $added" }
+            val byFile = core.project.GitTools.splitDiffByFile(diff)
+            check(byFile.keys == setOf("a.kt", "b.kt")) { "split: ${byFile.keys}" }
+            val (sum, findings, comments) = core.rag.parseReviewJson(
+                """{"summary": "s", "findings": ["f1"], "comments": [
+                |{"path": "a.kt", "line": 2, "severity": "bug", "body": "b1"},
+                |{"path": "a.kt", "line": 99, "severity": "nit", "body": "drop-me"},
+                |{"path": "b.kt", "line": 11, "severity": "arch", "body": "b2"}]}""".trimMargin()
+            )
+            check(sum == "s" && findings == listOf("f1")) { "parse: $sum $findings" }
+            val valid = core.rag.validateComments(comments, added)
+            check(valid.size == 2 && valid.none { it.line == 99 }) { "validate: $valid" }
+            check(valid.map { it.severity }.toSet() == setOf("bug", "arch")) { "sev: $valid" }
+            println("VERIFY-REVIEW PASSED")
+        }
+        // Task 2: ревью PR. Ключ ТОЛЬКО из env (GH Secrets -> DEEPSEEK_API_KEY), на диск не пишем.
+        //   review [--project name] [--base origin/main] [--head HEAD] [--maxFiles 15] [--format json|md] [--out review.json] [--dry-run]
+        // dry-run — без LLM: только freshness + файлы diff (дымовой тест в CI без ключа).
+        "review" -> {
+            val (_, rest) = splitPaths(args)
+            val project = flag(rest, "--project")
+            val base = flag(rest, "--base") ?: "origin/main"
+            val head = flag(rest, "--head") ?: "HEAD"
+            val maxFiles = flag(rest, "--maxFiles")?.toIntOrNull()?.coerceIn(1, 50) ?: 15
+            val format = flag(rest, "--format")?.lowercase() ?: "json"
+            val out = flag(rest, "--out")
+            val dryRun = rest.contains("--dry-run")
+            if (dryRun) {
+                val (entry, fresh) = svc.reviewFreshness(project)
+                val dir = svc.projectDir(entry.name) ?: throw IllegalStateException("папка проекта пропала")
+                val pr = core.project.GitTools.prDiff(dir, base, head)
+                val added = core.project.GitTools.parseAddedLines(pr.diff)
+                val json = reviewOutJson
+                val payload = json.encodeToString(
+                    ReviewResult.serializer(),
+                    ReviewResult(
+                        summary = "dry-run: файлов ${pr.files.size}, добавленных строк ${added.values.sumOf { it.size }}",
+                        freshness = fresh, filesReviewed = pr.files.size, truncated = pr.truncated,
+                    ),
+                )
+                if (out != null) java.io.File(out).writeText(payload)
+                println(payload)
+                return@runCommand
+            }
+            val apiKey = System.getenv("DEEPSEEK_API_KEY")?.trim()?.takeIf { it.isNotBlank() }
+            val res = svc.review(project, base, head, apiKey = apiKey, maxFiles = maxFiles)
+            if (format == "md") {
+                val md = buildString {
+                    appendLine(res.summary)
+                    if (res.bugs.isNotEmpty()) { appendLine("\n## Баги"); res.bugs.forEach { appendLine("- $it") } }
+                    if (res.arch.isNotEmpty()) { appendLine("\n## Архитектура"); res.arch.forEach { appendLine("- $it") } }
+                    if (res.recommendations.isNotEmpty()) { appendLine("\n## Рекомендации"); res.recommendations.forEach { appendLine("- $it") } }
+                    appendLine("\n_RAG: доков ${res.freshness.docsFound}, чанков ${res.freshness.chunks}, upToDate=${res.freshness.upToDate}${if (res.freshness.warning.isNotBlank()) " (${res.freshness.warning})" else ""}_")
+                }.trim()
+                if (out != null) java.io.File(out).writeText(md)
+                println(md)
+            } else {
+                val payload = reviewOutJson.encodeToString(ReviewResult.serializer(), res)
+                if (out != null) java.io.File(out).writeText(payload)
+                println(payload)
+            }
+            // Машиночитаемый итог для Action: число inline-комментов в stderr-строке.
+            System.err.println("REVIEW_COMMENTS=${res.comments.size} FILES=${res.filesReviewed}")
+        }
         // Скрытый дымовой тест новых путей: RAG вкл/выкл, фильтр документов. He для видео.
         "selftest" -> {
             val docs = svc.indexedDocs()
@@ -268,6 +361,11 @@ private fun usage() {
     println("  мини-чат с RAG + памятью задачи; команды: /memory /forget /exit")
     println("week4 eval-modes [--probe \"вопрос...\" ...] [--strategy both] [--topK 20] [--temperature 0.35] [--postK 5|off]")
     println("  сравнение режимов без фильтра / с фильтром / фильтр+rewrite на одних пробах (без переиндексации)")
+    println("week6 review [--project <имя>] [--base origin/main] [--head HEAD] [--maxFiles 15] [--format json|md] [--out review.json] [--dry-run]")
+    println("  Task 2: RAG-freshness + PR-diff -> JSON {summary, comments[{path,line,severity,body}]} для inline-ревью.")
+    println("  Ключ только из env DEEPSEEK_API_KEY (GH Secrets). --dry-run: без LLM, только freshness+diff.")
+    println("week6 verify-review")
+    println("  Task 2: pure-проверка парсинга diff/JSON без сети и БД (для CI без секретов).")
 }
 
 // Task 5: чат по имени для CLI — тот же ChatStore, что у desktop.

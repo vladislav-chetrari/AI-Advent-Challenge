@@ -1,0 +1,11 @@
+# Review-server для Task 2 (VPS, GCP).
+# Собирается Amper'ом на VM (Docker-сборка Amper тяжёлая), образ — только рантайм.
+FROM eclipse-temurin:21-jre
+WORKDIR /app
+# Ожидается собранный дистрибутив server (./kotlin package --module server) рядом.
+COPY build/server/ /app/
+ENV PORT=8080
+EXPOSE 8080
+# VPS_TOKEN и данные (~/.ai-advent-week6) монтируются/задаются при запуске.
+# DEEPSEEK_API_KEY НЕ задавать — прилетает per-request в X-LLM-Key из GH Secrets.
+CMD ["./bin/server"]

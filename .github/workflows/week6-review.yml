@@ -1,0 +1,84 @@
+name: week6-ai-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'Week 6/**'
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: 'Номер PR для ручного ревью'
+        required: false
+
+permissions:
+  pull-requests: write
+  contents: read
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: Week 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Для pull_request нужен diff base...head
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - name: Fetch base
+        run: git fetch origin ${{ github.event.pull_request.base.ref || 'main' }} --depth=50 || true
+
+      # Режим A: VPS (если задан VPS_URL) — ключ DeepSeek летит per-request, на VPS не хранится.
+      # Режим B: локально в раннере — сборка Amper + CLI review.
+      - name: Review via VPS
+        if: ${{ secrets.VPS_URL != '' }}
+        env:
+          VPS_URL: ${{ secrets.VPS_URL }}
+          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          REVIEW_PROJECT: ${{ vars.REVIEW_PROJECT || github.event.repository.name }}
+        run: |
+          BASE="${{ github.event.pull_request.base.ref || 'main' }}"
+          git diff --unified=3 --no-color "origin/$BASE...HEAD" > /tmp/pr.diff || git diff --unified=3 --no-color > /tmp/pr.diff
+          python3 - <<'EOF'
+          import json, os, urllib.request
+          diff = open('/tmp/pr.diff', encoding='utf-8', errors='replace').read()[:100000]
+          payload = json.dumps({
+              "diff": diff,
+              "project": os.environ.get('REVIEW_PROJECT') or None,
+              "maxFiles": 15,
+              "refresh": True,
+          }).encode()
+          req = urllib.request.Request(
+              os.environ['VPS_URL'].rstrip('/') + '/review', data=payload, method='POST',
+              headers={'Content-Type': 'application/json',
+                       'Authorization': 'Bearer ' + os.environ.get('VPS_TOKEN', ''),
+                       'X-LLM-Key': os.environ.get('DEEPSEEK_API_KEY', '')},
+          )
+          body = urllib.request.urlopen(req, timeout=600).read()
+          open('review.json', 'wb').write(body)
+          print('VPS review ok, bytes:', len(body))
+          EOF
+
+      - name: Review locally (Amper CLI)
+        if: ${{ secrets.VPS_URL == '' }}
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: |
+          BASE="${{ github.event.pull_request.base.ref || 'main' }}"
+          ./kotlin run --module cli -- review --base "origin/$BASE" --head HEAD --maxFiles 15 --format json --out review.json || \
+          ./kotlin run --module cli -- review --base "$BASE" --head HEAD --maxFiles 15 --format json --out review.json
+          cat review.json | head -c 2000
+
+      - name: Post inline comments
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+          REVIEW_FILE: review.json
+        run: python3 scripts/post_review.py

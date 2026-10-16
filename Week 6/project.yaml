@@ -2,3 +2,4 @@ modules:
   - cli
   - core
   - desktop
+  - server
