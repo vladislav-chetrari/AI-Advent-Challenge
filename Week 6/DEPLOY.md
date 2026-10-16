@@ -22,13 +22,18 @@ e2-medium+, Ubuntu 22.04. Caddy/Nginx с TLS (443/80) → прокси на `127
 
 ## 3. RAG-индекс целевого проекта (один раз на проект)
 
+На headless VM десктопа нет — проекты добавляются через CLI:
+
 ```sh
-./kotlin run --module desktop   # кнопка + : имя + git-URL (клон в repos/<имя>) или локальный путь
+cd ~/AI-Advent-Challenge/"Week 6"
+./kotlin run --module cli -- project-add --name CallowFellow --input https://github.com/vladislav-chetrari/CallowFellow
+./kotlin run --module cli -- project-list   # проверка
 # данные: ~/.ai-advent-week6/: rag.db, projects.json, repos/
 ```
 
-Имя запомни — это `REVIEW_PROJECT`. Приватный репозиторий: клонируй на VPS
-вручную (deploy key / PAT) и добавь локальным путём.
+Имя (`CallowFellow`) запомни — это `REVIEW_PROJECT`. Приватный репозиторий:
+клонируй на VPS вручную (deploy key / PAT) и добавь локальным путём
+(`--input /path/to/repo`).
 
 ## 4. Сервер (один раз)
 

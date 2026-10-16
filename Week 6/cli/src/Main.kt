@@ -225,6 +225,33 @@ private suspend fun runCommand(args: Array<String>) {
                 }
             }
         }
+        // Task 2: управление проектами на headless VPS (десктоп-UI там недоступен).
+        //   project-add --name <имя> --input <git-URL|путь> [--strategy both]
+        //   project-list | project-update --name <имя> [--strategy both]
+        "project-add" -> {
+            val (_, rest) = splitPaths(args)
+            val name = flag(rest, "--name") ?: fail("нужно --name <имя>")
+            val input = flag(rest, "--input") ?: fail("нужно --input <git-URL|путь>")
+            val strat = flag(rest, "--strategy") ?: "both"
+            try {
+                svc.checkEmbeddings()
+            } catch (e: Exception) {
+                throw IllegalStateException("нет связи с эмбеддингами (Ollama): ${e.message}")
+            }
+            val n = svc.addProject(name, input, strat, onLog = { println(it) })
+            println("OK project=$name files=$n")
+        }
+        "project-list" -> {
+            svc.listProjects().forEach { println("${it.name} ${it.localPath} indexed=${it.indexedCommit}") }
+            println("selected=${svc.selectedProject()?.name}")
+        }
+        "project-update" -> {
+            val (_, rest) = splitPaths(args)
+            val name = flag(rest, "--name") ?: fail("нужно --name <имя>")
+            val strat = flag(rest, "--strategy") ?: "both"
+            val n = svc.updateProject(name, strat, onLog = { println(it) })
+            println("OK updated=$name files=$n")
+        }
         // Task 2: pure-проверка парсинга diff/JSON без сети и БД (для CI без секретов).
         //   review --verify
         "verify-review" -> {
@@ -366,6 +393,10 @@ private fun usage() {
     println("  Ключ только из env DEEPSEEK_API_KEY (GH Secrets). --dry-run: без LLM, только freshness+diff.")
     println("week6 verify-review")
     println("  Task 2: pure-проверка парсинга diff/JSON без сети и БД (для CI без секретов).")
+    println("week6 project-add --name <имя> --input <git-URL|путь> [--strategy both]")
+    println("  Task 2: добавить проект в RAG (для headless VPS; git-URL клонируется в repos/<имя>).")
+    println("week6 project-list | project-update --name <имя>")
+    println("  Task 2: список проектов / обновить индекс (git pull + доиндексация).")
 }
 
 // Task 5: чат по имени для CLI — тот же ChatStore, что у desktop.
