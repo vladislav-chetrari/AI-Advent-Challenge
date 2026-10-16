@@ -41,6 +41,8 @@ jobs:
           VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           REVIEW_PROJECT: ${{ vars.REVIEW_PROJECT || github.event.repository.name }}
+          REPO_URL: ${{ format('{0}/{1}', github.server_url, github.repository) }}
+          REPO_TOKEN: ${{ github.event.repository.private && secrets.GITHUB_TOKEN || '' }}
         run: |
           BASE="${{ github.event.pull_request.base.ref || 'main' }}"
           git diff --unified=3 --no-color "origin/$BASE...HEAD" > /tmp/pr.diff || git diff --unified=3 --no-color > /tmp/pr.diff
@@ -50,6 +52,8 @@ jobs:
           payload = json.dumps({
               "diff": diff,
               "project": os.environ.get('REVIEW_PROJECT') or None,
+              "repoUrl": os.environ.get('REPO_URL') or None,
+              "repoToken": os.environ.get('REPO_TOKEN') or None,
               "maxFiles": 15,
               "refresh": True,
           }).encode()

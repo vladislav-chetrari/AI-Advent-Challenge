@@ -288,6 +288,8 @@ private suspend fun runCommand(args: Array<String>) {
             val valid = core.rag.validateComments(comments, added)
             check(valid.size == 2 && valid.none { it.line == 99 }) { "validate: $valid" }
             check(valid.map { it.severity }.toSet() == setOf("bug", "arch")) { "sev: $valid" }
+            check(core.project.ProjectLoader.repoNameFromUrl("https://github.com/o/my-svc.git") == "my-svc") { "repourl" }
+            check(core.project.ProjectLoader.repoNameFromUrl("https://github.com/o/my-svc") == "my-svc") { "repourl2" }
             println("VERIFY-REVIEW PASSED")
         }
         // Task 2: ревью PR. Ключ ТОЛЬКО из env (GH Secrets -> DEEPSEEK_API_KEY), на диск не пишем.

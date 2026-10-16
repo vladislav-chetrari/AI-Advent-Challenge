@@ -37,6 +37,10 @@ jobs:
           VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           REVIEW_PROJECT: ${{ vars.REVIEW_PROJECT || github.event.repository.name }}
+          REPO_URL: ${{ format('{0}/{1}', github.server_url, github.repository) }}
+          # Токен для приватных репозиториев: сервер использует его только чтобы
+          # склонировать/подтянуть доки (в памяти, не хранится). Для публичных — пусто.
+          REPO_TOKEN: ${{ github.event.repository.private && secrets.GITHUB_TOKEN || '' }}
           BASE_REF: ${{ github.event.pull_request.base.ref || 'main' }}
         run: |
           git diff --unified=3 --no-color "origin/$BASE_REF...HEAD" > /tmp/pr.diff \
@@ -51,6 +55,9 @@ jobs:
           payload = json.dumps({
               "diff": diff,
               "project": os.environ.get('REVIEW_PROJECT') or None,
+              # Сервер сам склонирует доки при первом обращении и подтянет при следующих.
+              "repoUrl": os.environ.get('REPO_URL') or None,
+              "repoToken": os.environ.get('REPO_TOKEN') or None,
               "maxFiles": 15,
               "refresh": True,
           }).encode()

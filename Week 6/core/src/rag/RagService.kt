@@ -12,6 +12,7 @@ import core.project.ProjectLoader
 import core.project.ProjectStore
 import java.io.File
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 val DEFAULT_PROBES = listOf(
@@ -580,13 +581,14 @@ class RagService(
         strategy: String,
         onDocProgress: (source: String, done: Int, total: Int) -> Unit = { _, _, _ -> },
         onLog: (String) -> Unit = {},
+        authToken: String? = null,
     ): Int = withContext(Dispatchers.IO) {
         val entry = projects.get(name) ?: throw IllegalStateException("нет проекта «$name»")
         val dir = File(entry.localPath)
         require(dir.isDirectory) { "папка проекта пропала: ${entry.localPath}" }
         if (entry.gitUrl.isNotBlank() || File(dir, ".git").isDirectory) {
             try {
-                val out = ProjectLoader.pull(dir)
+                val out = ProjectLoader.pull(dir, authToken)
                 onLog("git pull: ${out.lines().firstOrNull().orEmpty().take(120)}")
             } catch (e: Exception) {
                 onLog("pull не удался: ${e.message}")
@@ -806,9 +808,43 @@ class RagService(
         )
     }
 
+    // Замки под проекты для авто-флоу: два параллельных ревью одного
+    // проекта не должны клонировать/индексировать одновременно.
+    // Mutex вместо synchronized — внутри suspend-вызовы (индексация).
+    private val projectMutexes = java.util.concurrent.ConcurrentHashMap<String, kotlinx.coroutines.sync.Mutex>()
+
+    // Авто-флоу сервера: проект заводится сам при первом обращении по repoUrl,
+    // дальше только подтягивается. Без repoUrl и без регистрации — честная ошибка.
+    // Пустой индекс (нет доков) — не ошибка: ревью идёт по общим правилам + warning.
+    suspend fun ensureProject(name: String, repoUrl: String?, repoToken: String? = null): ProjectEntry {
+        val clean = ProjectLoader.sanitizeName(name)
+        projects.get(clean)?.let { return it }
+        val url = repoUrl?.trim()
+            ?: throw IllegalStateException("проект «$clean» не зарегистрирован на VPS — передай repoUrl или добавь через project-add")
+        require(ProjectLoader.isGitUrl(url)) { "repoUrl должен быть git-URL: $url" }
+        val mutex = projectMutexes.getOrPut(clean) { kotlinx.coroutines.sync.Mutex() }
+        return mutex.withLock {
+            projects.get(clean)?.let { return@withLock it }
+            val dir = ProjectLoader.cloneFresh(clean, url, appDir, repoToken)
+            val docs = try {
+                ProjectLoader.scan(clean, dir)
+            } catch (e: IllegalArgumentException) {
+                emptyList() // доков нет — регистрируем пустым, ревью будет общим
+            }
+            if (docs.isNotEmpty()) {
+                markIndexing(docs, "both")
+                indexNewDocs(docs, "both")
+            }
+            val commit = try { GitTools.commit(dir) } catch (_: Exception) { "" }
+            val entry = ProjectEntry(clean, dir.absolutePath, url, commit, System.currentTimeMillis())
+            projects.upsert(entry)
+            entry
+        }
+    }
+
     // Best-effort обновление индекса проекта перед ревью (VPS-режим).
     // Возвращает строку для warning (пусто — всё свежо). Никогда не бросает наружу.
-    private suspend fun tryRefreshProject(projectName: String?): String {
+    private suspend fun tryRefreshProject(projectName: String?, authToken: String? = null): String {
         return try {
             val entry = (projectName?.let { projects.get(it) } ?: selectedProject()) ?: return ""
             if (entry.gitUrl.isBlank() && !File(entry.localPath, ".git").isDirectory) return ""
@@ -817,7 +853,7 @@ class RagService(
                 .map { it.strategy }.groupingBy { it }.eachCount()
                 .maxByOrNull { it.value }?.key
                 .takeIf { it == "fixed" || it == "structure" } ?: "both"
-            updateProject(entry.name, strat)
+            updateProject(entry.name, strat, authToken = authToken)
             ""
         } catch (e: Exception) {
             "автообновление доков не удалось: ${e.message?.take(120)}"
@@ -836,9 +872,19 @@ class RagService(
         maxFiles: Int = 15,
         perFileTopK: Int = 4,
         refresh: Boolean = true,
+        repoUrl: String? = null,
+        repoToken: String? = null,
     ): ReviewResult = withContext(Dispatchers.IO) {
-        val refreshNote = if (refresh) tryRefreshProject(projectName) else ""
-        val (entry, baseFresh) = reviewFreshness(projectName)
+        // Авто-флоу: имя из project, иначе из repoUrl; проект заводится сам при первом обращении.
+        val effectiveName = projectName?.trim()?.takeIf { it.isNotBlank() }
+            ?: repoUrl?.let { ProjectLoader.repoNameFromUrl(it) }
+            ?: selectedProject()?.name
+            ?: throw IllegalStateException("не указан проект: передай project или repoUrl")
+        if (repoUrl != null || projects.get(effectiveName) == null) {
+            ensureProject(effectiveName, repoUrl, repoToken)
+        }
+        val refreshNote = if (refresh) tryRefreshProject(effectiveName, repoToken) else ""
+        val (entry, baseFresh) = reviewFreshness(effectiveName)
         val fresh = if (refreshNote.isNotBlank()) {
             baseFresh.copy(warning = listOf(baseFresh.warning, refreshNote).filter { it.isNotBlank() }.joinToString("; "))
         } else baseFresh

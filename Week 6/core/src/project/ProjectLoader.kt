@@ -44,10 +44,45 @@ object ProjectLoader {
         return dest.canonicalFile
     }
 
-    fun pull(dir: File): String {
-        val (code, out) = runGit(dir, "pull", "--ff-only")
+    fun pull(dir: File, authToken: String? = null): String {
+        val args = if (!authToken.isNullOrBlank()) {
+            // Токен только в транспортном заголовке: в .git/config ничего не пишется.
+            arrayOf("-c", "http.extraHeader=AUTHORIZATION: bearer $authToken", "pull", "--ff-only")
+        } else arrayOf("pull", "--ff-only")
+        val (code, out) = runGit(dir, *args)
         if (code != 0) throw IllegalStateException("git pull: ${out.take(300)}")
         return out.take(500)
+    }
+
+    // Имя проекта из git-URL: последний сегмент без .git (чистая функция, покрыта verify-review).
+    fun repoNameFromUrl(url: String): String {
+        val t = url.trim().trimEnd('/')
+        require(t.isNotEmpty()) { "пустой repoUrl" }
+        val seg = t.substringAfterLast('/').substringAfterLast(':').trim()
+        val name = (if (seg.endsWith(".git", ignoreCase = true)) seg.dropLast(4) else seg).trim()
+        require(name.isNotEmpty()) { "не вывелось имя из URL: $url" }
+        return sanitizeName(name)
+    }
+
+    // Клон для авто-флоу сервера: dest переиспользуется, если уже есть (повторный заход).
+    // Токен — только при необходимости: сначала анонимно, при 401/404 и наличии токена — с ним.
+    fun cloneFresh(clean: String, url: String, appDir: File, authToken: String? = null): File {
+        val dest = File(appDir, "repos/$clean")
+        if (dest.isDirectory && File(dest, ".git").isDirectory) return dest.canonicalFile
+        require(!dest.exists()) { "папка repos/$clean занята не git-клоном" }
+        try {
+            clone(url, dest, authToken = null)
+        } catch (e: Exception) {
+            val msg = e.message.orEmpty()
+            val needAuth = "401" in msg || "403" in msg || "not found" in msg.lowercase() || "could not read" in msg.lowercase()
+            if (!needAuth || authToken.isNullOrBlank()) throw e
+            try {
+                dest.deleteRecursively()
+            } catch (_: Exception) {
+            }
+            clone(url, dest, authToken = authToken)
+        }
+        return dest.canonicalFile
     }
 
     // Сканирует директорию в RawDoc-и: ТОЛЬКО документация (Task 1: README + docs).
@@ -127,10 +162,14 @@ object ProjectLoader {
         return false
     }
 
-    private fun clone(url: String, dest: File): String {
+    private fun clone(url: String, dest: File, authToken: String? = null): String {
         dest.parentFile?.mkdirs()
-        val pb = ProcessBuilder("git", "clone", "--depth", "1", url, dest.absolutePath)
-            .redirectErrorStream(true)
+        val cmd = if (!authToken.isNullOrBlank()) {
+            listOf("git", "-c", "http.extraHeader=AUTHORIZATION: bearer $authToken",
+                "clone", "--depth", "1", url, dest.absolutePath)
+        } else listOf("git", "clone", "--depth", "1", url, dest.absolutePath)
+        val pb = ProcessBuilder(cmd).redirectErrorStream(true)
+        // Токен в args виден только в ps этого хоста; на диск (remote URL) не пишется.
         val proc = pb.start()
         val out = proc.inputStream.bufferedReader().readText()
         val code = proc.waitFor()

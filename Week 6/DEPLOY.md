@@ -20,20 +20,21 @@ e2-medium+, Ubuntu 22.04. Caddy/Nginx с TLS (443/80) → прокси на `127
   поэтому 32B-модели на VPS не нужны),
 - клон **этого** репозитория, `cd "Week 6"`.
 
-## 3. RAG-индекс целевого проекта (один раз на проект)
+## 3. Доки целевых проектов — авто-флоу (настройка не нужна)
 
-На headless VM десктопа нет — проекты добавляются через CLI:
+Сервер сам заводит проект при первом обращении: клонирует `repoUrl` из запроса
+в `~/.ai-advent-week6/repos/<имя>`, индексирует доки; при следующих PR —
+`git pull` + доиндексация (`refresh: true`, best-effort). Токен приватного
+репозитория (`repoToken`) идёт только в git-транспорт и не хранится.
+
+Запасной путь — ручное `project-add` на VPS (доки вне git, клон недоступен):
 
 ```sh
 cd ~/AI-Advent-Challenge/"Week 6"
-./kotlin run --module cli -- project-add --name CallowFellow --input https://github.com/vladislav-chetrari/CallowFellow
-./kotlin run --module cli -- project-list   # проверка
+./kotlin run --module cli -- project-add --name <имя> --input <git-URL|путь>
+./kotlin run --module cli -- project-list
 # данные: ~/.ai-advent-week6/: rag.db, projects.json, repos/
 ```
-
-Имя (`CallowFellow`) запомни — это `REVIEW_PROJECT`. Приватный репозиторий:
-клонируй на VPS вручную (deploy key / PAT) и добавь локальным путём
-(`--input /path/to/repo`).
 
 ## 4. Сервер (один раз)
 

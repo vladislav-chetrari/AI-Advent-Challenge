@@ -13,13 +13,17 @@ import kotlinx.serialization.json.Json
 // ключ DeepSeek НЕ хранит — прилетает per-request в X-LLM-Key из GH Secrets.
 //   PORT=8080 VPS_TOKEN=xxx ./kotlin run --module server
 //   POST /health -> ok
-//   POST /review {diff, project?, maxFiles?, refresh?} -> ReviewResult JSON
+//   POST /review {diff, project?, repoUrl?, repoToken?, maxFiles?, refresh?} -> ReviewResult JSON
 //   Headers: Authorization: Bearer <VPS_TOKEN>, X-LLM-Key: <DEEPSEEK_API_KEY>
-//   project — имя проекта в RAG-индексе VPS (см. integration/README.md).
+//   project — имя в RAG-индексе VPS; repoUrl — git-URL вызывающего проекта
+//   (сервер сам склонирует при первом обращении и подтянет при следующих).
+//   repoToken — опционально, только для приватных репозиториев (в памяти, не хранится).
 @Serializable
 private data class ReviewRequest(
     val diff: String = "",
     val project: String? = null,
+    val repoUrl: String? = null,
+    val repoToken: String? = null,
     val maxFiles: Int = 15,
     val refresh: Boolean = true,
 )
@@ -67,7 +71,7 @@ fun main() {
                 return@createContext
             }
             val res: ReviewResult = runBlocking {
-                svc.reviewDiff(req.project, req.diff, apiKey = llmKey, maxFiles = req.maxFiles.coerceIn(1, 50), refresh = req.refresh)
+                svc.reviewDiff(req.project, req.diff, apiKey = llmKey, maxFiles = req.maxFiles.coerceIn(1, 50), refresh = req.refresh, repoUrl = req.repoUrl, repoToken = req.repoToken)
             }
             val out = Json { prettyPrint = true; encodeDefaults = true }.encodeToString(ReviewResult.serializer(), res).toByteArray()
             ex.responseHeaders.add("Content-Type", "application/json")
