@@ -550,7 +550,22 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     // --- база знаний ---
 
-    fun setAddStrategy(v: String) = update { it.copy(addStrategy = v) }
+    // Чанкинг — мультивыбор: «фикс» и «структура» тогглятся независимо,
+    // хотя бы один должен остаться включённым.
+    fun toggleChunkPart(part: String) = update { st ->
+        val fixed = st.addStrategy != "structure"
+        val structure = st.addStrategy != "fixed"
+        val nf = if (part == "fixed") !fixed else fixed
+        val ns = if (part == "structure") !structure else structure
+        if (!nf && !ns) st
+        else st.copy(
+            addStrategy = when {
+                nf && ns -> "both"
+                nf -> "fixed"
+                else -> "structure"
+            },
+        )
+    }
     fun openWiki() = update { it.copy(showWiki = true, wikiInput = "") }
     fun closeWiki() = update { it.copy(showWiki = false) }
     fun setWikiInput(v: String) = update { it.copy(wikiInput = v) }
@@ -565,7 +580,23 @@ class AppViewModel(private val scope: CoroutineScope) {
     fun openAddProject() = update { it.copy(showAddProject = true, projectNameInput = "", projectInput = "") }
     fun closeAddProject() = update { it.copy(showAddProject = false) }
     fun setProjectNameInput(v: String) = update { it.copy(projectNameInput = v) }
-    fun setProjectInput(v: String) = update { it.copy(projectInput = v) }
+
+    // Вставка URL/пути подставляет имя проекта из хвоста (после последнего
+    // слеша, без .git) — но только пока поле имени пустое: введённое
+    // вручную имя пользователя не затираем.
+    fun setProjectInput(v: String) = update { st ->
+        val auto = deriveProjectName(v)
+        st.copy(
+            projectInput = v,
+            projectNameInput = if (st.projectNameInput.isBlank() && auto.isNotBlank()) auto else st.projectNameInput,
+        )
+    }
+
+    private fun deriveProjectName(input: String): String {
+        val t = input.trim().trimEnd('/').substringAfterLast('/').substringAfterLast('\\').trim()
+        if (t.isEmpty()) return ""
+        return if (t.endsWith(".git", ignoreCase = true)) t.dropLast(4).trim() else t
+    }
 
     fun selectProject(name: String) {
         svc.selectProject(name)

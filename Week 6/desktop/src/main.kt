@@ -742,24 +742,22 @@ fun CreateChatDialog(vm: AppViewModel) {
 }
 
 @Composable
-fun ChunkStrategyPicker(selected: String, onSelect: (String) -> Unit) {
+fun ChunkStrategyPicker(selected: String, onToggle: (String) -> Unit) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-        Text("Чанкинг:", fontSize = 12.sp, color = Color.Gray)
+        Text("Чанкинг:", fontSize = 14.sp, fontWeight = FontWeight.Bold)
         Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            StrategyChip("Обе", "both", selected, onSelect)
-            StrategyChip("Фикс. размер", "fixed", selected, onSelect)
-            StrategyChip("По структуре", "structure", selected, onSelect)
+            FilterChip(
+                selected = selected != "structure",
+                onClick = { onToggle("fixed") },
+                label = { Text("Фикс. размер", fontSize = 12.sp) },
+            )
+            FilterChip(
+                selected = selected != "fixed",
+                onClick = { onToggle("structure") },
+                label = { Text("По структуре", fontSize = 12.sp) },
+            )
         }
     }
-}
-
-@Composable
-fun StrategyChip(label: String, value: String, selected: String, onSelect: (String) -> Unit) {
-    FilterChip(
-        selected = selected == value,
-        onClick = { onSelect(value) },
-        label = { Text(label, fontSize = 12.sp) },
-    )
 }
 
 @Composable
@@ -771,20 +769,20 @@ fun AddProjectDialog(vm: AppViewModel) {
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "Git-URL клонируется в локальные repos, путь — индексируется на месте.",
+                    "Git-URL клонируется в локальные repos, путь — индексируется на месте. Имя подставится из хвоста пути, можно править.",
                     fontSize = 11.sp, color = Color.Gray,
-                )
-                OutlinedTextField(
-                    value = st.projectNameInput, onValueChange = vm::setProjectNameInput,
-                    label = { Text("Имя (латиница)") },
-                    placeholder = { Text("my-service") },
-                    singleLine = true,
-                    modifier = Modifier.fillMaxWidth(),
                 )
                 OutlinedTextField(
                     value = st.projectInput, onValueChange = vm::setProjectInput,
                     label = { Text("Git-URL или локальный путь") },
                     placeholder = { Text("https://github.com/...git или /path/to/repo") },
+                    singleLine = true,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                OutlinedTextField(
+                    value = st.projectNameInput, onValueChange = vm::setProjectNameInput,
+                    label = { Text("Имя (латиница)") },
+                    placeholder = { Text("my-service") },
                     singleLine = true,
                     modifier = Modifier.fillMaxWidth().onPreviewKeyEvent { e ->
                         if (isConfirmKey(e) && st.projectNameInput.isNotBlank() && st.projectInput.isNotBlank()) {
@@ -793,7 +791,7 @@ fun AddProjectDialog(vm: AppViewModel) {
                         } else false
                     },
                 )
-                ChunkStrategyPicker(st.addStrategy, vm::setAddStrategy)
+                ChunkStrategyPicker(st.addStrategy, vm::toggleChunkPart)
             }
         },
         confirmButton = {
@@ -827,7 +825,7 @@ fun WikiDialog(vm: AppViewModel) {
                         } else false
                     },
                 )
-                ChunkStrategyPicker(st.addStrategy, vm::setAddStrategy)
+                ChunkStrategyPicker(st.addStrategy, vm::toggleChunkPart)
             }
         },
         confirmButton = { Button(onClick = vm::fetchWiki, enabled = st.wikiInput.isNotBlank()) { Text("Загрузить") } },
