@@ -129,6 +129,17 @@ class CrmTools(
     fun store(project: String = defaultProject): CrmStore =
         stores.computeIfAbsent(project) { CrmStore(it, appDir) }
 
+    // Какие проекты вообще есть в CRM на диске. Нужно, когда имя проекта задано
+    // секретом: в логах GitHub оно замаскировано, и не понятно, куда легли тикеты.
+    fun knownProjects(): List<String> {
+        val dir = File(appDir, "crm")
+        if (!dir.isDirectory) return emptyList()
+        return dir.listFiles { f -> f.isFile && f.name.endsWith(".json") && !f.name.endsWith(".overrides.json") }
+            ?.map { it.name.removeSuffix(".json") }
+            ?.sorted()
+            .orEmpty()
+    }
+
     fun registry(): McpToolRegistry = McpToolRegistry(defaultProject).apply {
         register(getTicket())
         register(listOpenTickets())

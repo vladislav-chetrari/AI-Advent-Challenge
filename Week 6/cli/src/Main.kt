@@ -422,8 +422,23 @@ private suspend fun runCommand(args: Array<String>) {
             val escalate = flag(rest, "--escalate")
             // --list без значения: splitPaths отнёс бы его в позиционные, смотрим args.
             val list = args.contains("--list")
+            val allProjects = args.contains("--projects")
             status?.let { require(it in TICKET_STATUSES) { "статус должен быть одним из: ${TICKET_STATUSES.joinToString(", ")}" } }
             val server = flag(rest, "--server") ?: vpsUrl()
+            if (allProjects) {
+                val server0 = flag(rest, "--server") ?: vpsUrl()
+                    ?: throw IllegalStateException("нужен --server <URL> или переменная VPS_URL")
+                val st = reviewOutJson.decodeFromString(
+                    CrmState.serializer(),
+                    postJson("$server0/crm/tickets", buildJsonObject { put("project", "*") }.toString()),
+                )
+                println("CRM на VPS:")
+                st.projects.forEach { p ->
+                    println("  ${p.project}: тикетов ${p.total}, открытых ${p.open}, импорт ${stamp(p.importedAt)}")
+                }
+                if (st.projects.isEmpty()) println("  (пусто — CRM ещё ни разу не заполнялась)")
+                return@runCommand
+            }
             if (list || (id == null && status == null)) {
                 val tickets = if (server != null) {
                     val body = postJson(
@@ -431,6 +446,13 @@ private suspend fun runCommand(args: Array<String>) {
                         buildJsonObject { put("project", project) }.toString(),
                     )
                     val st = reviewOutJson.decodeFromString(CrmState.serializer(), body)
+                    if (st.project == "*") {
+                        println("CRM на VPS:")
+                        st.projects.forEach { p ->
+                            println("  ${p.project}: тикетов ${p.total}, открытых ${p.open}, импорт ${stamp(p.importedAt)}")
+                        }
+                        return@runCommand
+                    }
                     println("CRM ${st.project}: импорт ${stamp(st.importedAt)}, открытых ${st.open}, эскалаций ${st.escalated}")
                     st.tickets
                 } else {
@@ -784,7 +806,7 @@ private fun usage() {
     println()
     println("week6 support-ask --chat <тикет> --message <текст> [--project <имя>] [--server <URL>] [--topK 8]")
     println("  Task 3: ответ ассистента поддержки. --server или переменная VPS_URL — по сети на VPS, иначе локально.")
-    println("week6 support-ticket --list | --id <тикет> [--status open|in-progress|needs-info|resolved|closed]")
+    println("week6 support-ticket --list | --projects | --id <тикет> [--status open|in-progress|needs-info|resolved|closed]")
     println("      [--assignee <ник>] [--comment <текст>] [--escalate <причина>]")
     println("  Task 3: контекст CRM и правки тикета (правка сразу меняет ответы бота).")
     println("week6 mcp-tools [--server <URL>]")

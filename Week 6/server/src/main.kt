@@ -8,6 +8,7 @@ import core.rag.RagService
 import core.rag.ReviewFreshness
 import core.rag.ReviewResult
 import core.support.CrmImportResult
+import core.support.CrmProjectBrief
 import core.support.CrmState
 import core.support.CrmTools
 import core.support.McpServer
@@ -311,6 +312,28 @@ fun main() {
                 json.decodeFromString(CrmPatchRequest.serializer(), body).project.ifBlank { defaultProject }
             } catch (_: Exception) {
                 defaultProject
+            }
+            // project="*" — показать, какие проекты вообще есть в CRM. Нужен, когда
+            // имя проекта задано секретом: в логах GitHub оно замаскировано.
+            if (project == "*") {
+                val briefs = crm.knownProjects().map { p ->
+                    val st = crm.store(p)
+                    val all = st.all()
+                    CrmProjectBrief(
+                        project = p,
+                        importedAt = st.importedAt(),
+                        open = all.count { it.status in setOf("open", "in-progress", "needs-info") },
+                        total = all.size,
+                    )
+                }
+                sendJson(
+                    ex, 200,
+                    outJson.encodeToString(
+                        CrmState.serializer(),
+                        CrmState(project = "*", projects = briefs),
+                    ),
+                )
+                return@createContext
             }
             val store = crm.store(project)
             val all = store.all()

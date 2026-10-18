@@ -444,4 +444,15 @@ data class CrmState(
     val open: Int = 0,
     val escalated: Int = 0,
     val tickets: List<SupportTicket> = emptyList(),
+    // Режим "*": какие проекты вообще есть в CRM (нужно, когда имя проекта задано
+    // секретом и не видно в логах).
+    val projects: List<CrmProjectBrief> = emptyList(),
+)
+
+@Serializable
+data class CrmProjectBrief(
+    val project: String = "",
+    val importedAt: Long = 0,
+    val open: Int = 0,
+    val total: Int = 0,
 )
