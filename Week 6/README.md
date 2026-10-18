@@ -53,3 +53,74 @@ cd "Week 6"
 - VPS перед каждым ревью best-effort подтягивает доки (`git pull` + доиндексация, `refresh`), неудача — строка в `warning`.
 - Промпт: `buildReviewSystem/buildReviewUser` в `core/src/rag/Prompts.kt` — строгий JSON без фенсов.
 - Деплой: `DEPLOY.md` + `Dockerfile.review-server`.
+
+## Task 3 — Ассистент поддержки (День 33)
+
+CRM = **GitHub Issues продукта** (лейбл `support` + `status:*`). Ночной workflow выгружает
+тикеты на VPS, сервер разбирает front-matter, раскладывает их в CRM и кладёт в **тот же
+RAG-индекс**, что и FAQ — поэтому «такая же ошибка была у других» находится по описанию,
+а не только по номеру.
+
+Продукт для демо — [CallowFellow](https://github.com/vladislav-chetrari/CallowFellow):
+FAQ в `support/faq.md`, тикеты — Issues с профилем пользователя во front-matter.
+
+### Поток одного сообщения
+
+```
+CLI/UI: support-ask --chat 1042 --message "модель падает на 80%"
+   └─▶ VPS POST /support/ask
+         ├─ MCP-клиент ─▶ POST /mcp  get_ticket(1042)          ← статус, ответственный, обходной путь
+         ├─ RAG          ─▶ FAQ + docs проекта (top-K, цитаты [N])
+         ├─ MCP-клиент ─▶ POST /mcp  search_tickets(query)      ← только если FAQ не ответил
+         └─ DeepSeek     ─▶ ответ: признать проблему, опереться на тикет, дать шаг
+```
+
+Один диалог = один тикет (`chatId == ticketId`), история — в `support_chats.json`.
+
+### Ключевые решения
+
+- **Тикет авторитетнее FAQ.** Статус, ответственный, срок и обходной путь берутся только
+  из CRM. Если срока в тикете нет — бот обязан сказать «ориентира по срокам пока нет».
+- **Что говорить по статусу, считает код, а не модель** (`ticketGuidance`): мелкие LLM путают
+  `resolved` и `in-progress`. Поведение воспроизводимо и не зависит от настроек модели.
+- **Запрет выдумок** — правила 7–9 в `buildSupportSystem` + отрицательный пример («настройки →
+  Система → Диагностика») и потолок `max_tokens = 500`: на длинных ответах модель
+  расписывает несуществующие пути и срывается на другой язык.
+- **Порядок блоков промпта и бюджет на каждый** (`buildSupportUser`): общий лимит раньше
+  резал промпт с конца, из-за чего выпадал именно FAQ — модель отвечала, не видя цитат.
+- **Деградация без эмбеддингов**: если Ollama недоступна, ассистент отвечает по тикету из CRM
+  и честно пишет об этом в `warning`, вместо того чтобы молчать или упасть.
+- **Ночная выгрузка не затирает ручные правки**: снимок GitHub — в `crm/<project>.json`,
+  локальные изменения (статус, комментарий, эскалация) — в `crm/<project>.overrides.json`.
+
+### Команды
+
+```sh
+support-ask   --chat 1042 --message "текст" [--project CallowFellow] [--server URL] [--topK 8]
+support-ticket --list | --id 1042 [--status in-progress] [--assignee ilya] [--comment "..."] [--escalate "..."]
+mcp-tools     [--server URL]                      # tools/list CRM-сервера по MCP
+support-eval  --cases support/cases.json          # 8 кейсов: тикет/статус/фразы/запрещённое
+verify-support                                   # оффлайн-проверка слоя, без сети и БД
+```
+
+`--server` (или `$VPS_URL`) — работа по сети на VPS; без него тот же код исполняется локально.
+Ключ LLM — из `DEEPSEEK_API_KEY` в env (на VPS прилетает в `X-LLM-Key`).
+
+### Эндпоинты
+
+| Метод | Путь | Назначение |
+|---|---|---|
+| POST | `/support/ask` | одно сообщение пользователя → `SupportReply` |
+| POST | `/mcp` | CRM как MCP-сервер (JSON-RPC 2.0: `initialize`, `tools/list`, `tools/call`) |
+| POST | `/crm/import` | выгрузка тикетов из Issues + индексация их в RAG |
+| POST | `/crm/tickets` | текущее состояние CRM |
+| POST | `/crm/ticket` | правка тикета: статус, ответственный, комментарий, эскалация |
+
+MCP-тулы: `get_ticket`, `list_open_tickets`, `search_tickets`, `get_user_tickets`.
+
+### Подключение к продукту
+
+Скопировать в репозиторий продукта `integration/support-index.yml` →
+`.github/workflows/support-index.yml`, задать `VPS_URL`, `VPS_TOKEN` и
+(необязательно) `TICKET_LABEL`. Демо-тикеты создаются скриптом
+`scripts/seed_support_tickets.py`. Подробности — `integration/README.md`.

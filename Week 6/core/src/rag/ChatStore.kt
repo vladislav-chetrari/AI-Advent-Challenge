@@ -38,9 +38,14 @@ data class ChatState(
 
 fun newChatId(): String = java.util.UUID.randomUUID().toString().take(8)
 
-class ChatStore(appDir: File = ApiKeyProvider.appDir()) {
+class ChatStore(
+    appDir: File = ApiKeyProvider.appDir(),
+    // Task 3: поддержка ведёт переписку в отдельном файле — десктопные чаты
+    // разработчика не должны мешаться с диалогами саппорта по тикетам.
+    fileName: String = "chats.json",
+) {
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
-    private val file = File(appDir, "chats.json")
+    private val file = File(appDir, fileName)
     private val lock = Any()
 
     @Volatile

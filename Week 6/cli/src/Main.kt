@@ -1,5 +1,6 @@
 package cli
 
+import core.llm.ApiKeyProvider
 import core.rag.ChatStore
 import core.rag.DEFAULT_FINAL_K
 import core.rag.DEFAULT_MIN_SCORE
@@ -11,8 +12,25 @@ import core.rag.RagService
 import core.rag.RerankModes
 import core.rag.ReviewResult
 import core.rag.newChatId
+import core.support.CrmState
+import core.support.CrmTools
+import core.support.McpClient
+import core.support.RawIssue
+import core.support.SupportReply
+import core.support.SupportService
+import core.support.SupportTicket
+import core.support.TICKET_STATUSES
+import java.net.URI
+import java.net.http.HttpClient
+import java.net.http.HttpRequest
+import java.net.http.HttpResponse
+import java.time.Duration
 import kotlinx.coroutines.runBlocking
+import kotlinx.serialization.Serializable
+import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 
 // Общий сериализатор для review.json: полные дефолты, чтобы post_review.py
 // и VPS всегда видели одинаковую схему.
@@ -341,6 +359,225 @@ private suspend fun runCommand(args: Array<String>) {
             // Машиночитаемый итог для Action: число inline-комментов в stderr-строке.
             System.err.println("REVIEW_COMMENTS=${res.comments.size} FILES=${res.filesReviewed}")
         }
+        // ===== Task 3 (День 33): ассистент поддержки =====
+        // Одно сообщение пользователя в диалоге по тикету. chatId == номер тикета.
+        //   support-ask --chat 1042 --message "текст" [--project CallowFellow] [--server URL | --local] [--topK 8]
+        // --server: по умолчанию берётся $VPS_URL, иначе работаем локально (тот же код).
+        "support-ask" -> {
+            val (_, rest) = splitPaths(args)
+            val chatId = flag(rest, "--chat") ?: fail("нужен --chat <номер тикета>")
+            val message = flags(rest, "--message").joinToString(" ").ifBlank { fail("нужен --message <текст обращения>") }
+            val project = flag(rest, "--project") ?: supportProject()
+            val topK = flag(rest, "--topK")?.toIntOrNull()?.coerceIn(1, 20) ?: 8
+            val server = flag(rest, "--server") ?: vpsUrl()
+            if (server != null) {
+                val key = System.getenv("DEEPSEEK_API_KEY")?.trim()?.takeIf { it.isNotBlank() }
+                val payload = buildJsonObject {
+                    put("project", project)
+                    put("chatId", chatId)
+                    put("message", message)
+                    put("topK", topK)
+                }
+                val body = postJson("$server/support/ask", payload.toString(), key = key)
+                val reply = reviewOutJson.decodeFromString(SupportReply.serializer(), body)
+                printReply(reply)
+            } else {
+                val crm = localCrmFor(project)
+                val chats = ChatStore(ApiKeyProvider.appDir(), "support_chats.json")
+                val history = chats.state.messages[chatId].orEmpty().takeLast(12)
+                val key = System.getenv("DEEPSEEK_API_KEY")?.trim()?.takeIf { it.isNotBlank() }
+                val reply = SupportService.ask(
+                    rag = svc, project = project, chatId = chatId, message = message,
+                    apiKey = key, history = history, crm = crm, topK = topK,
+                    onLog = { m -> System.err.println("  · $m") },
+                )
+                chats.appendMessage(chatId, RagMessage("user", message))
+                chats.appendMessage(chatId, RagMessage("assistant", reply.text, refs = reply.faqRefs))
+                printReply(reply)
+            }
+        }
+        // Контекст CRM: список тикетов / правка статуса. Правки живут на VPS и
+        // сразу меняют ответы бота — на видео это «разработчик взял тикет в работу».
+        //   support-ticket --list | --id 1042 [--status in-progress] [--assignee ilya] [--comment "..."] [--escalate "..."]
+        "support-ticket" -> {
+            val (_, rest) = splitPaths(args)
+            val project = flag(rest, "--project") ?: supportProject()
+            val id = flag(rest, "--id")
+            val status = flag(rest, "--status")
+            val assignee = flag(rest, "--assignee")
+            val comment = flag(rest, "--comment")
+            val escalate = flag(rest, "--escalate")
+            // --list без значения: splitPaths отнёс бы его в позиционные, смотрим args.
+            val list = args.contains("--list")
+            status?.let { require(it in TICKET_STATUSES) { "статус должен быть одним из: ${TICKET_STATUSES.joinToString(", ")}" } }
+            val server = flag(rest, "--server") ?: vpsUrl()
+            if (list || (id == null && status == null)) {
+                val tickets = if (server != null) {
+                    val body = postJson(
+                        "$server/crm/tickets",
+                        buildJsonObject { put("project", project) }.toString(),
+                    )
+                    val st = reviewOutJson.decodeFromString(CrmState.serializer(), body)
+                    println("CRM ${st.project}: импорт ${stamp(st.importedAt)}, открытых ${st.open}, эскалаций ${st.escalated}")
+                    st.tickets
+                } else {
+                    localCrmFor(project).store(project).all()
+                }
+                if (tickets.isEmpty()) println("CRM пуста — запусти support-index или импортируй тикеты") else tickets.forEach { printTicketLine(it) }
+            } else {
+                requireNotNull(id) { "нужен --id <номер тикета>" }
+                val ticket = if (server != null) {
+                    val payload = buildJsonObject {
+                        put("project", project)
+                        put("ticketId", id)
+                        put("status", status)
+                        put("assignee", assignee)
+                        put("comment", comment)
+                        put("escalate", escalate)
+                    }
+                    reviewOutJson.decodeFromString(
+                        SupportTicket.serializer(),
+                        postJson("$server/crm/ticket", payload.toString()),
+                    )
+                } else {
+                    val store = localCrmFor(project).store(project)
+                    store.patch(id, status = status, assignee = assignee, comment = comment)
+                    val esc = escalate?.takeIf { it.isNotBlank() }
+                    (if (esc != null) store.escalate(id, esc) else store.get(id))
+                        ?: throw IllegalStateException("тикет #$id не найден")
+                }
+                println("обновлён:")
+                printTicketLine(ticket)
+            }
+        }
+        // CRM как MCP-сервер: initialize + tools/list. Показывает, что поддержка
+        // говорит с CRM по протоколу, а не прямым вызовом.
+        //   mcp-tools [--server URL]
+        "mcp-tools" -> {
+            val (_, rest) = splitPaths(args)
+            val server = flag(rest, "--server") ?: vpsUrl() ?: throw IllegalStateException("нужен --server <URL> или переменная VPS_URL")
+            McpClient(server, vpsToken()).use { mcp ->
+                val info = mcp.initialize()
+                println("MCP сервер: ${info["name"]} ${info["version"]}")
+                val tools = mcp.toolsList()
+                println("тулов: ${tools.size}")
+                tools.forEach { println("  · ${it.name} — ${it.description}") }
+            }
+        }
+        // Прогон кейсов качества: сколько ответов подкреплены тикетом/FAQ и не содержат
+        // запрещённого. Ничего не «подкручивает» — только меряет.
+        //   support-eval --cases support/cases.json [--project P] [--server URL | --local]
+        "support-eval" -> {
+            val (_, rest) = splitPaths(args)
+            val casesPath = flag(rest, "--cases") ?: fail("нужен --cases <файл>")
+            val project = flag(rest, "--project") ?: supportProject()
+            val server = flag(rest, "--server") ?: vpsUrl()
+            val suite = reviewOutJson.decodeFromString(SupportSuite.serializer(), java.io.File(casesPath).readText())
+            val cases = suite.cases.map { if (it.project.isBlank()) it.copy(project = project) else it }
+            var passed = 0
+            cases.forEachIndexed { i, c ->
+                val reply = askSupport(svc, c, server)
+                val reasons = checkCase(c, reply)
+                val ok = reasons.isEmpty()
+                if (ok) passed++
+                println("#${i + 1} ${if (ok) "OK  " else "FAIL"} [${c.chatId}] ${c.message.take(70)}")
+                if (!ok) reasons.forEach { println("       ✗ $it") }
+                println("       ${reply.text.replace('\n', ' ').take(160)}")
+            }
+            println("SUPPORT-EVAL $passed/${cases.size}")
+        }
+        // Чистый оффлайн-тест слоя поддержки: фронтматтер, маппинг тикета, MCP-эндпоинты,
+        // промпт и CrmStore. Без сети и без БД — как verify-review для Task 2.
+        "verify-support" -> {
+            // 1) Фронтматтер из тела Issue.
+            val body = "---\nticket:\n  user:\n    id: u17\n    name: Ирина\n    plan: pro\n    device: Pixel 8\n  status: in-progress\n  assignee: \"@ilya\"\n  workaround: положить .litertlm в models/llm/\n---\n\nМодель падает на 80%"
+            val (fm, rest) = core.support.FrontMatter.split(body)
+            val map = core.support.FrontMatter.parseMap(fm)
+            check(rest.trim() == "Модель падает на 80%") { "тело тикета не отделено: $rest" }
+            check(map["ticket.user.id"] == "u17") { "вложенный ключ: $map" }
+            check(map["ticket.workaround"]?.startsWith("положить") == true) { "значение с двоеточием: $map" }
+
+            // 2) Issue -> тикет.
+            val issue = RawIssue(
+                number = 1042, title = "Модель не скачивается",
+                body = body, state = "open",
+                labels = listOf("support", "type:bug", "severity:major", "status:in-progress", "component:models"),
+                url = "https://github.com/o/r/issues/1042",
+            )
+            val t = core.support.TicketMapper.toTicket(issue)
+            check(t.id == "1042" && t.status == "in-progress") { "статус тикета: ${t.status}" }
+            check(t.assignee == "ilya") { "assignee без @: ${t.assignee}" }
+            check(t.component == "models" && t.severity == "major") { "лейблы: ${t.component}/${t.severity}" }
+            check(t.user.id == "u17" && t.user.plan == "pro") { "профиль юзера: ${t.user}" }
+            check(t.workaround.isNotBlank()) { "нет обходного пути" }
+            check(t.body == "Модель падает на 80%") { "в тело тикета попал фронтматтер" }
+            val closed = core.support.TicketMapper.toTicket(issue.copy(state = "closed", labels = listOf("status:resolved")))
+            check(closed.status == "resolved") { "лейбл важнее state: ${closed.status}" }
+
+            // 3) Блок тикета: шапка, статус, отсутствие выдуманного срока.
+            val sum = core.support.ticketSummary(t, full = true)
+            check(sum.startsWith("Тикет #1042")) { "шапка блока: ${sum.take(40)}" }
+            check(SupportService.ticketStatusOf(sum) == "in-progress") { "статус из блока" }
+            check(sum.contains("Ориентир по сроку: не задан")) { "срок не выдуман, но и не назван" }
+            check(SupportService.ticketIdOf(sum) == "1042") { "номер из блока" }
+
+            // 4) Источники тикетов в RAG изолированы от доков.
+            check(core.support.ticketPrefix("CallowFellow") == "proj:CallowFellow:support/tickets/") { "префикс" }
+            check(core.support.ticketSource("CallowFellow", "7") == "proj:CallowFellow:support/tickets/7.md") { "source тикета" }
+
+            // 5) MCP: JSON-RPC без сети — сам сервер и реестр тулов.
+            val dir = java.nio.file.Files.createTempDirectory("crm-verify").toFile()
+            val crm = CrmTools("CallowFellow", dir)
+            val server = McpServerProbe(crm)
+            val init = server.handle("""{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}""")
+            val proto = core.support.MCP_PROTOCOL_VERSION
+            check(init.contains(proto) && init.contains("callowfellow-support-crm")) { "initialize: $init" }
+            val list = server.handle("""{"jsonrpc":"2.0","id":2,"method":"tools/list"}""")
+            listOf("get_ticket", "list_open_tickets", "search_tickets", "get_user_tickets").forEach {
+                check(list.contains("\"$it\"")) { "тул $it не в tools/list" }
+            }
+            check(server.handle("""{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"get_ticket","arguments":{"ticketId":"404"}}}""")
+                .contains("не найден")) { "тул на несуществующий тикет должен честно сказать об этом" }
+            val schemas = server.handle("""{"jsonrpc":"2.0","id":4,"method":"tools/list"}""")
+            check(schemas.contains("ticketId") && schemas.contains("inputSchema") && schemas.contains("required")) { "схема тула в tools/list" }
+            check(server.handle("""{"jsonrpc":"2.0","id":5,"method":"нет-такого"}""").contains("-32601")) { "неизвестный метод" }
+            check(server.handle("""{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"нет-тула"}}""").contains("нет тула")) { "неизвестный тул" }
+            check(server.handle("""{"jsonrpc":"2.0","id":7,"method":"tools/list"}""").isNotEmpty()) { "tools/list без id" }
+
+            // 6) CrmStore: импорт -> правка -> повторный импорт не затирает правки.
+            val store = crm.store("CallowFellow")
+            store.import(listOf(issue, issue.copy(number = 1043, title = "Нужен ключ DeepSeek",
+                body = "---\nticket:\n  type: question\n---\nГде ключ?", labels = listOf("support"))))
+            check(store.all().size == 2) { "импортировано ${store.all().size}" }
+            check(store.get("1043")?.type == "question") { "тип из фронтматтера" }
+            check(store.open().size == 2) { "оба тикета открыты" }
+            store.patch("1043", status = "resolved", comment = "починили в 0.1.1")
+            check(store.get("1043")?.status == "resolved") { "локальный статус" }
+            store.escalate("1043", "нет ответа разработчика")
+            check(store.get("1043")?.escalated == true) { "эскалация" }
+            store.import(listOf(issue, issue.copy(number = 1043, title = "Нужен ключ DeepSeek",
+                body = "---\nticket:\n  type: question\n---\nГде ключ?", labels = listOf("status:in-progress"))))
+            check(store.get("1043")?.status == "resolved") { "ночной импорт затёр локальную правку" }
+            check(store.get("1043")?.notes?.any { it.contains("починили") } == true) { "комментарий потерян" }
+            check(store.open().size == 1) { "после resolved открытых должен остаться один" }
+
+            // 7) Промпт: тикет авторитетнее FAQ, сроки запрещены.
+            val sys = core.rag.buildSupportSystem("CallowFellow", sum, 2, "")
+            check(sys.contains("ДАННЫЕ ТИКЕТА ИЗ CRM")) { "блок тикета не попал в системный промпт" }
+            check(sys.contains("ориентира по срокам пока нет")) { "правило про отсутствие срока" }
+            check(sys.contains("первой фразой") || sys.contains("Первой фразой")) { "правило реакции на пользователя" }
+            val user = core.rag.buildSupportUser(sum, "[1] FAQ: обходной путь", "", "модель падает")
+            check(user.contains("ДАННЫЕ ТИКЕТА") && user.contains("FAQ:")) { "блоки в user-промпте" }
+            // Длинная история не должна выдавливать FAQ: раньше общий лимит резал
+            // промпт с конца, и модель отвечала, не увидев цитат.
+            val longHistory = (1..40).joinToString("\n") { "реплика $it " + "х".repeat(200) }
+            val big = core.rag.buildSupportUser(sum, "[1] FAQ: важная цитата", longHistory, "вопрос")
+            check(big.contains("FAQ:") && big.contains("важная цитата")) { "FAQ вытеснен историей" }
+            check(big.length <= core.rag.PROMPT_MAX_CHARS) { "промпт длиннее лимита: ${big.length}" }
+            check(big.indexOf("ДАННЫЕ ТИКЕТА") < big.indexOf("ФРАГМЕНТЫ FAQ")) { "тикет должен идти перед FAQ" }
+
+            println("VERIFY-SUPPORT PASSED")
+        }
         // Скрытый дымовой тест новых путей: RAG вкл/выкл, фильтр документов. He для видео.
         "selftest" -> {
             val docs = svc.indexedDocs()
@@ -368,6 +605,138 @@ private suspend fun runCommand(args: Array<String>) {
         }
         else -> usage()
     }
+}
+
+// ===== Task 3: кейсы качества и помощники CLI поддержки =====
+
+@Serializable
+private data class SupportCase(
+    val chatId: String = "",
+    val message: String = "",
+    val project: String = "",
+    // Должен ли был сработать тикет (null = не проверяем).
+    val expectTicket: Boolean? = null,
+    val expectStatus: String = "",
+    // Хотя бы одна из фраз должна прозвучать в ответе (без учёта регистра).
+    val expectAny: List<String> = emptyList(),
+    // Фразы, которых в ответе быть не должно (обещания сроков, выдумки).
+    val forbidAny: List<String> = emptyList(),
+)
+
+@Serializable
+private data class SupportSuite(
+    val project: String = "",
+    val cases: List<SupportCase> = emptyList(),
+)
+
+// Общий HTTP-клиент CLI к VPS: тот же Bearer, что у сервера, ключ LLM — заголовком.
+private val http: HttpClient = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(15)).build()
+
+private fun vpsUrl() = System.getenv("VPS_URL")?.trim()?.takeIf { it.isNotBlank() }
+
+private fun vpsToken() = System.getenv("VPS_TOKEN")?.trim().orEmpty()
+
+private fun llmKey() = System.getenv("DEEPSEEK_API_KEY")?.trim()?.takeIf { it.isNotBlank() }
+
+private fun supportProject() =
+    System.getenv("SUPPORT_PROJECT")?.trim()?.takeIf { it.isNotBlank() } ?: "CallowFellow"
+
+private fun postJson(url: String, payload: String, key: String? = llmKey()): String {
+    val res = http.send(
+        HttpRequest.newBuilder(URI.create(url))
+            .timeout(Duration.ofMinutes(10))
+            .header("Content-Type", "application/json")
+            .header("Authorization", "Bearer ${vpsToken()}")
+            .apply { if (key != null) header("X-LLM-Key", key) }
+            .POST(HttpRequest.BodyPublishers.ofString(payload))
+            .build(),
+        HttpResponse.BodyHandlers.ofString(),
+    )
+    if (res.statusCode() !in 200..299) {
+        throw IllegalStateException("VPS HTTP ${res.statusCode()}: ${res.body().take(300)}")
+    }
+    return res.body()
+}
+
+private fun stamp(ms: Long) = if (ms <= 0) "нет" else java.time.Instant.ofEpochMilli(ms).toString()
+
+private fun localCrmFor(project: String) =
+    CrmTools(project) { p, q, l -> SupportService.searchTicketRefs(localSvc(), p, q, l) }
+
+// RagService для локальных хелперов: создаётся один раз на процесс.
+private var localSvcInstance: RagService? = null
+
+private fun localSvc(): RagService =
+    localSvcInstance ?: RagService().also { localSvcInstance = it }
+
+private suspend fun askSupport(svc: RagService, c: SupportCase, server: String?): SupportReply =
+    if (server != null) {
+        val payload = buildJsonObject {
+            put("project", c.project)
+            put("chatId", c.chatId)
+            put("message", c.message)
+        }
+        reviewOutJson.decodeFromString(SupportReply.serializer(), postJson("$server/support/ask", payload.toString()))
+    } else {
+        SupportService.ask(
+            rag = svc, project = c.project, chatId = c.chatId, message = c.message,
+            apiKey = llmKey(), crm = localCrmFor(c.project),
+        )
+    }
+
+// Проверка кейса: тикет/статус + обязательные фразы − запрещённые.
+private fun checkCase(c: SupportCase, r: SupportReply): List<String> {
+    val bad = mutableListOf<String>()
+    val text = r.text.lowercase()
+    if (c.expectTicket != null && r.usedTicket != c.expectTicket) {
+        bad += "тикет usedTicket=${r.usedTicket}, ждали ${c.expectTicket}"
+    }
+    if (c.expectStatus.isNotBlank() && r.ticketStatus != c.expectStatus) {
+        bad += "статус тикета «${r.ticketStatus}» != «${c.expectStatus}»"
+    }
+    if (c.expectAny.isNotEmpty() && c.expectAny.none { it.lowercase() in text }) {
+        bad += "в ответе нет ни одной из фраз: ${c.expectAny.joinToString(" / ")}"
+    }
+    c.forbidAny.forEach { if (it.lowercase() in text) bad += "запрещённая фраза в ответе: $it" }
+    return bad
+}
+
+private fun printReply(r: SupportReply) {
+    println(r.text)
+    println()
+    println("— чат #${r.chatId} · " + (if (r.usedTicket) "тикет #${r.ticketId} (${r.ticketStatus})" else "тикет не найден, только FAQ"))
+    if (r.faqRefs.isNotEmpty()) {
+        println("— источники:")
+        r.faqRefs.forEach { println("  [${it.index}] ${it.title}${if (it.section.isNotBlank()) " / ${it.section}" else ""} · ${"%.2f".format(it.score)}") }
+    } else {
+        println("— источников FAQ нет")
+    }
+    if (r.refused) println("— честный отказ: в базе ничего не нашлось, LLM не звали")
+    if (r.escalated) println("— эскалировано: ${r.escalateReason}")
+    if (r.historyUsed > 0) println("— истории диалога в промпте: ${r.historyUsed} реплик")
+    if (r.warning.isNotBlank()) println("— предупреждение: ${r.warning}")
+}
+
+private fun printTicketLine(t: SupportTicket) {
+    println("#${t.id} [${core.support.ticketStatusName(t.status)}] ${t.title}")
+    val bits = buildList {
+        add("${t.type}/${t.severity}")
+        if (t.component.isNotBlank()) add(t.component)
+        if (t.assignee.isNotBlank()) add(t.assignee)
+        if (t.eta.isNotBlank()) add("срок: ${t.eta}")
+        if (t.workaround.isNotBlank()) add("обходной путь: ${t.workaround.take(70)}")
+        if (t.fix.isNotBlank()) add("фикс: ${t.fix.take(70)}")
+    }
+    println("   ${bits.joinToString(" · ")}")
+    println("   юзер: ${t.user.name} (${t.user.id}, план ${t.user.plan}, ${t.user.device} ${t.user.os}, ${t.user.app})")
+    if (t.escalated) println("   ЭСКАЛАЦИЯ: ${t.escalatedReason}")
+    t.notes.forEach { println("   комментарий: $it") }
+}
+
+// Проба MCP-слоя без сети: handle() — чистая функция над JSON-строкой.
+private class McpServerProbe(crm: CrmTools) {
+    private val server = core.support.McpServer(crm.registry())
+    suspend fun handle(body: String): String = server.handle(body)
 }
 
 private fun fail(msg: String): Nothing {
@@ -399,6 +768,18 @@ private fun usage() {
     println("  Task 2: добавить проект в RAG (для headless VPS; git-URL клонируется в repos/<имя>).")
     println("week6 project-list | project-update --name <имя>")
     println("  Task 2: список проектов / обновить индекс (git pull + доиндексация).")
+    println()
+    println("week6 support-ask --chat <тикет> --message <текст> [--project <имя>] [--server <URL>] [--topK 8]")
+    println("  Task 3: ответ ассистента поддержки. --server или переменная VPS_URL — по сети на VPS, иначе локально.")
+    println("week6 support-ticket --list | --id <тикет> [--status open|in-progress|needs-info|resolved|closed]")
+    println("      [--assignee <ник>] [--comment <текст>] [--escalate <причина>]")
+    println("  Task 3: контекст CRM и правки тикета (правка сразу меняет ответы бота).")
+    println("week6 mcp-tools [--server <URL>]")
+    println("  Task 3: tools/list CRM-сервера по MCP.")
+    println("week6 support-eval --cases <файл.json> [--project <имя>] [--server <URL>]")
+    println("  Task 3: прогон кейсов качества (тикет сработал / фразы есть / запрещённого нет).")
+    println("week6 verify-support")
+    println("  Task 3: оффлайн-проверка слоя поддержки (фронтматтер, MCP, промпт, CRM).")
 }
 
 // Task 5: чат по имени для CLI — тот же ChatStore, что у desktop.

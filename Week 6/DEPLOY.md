@@ -63,3 +63,48 @@ export PORT=8080 VPS_TOKEN=$(openssl rand -hex 32)
 `.github/workflows/week6-review.yml` — тот же принцип, но ревьюит PR этого
 репозитория локально (Amper CLI в раннере, без VPS) либо через VPS, если задан
 `VPS_URL`. Режим выбирается автоматически по наличию секрета.
+
+## 7. Task 3 — поддержка пользователей на том же VPS
+
+Ничего ставить не нужно: тот же `server` модуль и тот же процесс на `:8080`.
+CRM — это GitHub Issues продукта, они приезжают ночным workflow и складываются в
+`~/.ai-advent-week6/crm/<project>.json`.
+
+Новые эндпоинты (auth — тот же `Authorization: Bearer $VPS_TOKEN`):
+
+| Путь | Что делает |
+|---|---|
+| `POST /support/ask` | одно сообщение пользователя → `SupportReply` |
+| `POST /mcp` | CRM как MCP-сервер (JSON-RPC 2.0) |
+| `POST /crm/import` | выгрузка тикетов из Issues + индексация их в RAG |
+| `POST /crm/tickets`, `POST /crm/ticket` | состояние CRM и правка тикета |
+
+`DEEPSEEK_API_KEY` по-прежнему прилетает per-request в `X-LLM-Key` — на диск не пишется.
+Ollama нужна как и раньше: тикеты кладутся в RAG-индекс (`bge-m3`).
+
+Проверка после деплоя:
+
+```sh
+# CRM жива: список тикетов
+curl -s -X POST http://127.0.0.1:8080/crm/tickets \
+  -H "Authorization: Bearer $VPS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"project":"CallowFellow"}'
+
+# CRM говорит по MCP
+./kotlin run --module cli -- mcp-tools --server https://<vps>
+
+# ответ ассистента (ключ придёт из env)
+./kotlin run --module cli -- support-ask --chat 1042 \
+  --message "модель падает на 80%" --server https://<vps>
+```
+
+Подключение продукта — `integration/support-index.yml` + секреты `VPS_URL`, `VPS_TOKEN`
+(см. `integration/README.md`). FAQ продукта индексируется сам: это обычный `*.md`.
+
+Что стоит знать при эксплуатации:
+
+- `/crm/import` best-effort по индексации: если Ollama лежит, CRM и точный доступ к
+  тикетам работают, пропадает только семантический поиск по обращениям;
+- ночная выгрузка GitHub **не затирает** ручные правки (`crm/<project>.overrides.json`);
+- при недоступных эмбеддингах `/support/ask` отвечает по тикету и пишет предупреждение
+  в `warning`, а не падает.

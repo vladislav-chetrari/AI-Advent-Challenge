@@ -72,6 +72,27 @@ class RagService(
     private fun llmProviderLabel(): String =
         explicitLlm?.label ?: llmSettings.effective().label()
 
+    // Task 3 (поддержка): у саппорта свой системный промпт (роль оператора + блок
+    // тикета), поэтому он зовёт LLM напрямую — тем же клиентом, ключом и температурой,
+    // что и остальной RAG. Отдельный клиент ему не нужен.
+    suspend fun askLlm(
+        system: String,
+        user: String,
+        apiKey: String? = null,
+        temperature: Double = SUPPORT_TEMPERATURE,
+        // Ответ оператора — 1-3 абзаца. Потолок нужен не для экономии, а против
+        // длинных выдумок: на 500 токенах модель не успевает расписать несуществующие
+        // пути по настройкам и соскочить на другой язык.
+        maxTokens: Int? = SUPPORT_MAX_TOKENS,
+    ): LlmResult =
+        llm().complete(listOf(ChatMsg("system", system), ChatMsg("user", user)), llmApiKey(apiKey), temperature, maxTokens)
+
+    // Task 3: ключ по тем же правилам, что и у ask(): облако требует DEEPSEEK_API_KEY,
+    // локальной Ollama ключ не нужен.
+    fun resolveApiKey(explicit: String? = null): String? = llmApiKey(explicit)
+
+    fun llmLabelOrProvider(): String = llmProviderLabel()
+
     // Короткий label для UI: "deepseek:deepseek-chat" | "ollama:qwen3:32b · localhost:11434".
     val llmLabel: String get() = explicitLlm?.label ?: llmSettings.effective().label()
 

@@ -1,9 +1,22 @@
 package server
 
+import com.sun.net.httpserver.HttpExchange
 import com.sun.net.httpserver.HttpServer
+import core.rag.ChatStore
+import core.rag.RagMessage
 import core.rag.RagService
 import core.rag.ReviewFreshness
 import core.rag.ReviewResult
+import core.support.CrmImportResult
+import core.support.CrmState
+import core.support.CrmTools
+import core.support.McpServer
+import core.support.RawIssue
+import core.support.SUPPORT_TOP_K
+import core.support.SupportReply
+import core.support.SupportService
+import core.support.SupportTicket
+import core.support.TICKET_STATUSES
 import java.net.InetSocketAddress
 import java.util.concurrent.Executors
 import kotlinx.coroutines.runBlocking
@@ -37,6 +50,38 @@ private data class IndexRequest(
     val project: String? = null,
     val repoUrl: String? = null,
     val repoToken: String? = null,
+)
+
+// ===== Task 3: поддержка пользователей =====
+
+// CRM-выгрузка из GitHub Issues (её собирает ночной workflow support-index).
+// Сервер сам разбирает front-matter тикетов и кладёт их в RAG-индекс.
+@Serializable
+private data class CrmImportRequest(
+    val project: String = "",
+    val issues: List<RawIssue> = emptyList(),
+)
+
+// Локальная правка тикета: «разработчик взял в работу», «починил», «эскалировали».
+@Serializable
+private data class CrmPatchRequest(
+    val project: String = "",
+    val ticketId: String = "",
+    val status: String? = null,
+    val assignee: String? = null,
+    val comment: String? = null,
+    // Непустое значение = эскалировать обращение с этой причиной.
+    val escalate: String? = null,
+)
+
+// Одно сообщение пользователя в диалоге по тикету.
+@Serializable
+private data class SupportAskRequest(
+    val project: String = "",
+    // chatId == номер тикета: диалог и обращение — одна сущность.
+    val chatId: String = "",
+    val message: String = "",
+    val topK: Int = SUPPORT_TOP_K,
 )
 
 private val json = Json { prettyPrint = false; ignoreUnknownKeys = true; isLenient = true }
@@ -156,6 +201,248 @@ fun main() {
             ex.close()
         }
     }
+    // ===== Task 3: ассистент поддержки =====
+    //
+    // CRM — это MCP-сервер на /mcp; бот ходит в него по MCP, а не зовёт Kotlin-функции.
+    // Тикеты ежедневно приезжают из GitHub Issues через /crm/import (ночной workflow).
+    val defaultProject = System.getenv("SUPPORT_PROJECT")?.trim()?.takeIf { it.isNotBlank() } ?: "CallowFellow"
+    val crm = CrmTools(defaultProject) { p, q, l -> SupportService.searchTicketRefs(svc, p, q, l) }
+    val mcpServer = McpServer(crm.registry())
+    // История диалогов живёт рядом с CRM: отдельный chats.json, чтобы не мешать
+    // чатам десктоп-ассистента разработчика.
+    val supportChats = ChatStore(svcAppDir(), "support_chats.json")
+
+    // POST /mcp — CRM как MCP-сервер (JSON-RPC 2.0).
+    server.createContext("/mcp") { ex ->
+        try {
+            if (ex.requestMethod != "POST") {
+                ex.sendResponseHeaders(405, -1)
+                return@createContext
+            }
+            if (!authed(ex, token)) return@createContext
+            val body = ex.requestBody.bufferedReader().readText()
+            val out = runBlocking { mcpServer.handle(body) }
+            if (out.isEmpty()) {
+                // Уведомление (без id) — ответа не положено, но соединение закрываем.
+                ex.sendResponseHeaders(202, -1)
+            } else {
+                val b = out.toByteArray()
+                ex.responseHeaders.add("Content-Type", "application/json")
+                ex.sendResponseHeaders(200, b.size.toLong())
+                ex.responseBody.use { it.write(b) }
+            }
+        } catch (e: Exception) {
+            val msg = "mcp failed: ${e.message}".take(500).toByteArray()
+            try {
+                ex.sendResponseHeaders(500, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+            } catch (_: Exception) {
+            }
+        } finally {
+            ex.close()
+        }
+    }
+
+    // POST /crm/import — выгрузка тикетов из GitHub + переиндексация их в RAG.
+    server.createContext("/crm/import") { ex ->
+        try {
+            if (ex.requestMethod != "POST") {
+                ex.sendResponseHeaders(405, -1)
+                return@createContext
+            }
+            if (!authed(ex, token)) return@createContext
+            val body = ex.requestBody.bufferedReader().readText()
+            val req = try {
+                json.decodeFromString(CrmImportRequest.serializer(), body)
+            } catch (e: Exception) {
+                val msg = "bad request: ${e.message}".toByteArray()
+                ex.sendResponseHeaders(400, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+                return@createContext
+            }
+            val project = req.project.ifBlank { defaultProject }
+            val t0 = System.currentTimeMillis()
+            val res = runBlocking {
+                val store = crm.store(project)
+                val r = store.import(req.issues, onLog = { m -> log(m) })
+                // Тикеты кладём в тот же векторный индекс, что и FAQ: по описанию
+                // проблемы находятся похожие обращения, а не только «по номеру».
+                // Индексация — best-effort: без неё CRM и точный доступ к тикету
+                // работают, пропадает только семантический поиск по обращениям.
+                runCatching {
+                    SupportService.indexTickets(svc, project, store.all(), onLog = { m -> log(m) })
+                }.onFailure { log("тикеты импортированы, но не проиндексированы: ${it.message}") }
+                r
+            }
+            log("CRM проекта $project: импортировано ${res.imported}, открытых ${res.open}, за ${(System.currentTimeMillis() - t0) / 1000}с")
+            sendJson(ex, 200, outJson.encodeToString(CrmImportResult.serializer(), res))
+        } catch (e: Exception) {
+            fail(ex, "crm import failed", e)
+        } finally {
+            ex.close()
+        }
+    }
+
+    // POST /crm/tickets — текущее состояние CRM (после локальных правок).
+    server.createContext("/crm/tickets") { ex ->
+        try {
+            if (ex.requestMethod != "POST") {
+                ex.sendResponseHeaders(405, -1)
+                return@createContext
+            }
+            if (!authed(ex, token)) return@createContext
+            val body = ex.requestBody.bufferedReader().readText()
+            val project = try {
+                json.decodeFromString(CrmPatchRequest.serializer(), body).project.ifBlank { defaultProject }
+            } catch (_: Exception) {
+                defaultProject
+            }
+            val store = crm.store(project)
+            val all = store.all()
+            sendJson(
+                ex, 200,
+                outJson.encodeToString(
+                    CrmState.serializer(),
+                    CrmState(
+                        project = project,
+                        importedAt = store.importedAt(),
+                        open = all.count { it.status in setOf("open", "in-progress", "needs-info") },
+                        escalated = all.count { it.escalated },
+                        tickets = all.sortedByDescending { it.id.toIntOrNull() ?: 0 },
+                    ),
+                ),
+            )
+        } catch (e: Exception) {
+            fail(ex, "crm tickets failed", e)
+        } finally {
+            ex.close()
+        }
+    }
+
+    // POST /crm/ticket — локальная правка тикета: статус, ответственный, комментарий,
+    // эскалация. Этим на видео «разработчик чинит тикет», и бот сразу меняет тон.
+    server.createContext("/crm/ticket") { ex ->
+        try {
+            if (ex.requestMethod != "POST") {
+                ex.sendResponseHeaders(405, -1)
+                return@createContext
+            }
+            if (!authed(ex, token)) return@createContext
+            val body = ex.requestBody.bufferedReader().readText()
+            val req = try {
+                json.decodeFromString(CrmPatchRequest.serializer(), body)
+            } catch (e: Exception) {
+                val msg = "bad request: ${e.message}".toByteArray()
+                ex.sendResponseHeaders(400, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+                return@createContext
+            }
+            val project = req.project.ifBlank { defaultProject }
+            require(req.ticketId.isNotBlank()) { "нужен ticketId" }
+            req.status?.let { require(it in TICKET_STATUSES) { "статус должен быть одним из $TICKET_STATUSES" } }
+            val store = crm.store(project)
+            store.patch(req.ticketId, status = req.status, assignee = req.assignee, comment = req.comment)
+            val escalated = req.escalate?.takeIf { it.isNotBlank() }
+            val t = if (escalated != null) store.escalate(req.ticketId, escalated) else store.get(req.ticketId)
+                ?: throw IllegalStateException("тикет #${req.ticketId} не найден в CRM проекта $project")
+            log("CRM $project: тикет #${t.id} -> ${t.status}" + (if (t.escalated) " (эскалация)" else ""))
+            sendJson(ex, 200, outJson.encodeToString(SupportTicket.serializer(), t))
+        } catch (e: Exception) {
+            fail(ex, "crm ticket failed", e)
+        } finally {
+            ex.close()
+        }
+    }
+
+    // POST /support/ask — одно сообщение пользователя в диалоге по тикету.
+    server.createContext("/support/ask") { ex ->
+        try {
+            if (ex.requestMethod != "POST") {
+                ex.sendResponseHeaders(405, -1)
+                return@createContext
+            }
+            if (!authed(ex, token)) return@createContext
+            val llmKey = ex.requestHeaders.getFirst("X-LLM-Key")?.trim()?.takeIf { it.isNotBlank() }
+            val body = ex.requestBody.bufferedReader().readText()
+            val req = try {
+                json.decodeFromString(SupportAskRequest.serializer(), body)
+            } catch (e: Exception) {
+                val msg = "bad request: ${e.message}".toByteArray()
+                ex.sendResponseHeaders(400, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+                return@createContext
+            }
+            if (req.message.isBlank()) {
+                val msg = "empty message".toByteArray()
+                ex.sendResponseHeaders(400, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+                return@createContext
+            }
+            val project = req.project.ifBlank { defaultProject }
+            val chatId = req.chatId.ifBlank { "0" }
+            val history = supportChats.state.messages[chatId].orEmpty().takeLast(12)
+            val t0 = System.currentTimeMillis()
+            val res: SupportReply = runBlocking {
+                SupportService.ask(
+                    rag = svc, project = project, chatId = chatId, message = req.message.trim(),
+                    apiKey = llmKey, history = history, crm = crm,
+                    topK = req.topK.coerceIn(1, 20), onLog = { m -> log(m) },
+                )
+            }
+            // История — по тикету: то, что бот уже отвечал, влияет на следующий ответ.
+            supportChats.appendMessage(chatId, RagMessage("user", req.message.trim()))
+            supportChats.appendMessage(
+                chatId,
+                RagMessage(
+                    "assistant", res.text,
+                    info = "тикет #${res.ticketId} ${res.ticketStatus} · FAQ-цитат: ${res.faqRefs.size}",
+                    refs = res.faqRefs,
+                ),
+            )
+            log(
+                "поддержка $project/#$chatId за ${(System.currentTimeMillis() - t0) / 1000}с: " +
+                    "тикет=${res.usedTicket} faq=${res.faqRefs.size} отказ=${res.refused} эскалация=${res.escalated}"
+            )
+            sendJson(ex, 200, outJson.encodeToString(SupportReply.serializer(), res))
+        } catch (e: Exception) {
+            fail(ex, "support ask failed", e)
+        } finally {
+            ex.close()
+        }
+    }
+
     server.start()
-    log("review-server on :$port (эндпоинты: /health /review /index; VPS_TOKEN задан: ${token.isNotBlank()})")
+    log(
+        "review-server on :$port (эндпоинты: /health /review /index /mcp /crm/import /crm/tickets " +
+            "/crm/ticket /support/ask; продукт поддержки: $defaultProject; VPS_TOKEN задан: ${token.isNotBlank()})"
+    )
+}
+
+private fun svcAppDir(): java.io.File = core.llm.ApiKeyProvider.appDir()
+
+// Авторизация общая для всех защищённых ручек: Bearer-токен, без разных секретов.
+private fun authed(ex: HttpExchange, token: String): Boolean {
+    if (ex.requestHeaders.getFirst("Authorization").orEmpty() != "Bearer $token") {
+        ex.sendResponseHeaders(401, -1)
+        ex.close()
+        return false
+    }
+    return true
+}
+
+private fun sendJson(ex: HttpExchange, code: Int, payload: String) {
+    val b = payload.toByteArray()
+    ex.responseHeaders.add("Content-Type", "application/json")
+    ex.sendResponseHeaders(code, b.size.toLong())
+    ex.responseBody.use { it.write(b) }
+}
+
+private fun fail(ex: HttpExchange, prefix: String, e: Exception) {
+    log("$prefix: ${e.message}")
+    val msg = "$prefix: ${e.message}".take(500).toByteArray()
+    try {
+        ex.sendResponseHeaders(500, msg.size.toLong())
+        ex.responseBody.use { it.write(msg) }
+    } catch (_: Exception) {
+    }
 }

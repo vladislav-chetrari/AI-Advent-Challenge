@@ -113,6 +113,14 @@ class LlmSettingsStore(appDir: File = ApiKeyProvider.appDir()) {
         val modelFixed = if (saved.provider != provider && System.getenv("WEEK6_LLM_MODEL").isNullOrBlank()) {
             if (model == LlmSettings.DEFAULT_DEEPSEEK_MODEL || model == LlmSettings.DEFAULT_OLLAMA_MODEL) defaultModel else model
         } else model
-        return LlmSettings(provider = provider, model = modelFixed, baseUrl = url, temperature = saved.temperature)
+        // Тот же случай для адреса: сменили провайдера на ollama через env, а в
+        // llm.json остался api.deepseek.com — запрос ушёл бы в облако с локальной
+        // моделью и упал бы с 401 вместо понятной ошибки.
+        val urlFixed = if (saved.provider != provider &&
+            System.getenv("WEEK6_LLM_URL").isNullOrBlank() &&
+            System.getenv("OLLAMA_HOST").isNullOrBlank() &&
+            url == LlmSettings.DEFAULT_DEEPSEEK_URL
+        ) defaultUrl else url
+        return LlmSettings(provider = provider, model = modelFixed, baseUrl = urlFixed, temperature = saved.temperature)
     }
 }

@@ -26,6 +26,9 @@ private data class ChatRequest(
     val messages: List<WireMessage>,
     val temperature: Double = 0.3,
     val stream: Boolean = false,
+    // null = без ограничения. Поддержке нужен потолок: короткий ответ оператора
+    // не даёт модели уйти в перечисление выдуманных шагов и сорваться на другой язык.
+    val maxTokens: Int? = null,
 )
 
 @Serializable
@@ -72,6 +75,7 @@ open class LlmClient(
         history: List<ChatMsg>,
         apiKey: String?,
         temperatureOverride: Double? = null,
+        maxTokens: Int? = null,
     ): LlmResult {
         return try {
             val endpoint = LlmSettings(provider = provider, model = model, baseUrl = baseUrl, temperature = temperature).endpoint()
@@ -83,6 +87,7 @@ open class LlmClient(
                         model = model,
                         messages = history.map { WireMessage(it.role, it.content) },
                         temperature = temperatureOverride ?: temperature,
+                        maxTokens = maxTokens,
                     )
                 )
             }

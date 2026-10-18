@@ -140,6 +140,8 @@ fun refsFromHits(hits: List<ScoredChunk>, excerptLen: Int = 280): List<RagRef> =
     }
 
 // Task 3 (День 23): что произошло между векторным поиском и промптом.
+// @Serializable — диагностика уезжает в JSON ответа /support/ask.
+@Serializable
 data class RetrievalDebug(
     // Сколько кандидатов забрал векторный поиск (top-K до фильтрации).
     val retrieved: Int = 0,

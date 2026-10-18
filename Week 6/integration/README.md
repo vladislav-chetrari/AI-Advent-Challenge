@@ -64,3 +64,86 @@ Settings → Secrets and variables → Actions:
 Открой тестовый PR с мелочью (например, `TODO` без Issue или дублированный код) —
 бот должен оставить inline-коммент именно на этой строке + общий итог
 (баги / архитектура / рекомендации + строка `⚠ RAG:` если доки протухли).
+
+---
+
+# Task 3 — ассистент поддержки
+
+CRM ассистента — **Issues этого же репозитория** с лейблом `support`. Отдельная
+подключаемая часть: один файл workflow, ключ LLM сюда не нужен (генерация идёт
+в `/support/ask`, ключ прилетает per-request в `X-LLM-Key`).
+
+## Подключение (один файл)
+
+| Этот файл | Куда в целевом репозитории |
+|---|---|
+| `support-index.yml` | `.github/workflows/support-index.yml` |
+
+Secrets те же: `VPS_URL`, `VPS_TOKEN`. Variables:
+
+- `REVIEW_PROJECT` — имя проекта в RAG (то же, что для ревью);
+- `TICKET_LABEL` — лейбл тикетов, по умолчанию `support`.
+
+Workflow выгружает Issues ночью (03:47 UTC) и по кнопке: снимает список через GitHub API,
+отбрасывает PR, отправляет `POST /crm/import`. Сервер разбирает front-matter тикета,
+раскладывает его в CRM и индексирует в общий RAG-индекс проекта.
+
+## Формат тикета
+
+Лейблы задают состояние, YAML-фронтматтер в теле Issue — данные:
+
+```yaml
+---
+ticket:
+  user:
+    id: u17
+    name: Ирина
+    plan: pro
+    device: Pixel 8
+    os: Android 14
+    app: 0.1.0
+  component: models
+  assignee: ilya
+  workaround: скачать .litertlm вручную в models/llm/
+  fix: перезагрузка без Range-заголовка, рвётся на длинных соединениях
+  eta: релиз 0.1.1
+---
+
+Текст обращения пользователя.
+```
+
+Лейблы: `support`, `type:bug|question|known-issue`, `severity:critical|major|minor`,
+`status:open|in-progress|needs-info|resolved`, `component:<имя>`.
+
+**Лейбл важнее фронтматтера**, если заданы оба. Закрытый Issue без лейбла = `closed`.
+Если поля `eta` нет — ассистент обязан сказать, что ориентира по срокам нет, и никогда
+не называет срок сам.
+
+Профиль пользователя живёт в тикете: у CallowFellow нет аккаунтов, а `user` даёт
+ассистенту контекст устройства и версии.
+
+## FAQ
+
+Обычный `*.md` в репозитории продукта (`support/faq.md`) — индексируется ночным
+`index-docs` без дополнительных настроек, отдельный workflow не нужен.
+
+## Демо-тикеты
+
+```sh
+python3 ../scripts/seed_support_tickets.py --dry-run
+python3 ../scripts/seed_support_tickets.py
+```
+
+Скрипт идемпотентен (ищет Issue по заголовку), создаёт 6 тикетов, покрывающих все
+статусы: в работе / ждём ответа / решён / вопрос.
+
+## Проверка с терминала
+
+```sh
+export VPS_URL=https://<твой-vps> VPS_TOKEN=... DEEPSEEK_API_KEY=...
+./kotlin run --module cli -- support-ticket --list
+./kotlin run --module cli -- support-ticket --id 1042 --status resolved --comment "починили, релиз 0.1.1"
+./kotlin run --module cli -- support-ask --chat 1042 --message "модель так и не скачалась"
+```
+
+Смена статуса меняет ответ бота в том же диалоге: это и есть «учёт контекста тикета».
