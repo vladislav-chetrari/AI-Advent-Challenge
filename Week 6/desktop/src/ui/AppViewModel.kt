@@ -146,6 +146,10 @@ data class UiState(
 class AppViewModel(private val scope: CoroutineScope) {
     private val svc = RagService()
     private val chats = ChatStore()
+    // Хранилище прогонов объявлено ДО init: поля инициализируются по порядку,
+    // и refreshAgentRuns() в init иначе увидит ещё null.
+    private val agentStore = RunStore()
+    private val agentPerms = PermissionStore()
     private val _state = MutableStateFlow(UiState())
     val state: StateFlow<UiState> = _state
 
@@ -537,9 +541,6 @@ class AppViewModel(private val scope: CoroutineScope) {
     }
 
     // ===== Task 4: запуск и управление прогоном агента =====
-
-    private val agentStore = RunStore()
-    private val agentPerms = PermissionStore()
 
     // Ответ пользователя на запрос подтверждения. Пока он null, корутина
     // прогона висит на await — как Deferred в opencode.
