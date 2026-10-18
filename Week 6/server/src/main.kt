@@ -29,6 +29,7 @@ private data class ReviewRequest(
 )
 
 private val json = Json { prettyPrint = false; ignoreUnknownKeys = true; isLenient = true }
+private val outJson = Json { prettyPrint = true; encodeDefaults = true }
 
 fun main() {
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
@@ -73,7 +74,7 @@ fun main() {
             val res: ReviewResult = runBlocking {
                 svc.reviewDiff(req.project, req.diff, apiKey = llmKey, maxFiles = req.maxFiles.coerceIn(1, 50), refresh = req.refresh, repoUrl = req.repoUrl, repoToken = req.repoToken)
             }
-            val out = Json { prettyPrint = true; encodeDefaults = true }.encodeToString(ReviewResult.serializer(), res).toByteArray()
+            val out = outJson.encodeToString(ReviewResult.serializer(), res).toByteArray()
             ex.responseHeaders.add("Content-Type", "application/json")
             ex.sendResponseHeaders(200, out.size.toLong())
             ex.responseBody.use { it.write(out) }
