@@ -70,6 +70,27 @@ export PORT=8080 VPS_TOKEN=$(openssl rand -hex 32)
 
 ## 7. Task 3 — поддержка пользователей на том же VPS
 
+### Чат для пользователя (без токенов)
+
+Конечный пользователь не имеет ни `VPS_TOKEN`, ни ключа модели. Поэтому:
+
+- `GET /chat` — страница чата (один HTML, без зависимостей);
+- `POST /support/chat` — публичный эндпоинт `{chatId, message}` → `SupportReply`.
+
+Ключ модели берёт **сервер**: `DEEPSEEK_API_KEY` в env или `~/.ai-advent-week6/.env`
+(парсер читает строку `DEEPSEEK_API_KEY=...`). Если ключа нет — работает локальная
+модель Ollama, если она настроена (`WEEK6_LLM_PROVIDER=ollama`).
+
+Публичность ограничена троттлингом: 12 сообщений в минуту с одного IP.
+
+```sh
+# ключ на VPS (нужен для облачной модели)
+scp ~/IdeaProjects/AI-Advent-Challenge/.env <user>@<vps>:~/.ai-advent-week6/.env
+# или через systemd: Environment=DEEPSEEK_API_KEY=sk-...
+```
+
+Проверка: открыть `https://<vps>/chat` и написать вопрос.
+
 Ничего ставить не нужно: тот же `server` модуль и тот же процесс на `:8080`.
 CRM — это GitHub Issues продукта, они приезжают ночным workflow и складываются в
 `~/.ai-advent-week6/crm/<project>.json`.
