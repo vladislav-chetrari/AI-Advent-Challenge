@@ -100,22 +100,15 @@ data class UiState(
     // Task 5: память задачи активного чата (цель + факты: ограничения/термины).
     val taskMemory: TaskMemory? = null,
     // ===== Task 4: агент, работающий с файлами проекта =====
-    // Прогон целиком — UI рисует его как trace, а не как один блоб текста.
+    // Прогон целиком — UI рисует его как карточку в ленте агентного чата.
     val agentRun: AgentRun? = null,
-    // Панель агента раскрыта (кнопка «🎯 Агент» в шапке чата).
-    val showAgentPanel: Boolean = false,
-    // Поле ввода цели для /goal и кнопки «Старт».
-    val agentGoal: String = "",
-    // Диалог подтверждения записи: null = агент сейчас не ждёт разрешения.
+    // Запрошенное изменение: карточка разрешения рисуется в ленте чата,
+    // а не отдельным окном — решение видно в том же месте, где идёт прогон.
     val pendingChange: PendingChange? = null,
     // Что агент наговорил между шагами (не финальный ответ).
     val agentLog: List<String> = emptyList(),
-    // Прогоны, найденные на диске — для /runs и воспроизведения.
+    // Прогоны, найденные на диске — для ленты агентного чата и /runs.
     val agentRuns: List<AgentRun> = emptyList(),
-    // Показывать diff прогона целиком.
-    val showAgentDiff: Boolean = false,
-    // Автопринятие правок (как --auto-approve в CLI): по умолчанию выключено.
-    val agentAutoApprove: Boolean = false,
 ) {
     // Две секции сайдбара. Держать один список было путано: у информационного
     // чата вопросы по базе, у агентного — только прогоны по файлам.
@@ -155,13 +148,13 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     init {
         val st = chats.state
-        val first = st.chats.firstOrNull()?.id
+        val first = st.chats.firstOrNull()
         _state.value = _state.value.copy(
             chats = st.chats,
-            activeChatId = first,
-            messages = st.messages[first].orEmpty(),
-            taskMemory = first?.let { chats.getMemory(it) },
-            showAgentPanel = st.chats.firstOrNull { it.id == first }?.isAgent == true,
+            activeChatId = first?.id,
+            messages = st.messages[first?.id].orEmpty(),
+            taskMemory = first?.id?.let { chats.getMemory(it) },
+            agentRun = if (first?.isAgent == true) agentStore.latestForChat(first.id) else null,
             embedLabel = svc.embedLabel,
             llmLabel = svc.llmLabel,
         )
@@ -190,9 +183,7 @@ class AppViewModel(private val scope: CoroutineScope) {
             it.copy(
                 showCreateChat = false, chats = chats.state.chats, activeChatId = chat.id,
                 messages = emptyList(), taskMemory = TaskMemory(), viewingDoc = null,
-                // Агентный чат открывается сразу на панели агента и пустой целью.
-                showAgentPanel = kind == CHAT_KIND_AGENT, agentGoal = "", agentRun = null,
-                agentLog = emptyList(), showAgentDiff = false,
+                agentRun = null, agentLog = emptyList(), input = "",
             )
         }
         refreshAgentRuns()
@@ -200,6 +191,9 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun selectChat(id: String) {
         val chat = chats.state.chats.firstOrNull { it.id == id }
+        // Уходим из чата, где агент ждёт разрешения: карточка исчезнет из ленты,
+        // значит вопрос должен получить ответ — иначе прогон повиснет навсегда.
+        leaveChat()
         update {
             it.copy(
                 activeChatId = id,
@@ -207,23 +201,23 @@ class AppViewModel(private val scope: CoroutineScope) {
                 taskMemory = chats.getMemory(id),
                 viewingDoc = null,
                 status = null,
-                // Панель агента — только в агентном чате; в информационном её нет.
-                showAgentPanel = chat?.isAgent == true,
-                agentGoal = "",
+                input = "",
+                agentRun = null,
                 agentLog = emptyList(),
             )
         }
         if (chat?.isAgent == true) {
-            // Открываем чат на его последнем прогоне — иначе панель пустая.
+            // Открываем чат на его последнем прогоне — лента должна быть не пустой.
             agentStore.load()
-            update { it.copy(agentRuns = agentStore.runs, agentRun = agentStore.latestForChat(id), showAgentDiff = false) }
+            update { it.copy(agentRuns = agentStore.runs, agentRun = agentStore.latestForChat(id)) }
         }
     }
 
     fun deleteChat(id: String) {
+        leaveChat()
         chats.deleteChat(id)
         // Прогоны удалённого чата остаются в agent_runs.json (их видно и откатывать
-        // можно из CLI), но из панели чата исчезают — привязки больше нет.
+        // можно из CLI), но из ленты чата исчезают — привязки больше нет.
         agentStore.detachChat(id)
         val rest = chats.state.chats
         val next = if (_state.value.activeChatId == id) rest.firstOrNull()?.id else _state.value.activeChatId
@@ -501,8 +495,7 @@ class AppViewModel(private val scope: CoroutineScope) {
                 if (run == null) {
                     pushLocal(chatId, t, "Прогон `$id` не найден — посмотри `/runs`.")
                 } else {
-                    update { it.copy(agentRun = run, showAgentDiff = true) }
-                    pushLocal(chatId, t, "Показал diff прогона `${run.id}` справа.")
+                    pushLocal(chatId, t, "Прогон `${run.id}`: ${run.label()} · файлов ${run.changedFiles.size}. Полный trace и diff — в агентном чате.")
                 }
                 return true
             }
@@ -520,12 +513,7 @@ class AppViewModel(private val scope: CoroutineScope) {
                 return true
             }
             "/autopilot" -> {
-                val v = !_state.value.agentAutoApprove
-                update { it.copy(agentAutoApprove = v) }
-                pushLocal(
-                    chatId, t,
-                    if (v) "Автоподтверждение ВКЛ — агент будет писать файлы без вопроса." else "Автоподтверждение выкл.",
-                )
+                pushLocal(chatId, t, "Автоподтверждения больше нет: каждое изменение агента спрашивает разрешения в агентном чате.")
                 return true
             }
             else -> return false
@@ -547,14 +535,20 @@ class AppViewModel(private val scope: CoroutineScope) {
     private var approval: kotlinx.coroutines.CompletableDeferred<PermissionReply>? = null
     private var agentJob: kotlinx.coroutines.Job? = null
 
-    fun setAgentGoal(v: String) = update { it.copy(agentGoal = v) }
-    fun toggleAgentDiff() = update { it.copy(showAgentDiff = !it.showAgentDiff) }
-    fun toggleAgentAutoApprove() = update { it.copy(agentAutoApprove = !it.agentAutoApprove) }
-    fun toggleAgentPanel() = update { it.copy(showAgentPanel = !it.showAgentPanel) }
-
     fun refreshAgentRuns() {
         agentStore.load()
         update { it.copy(agentRuns = agentStore.runs) }
+    }
+
+    // Ввод в агентном чате: текст из нижнего поля — это цель для агента.
+    fun sendAgent() {
+        val st = _state.value
+        val chat = st.chats.firstOrNull { it.id == st.activeChatId } ?: return
+        val text = st.input.trim()
+        if (text.isEmpty()) return
+        if (!chat.isAgent) return
+        update { it.copy(input = "") }
+        startAgent(text, chat.id)
     }
 
     fun startAgent(goal: String, chatId: String? = null) {
@@ -565,13 +559,14 @@ class AppViewModel(private val scope: CoroutineScope) {
             return
         }
         if (_state.value.busy) {
-            update { it.copy(status = "Занято: дождись конца текущего хода или отмени прогон (⏹).") }
+            update { it.copy(status = "Занято: дождись конца текущего хода или останови прогон (⏹).") }
             return
         }
         val project = p.name
         val ws = Workspace(dir)
-        val auto = _state.value.agentAutoApprove
-        val gate = PermissionGate(agentPerms, if (auto) null else { change -> requestApproval(change) })
+        // Автоподтверждения нет: каждое изменение спрашивает разрешения
+        // карточкой в ленте чата (см. pendingChange).
+        val gate = PermissionGate(agentPerms) { change -> requestApproval(change) }
         val seed = chatId?.let { id ->
             // В агентном чате переписка — это лог прошлых прогонов; скармливать его
             // модели за контекст незачем. Историю задаёт сам агентный чат через RunStore.
@@ -581,8 +576,8 @@ class AppViewModel(private val scope: CoroutineScope) {
 
         update {
             it.copy(
-                agentGoal = goal, agentRun = null, agentLog = emptyList(),
-                busy = true, status = null, showAgentDiff = false, showAgentPanel = true,
+                agentRun = null, agentLog = emptyList(), pendingChange = null,
+                busy = true, status = null,
             )
         }
         approval = null
@@ -596,34 +591,15 @@ class AppViewModel(private val scope: CoroutineScope) {
                 onUpdate = { r -> update { it.copy(agentRun = r, agentRuns = agentStore.runs) } },
                 onLog = { line -> update { it.copy(agentLog = (it.agentLog + line).takeLast(200)) } },
             )
-            val run = runner.run(goal, project, seedHistory = seed, chatId = chatId ?: "")
+            runner.run(goal, project, seedHistory = seed, chatId = chatId ?: "")
             approval?.cancel()
             approval = null
-            // Финальный ответ агента — обычное сообщение чата: так он остаётся
-            // в переписке и переживает перезапуск вместе с ней.
-            val text = when (val s = run.state) {
-                is RunState.Done -> s.summary.ifBlank { "Прогон завершён без текста." }
-                is RunState.Failed -> "Прогон прерван: ${s.error}"
-                is RunState.Cancelled -> "Прогон отменён."
-                else -> run.summary.ifBlank { "Прогон завершён." }
-            }
-            val info = buildString {
-                append("агент · прогон ${run.id} · ${run.label()}")
-                append(" · шагов ${run.steps} · вызовов ${run.invocations.size}")
-                if (run.changedFiles.isNotEmpty()) append(" · изменено ${run.changedFiles.size}")
-                if (run.error.isNotBlank() && run.state is RunState.Done) append(" · ${run.error}")
-            }
-            chatId?.let { id ->
-                chats.appendMessage(id, RagMessage(role = "user", content = "🎯 $goal"))
-                chats.appendMessage(id, RagMessage(role = "assistant", content = text, info = info))
-                update { it.copy(messages = chats.state.messages[id].orEmpty()) }
-            }
-            update { it.copy(busy = false, agentRuns = agentStore.runs) }
+            update { it.copy(busy = false, agentRuns = agentStore.runs, pendingChange = null) }
         }
     }
 
-    // Диалог подтверждения. Diff уже внутри PendingChange — показываем его
-    // пользователю до вопроса (opencode: metadata.files в permission.assert).
+    // Запрос разрешения показывается карточкой В ЛЕНТЕ ЧАТА: решение принимается там
+    // же, где идёт прогон, и остаётся в истории вместе с ним.
     private suspend fun requestApproval(change: PendingChange): PermissionReply {
         val d = kotlinx.coroutines.CompletableDeferred<PermissionReply>()
         approval = d
@@ -640,8 +616,14 @@ class AppViewModel(private val scope: CoroutineScope) {
     fun approveOnce() = approval?.complete(PermissionReply.Once)
     fun approveAlways() = approval?.complete(PermissionReply.Always)
 
-    // Отказ: не просто закрываем диалог — это решение «не делать».
+    // Отказ: не просто закрываем карточку — это решение «не делать».
     fun rejectAgent() = approval?.complete(PermissionReply.Reject)
+
+    // Покидаем чат, в котором агент ждёт разрешения: карточка вопроса уходит из
+    // ленты вместе с чатом, и ждать ответа уже некому.
+    fun leaveChat() {
+        if (_state.value.pendingChange != null) rejectAgent()
+    }
 
     fun cancelAgent() {
         agentJob?.cancel()
@@ -651,20 +633,12 @@ class AppViewModel(private val scope: CoroutineScope) {
         update { it.copy(busy = false, pendingChange = null, status = "Прогон остановлен") }
     }
 
-    // Правило «всегда» уже записано в PermissionStore на ответе Always,
-    // здесь только закрываем диалог — состояния разводить нельзя.
     fun revertRun(id: String) {
         val run = agentStore.get(id) ?: return
         val dir = svc.projectDir(run.project) ?: return
         val n = agentStore.revert(run, Workspace(dir))
-        update { it.copy(agentRun = agentStore.get(run.id) ?: run, agentRuns = agentStore.runs) }
+        update { it.copy(agentRuns = agentStore.runs) }
         log("Откачено файлов: $n")
-    }
-
-    // Открыть прогон в панели агента: щелчок по строке истории чата.
-    fun openRun(id: String) {
-        val run = agentStore.get(id) ?: return
-        update { it.copy(agentRun = run, showAgentPanel = true, showAgentDiff = run.diff.isNotBlank()) }
     }
 
     // --- единый диалог настроек: LLM + эмбеддинги (как Week 5 SettingsTab) ---
