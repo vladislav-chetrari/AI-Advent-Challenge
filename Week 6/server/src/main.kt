@@ -60,6 +60,9 @@ private data class IndexRequest(
 private data class CrmImportRequest(
     val project: String = "",
     val issues: List<RawIssue> = emptyList(),
+    // Пустая выгрузка НЕ затирает CRM: случайный запрос без тела стирал бы все
+    // тикеты. Очистить снимок можно осознанно — forceEmpty.
+    val forceEmpty: Boolean = false,
 )
 
 // Локальная правка тикета: «разработчик взял в работу», «починил», «эскалировали».
@@ -261,6 +264,18 @@ fun main() {
                 return@createContext
             }
             val project = req.project.ifBlank { defaultProject }
+            if (req.issues.isEmpty() && !req.forceEmpty) {
+                // Не даём случайному пустому запросу обнулить CRM.
+                val store0 = crm.store(project)
+                val kept = store0.all().size
+                val msg = "в выгрузке 0 тикетов — снимок CRM не тронут (осталось $kept). " +
+                    "Чтобы очистить CRM осознанно, добавь forceEmpty: true"
+                log(msg)
+                val b = msg.toByteArray()
+                ex.sendResponseHeaders(400, b.size.toLong())
+                ex.responseBody.use { it.write(b) }
+                return@createContext
+            }
             val t0 = System.currentTimeMillis()
             val res = runBlocking {
                 val store = crm.store(project)
