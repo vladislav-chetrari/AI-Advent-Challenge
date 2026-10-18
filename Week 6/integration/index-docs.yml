@@ -1,0 +1,70 @@
+name: index-docs
+
+# Копировать в целевой репозиторий как .github/workflows/index-docs.yml
+# Ночная индексация доков в RAG на VPS. Решит: RAG не на каждый PR.
+# Полная переиндексация доков на 2 vCPU занимает ~30 минут, поэтому —
+# отдельная задача по расписанию, а не шаг внутри ревью.
+
+on:
+  schedule:
+    # 03:17 ночи UTC — минус 7 минут от «красивого» 03:30, чтобы не попасть
+    # в пик, когда GitHub откладывает cron-задачи.
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      project:
+        description: 'Имя проекта (по умолчанию — имя репозитория)'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: index-docs
+  cancel-in-progress: false
+
+jobs:
+  index:
+    runs-on: ubuntu-latest
+    # Индексация длинная: 60 минут с запасом.
+    timeout-minutes: 60
+    steps:
+      - name: Request indexing from VPS
+        env:
+          VPS_URL: ${{ secrets.VPS_URL }}
+          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
+          REVIEW_PROJECT: ${{ inputs.project || vars.REVIEW_PROJECT || github.event.repository.name }}
+          REPO_URL: ${{ format('{0}/{1}', github.server_url, github.repository) }}
+          REPO_TOKEN: ${{ github.event.repository.private && secrets.GITHUB_TOKEN || '' }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, sys, urllib.request, urllib.error, urllib.parse
+
+          base = os.environ.get('VPS_URL', '').strip()
+          if not base.startswith(('http://', 'https://')):
+              print('FAIL: VPS_URL must start with http:// or https:// (scheme missing)', file=sys.stderr)
+              raise SystemExit(1)
+          host = urllib.parse.urlparse(base).netloc
+          project = os.environ.get('REVIEW_PROJECT') or None
+          print('index project:', project, '| host:', host)
+
+          payload = json.dumps({
+              'project': project,
+              'repoUrl': os.environ.get('REPO_URL') or None,
+          }).encode()
+          req = urllib.request.Request(
+              base.rstrip('/') + '/index', data=payload, method='POST',
+              headers={'Content-Type': 'application/json',
+                       'Authorization': 'Bearer ' + os.environ.get('VPS_TOKEN', ''),
+                       'X-Repo-Token': os.environ.get('REPO_TOKEN', '')},
+          )
+          try:
+              body = urllib.request.urlopen(req, timeout=3300).read()
+          except urllib.error.HTTPError as e:
+              print(f'FAIL: VPS HTTP {e.code}: {e.read().decode(errors="replace")[:600]}', file=sys.stderr)
+              raise SystemExit(1)
+          except urllib.error.URLError as e:
+              print(f'FAIL: cannot reach VPS host {host}: {e.reason}', file=sys.stderr)
+              raise SystemExit(1)
+          print('index ok:', body.decode(errors='replace')[:1000])
+          EOF

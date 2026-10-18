@@ -5,13 +5,15 @@ import kotlinx.serialization.json.Json
 
 // ===== Task 2: модели код-ревью с inline-комментами =====
 
-// Свежесть RAG: есть ли доки и не отстал ли индекс от HEAD.
+// Свежесть RAG: есть ли доки и не отстал ли индекс от удалённого HEAD.
+// remoteCommit — голова на GitHub (ls-remote, без скачивания репозитория).
 @Serializable
 data class ReviewFreshness(
     val docsFound: Int = 0,
     val chunks: Int = 0,
     val indexedCommit: String = "",
     val headCommit: String = "",
+    val remoteCommit: String = "",
     val upToDate: Boolean = true,
     val staleFiles: List<String> = emptyList(),
     val warning: String = "",

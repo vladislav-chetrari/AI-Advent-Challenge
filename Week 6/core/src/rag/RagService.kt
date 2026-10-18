@@ -710,7 +710,7 @@ class RagService(
 
     // ===== Task 2: freshness RAG для ревью =====
     // 1) есть ли доки 2) up-to-date ли индекс (indexedCommit vs HEAD + исчезнувшие файлы).
-    fun reviewFreshness(projectName: String?): Pair<ProjectEntry, ReviewFreshness> {
+    fun reviewFreshness(projectName: String?, authToken: String? = null): Pair<ProjectEntry, ReviewFreshness> {
         val entry = (projectName?.let { projects.get(it) } ?: selectedProject())
             ?: throw IllegalStateException("проект не выбран — добавь через + или --project")
         val dir = File(entry.localPath)
@@ -718,17 +718,25 @@ class RagService(
         val sources = projectSources(entry.name)
         val chunks = store.loadAllChunks().count { it.source.startsWith(ProjectLoader.prefix(entry.name)) }
         val head = try { GitTools.commit(dir) } catch (_: Exception) { "—" }
+        val remote = try { GitTools.remoteHead(dir, authToken) } catch (_: Exception) { null }
         val stale = try { ProjectLoader.staleSources(entry.name, dir, sources) } catch (_: Exception) { emptyList() }
-        val upToDate = stale.isEmpty() && (entry.indexedCommit.isNotBlank() && entry.indexedCommit == head)
+        // Актуальность индекса меряем по удалённой голове: локальный HEAD после pull
+        // всегда равен индексу, а репозиторий на сервере может отставать от GitHub.
+        val remoteShort = remote?.take(7).orEmpty()
+        val upToDate = stale.isEmpty() &&
+            entry.indexedCommit.isNotBlank() &&
+            (remoteShort.isBlank() || entry.indexedCommit.take(7) == remoteShort)
         val warn = buildList {
-            if (sources.isEmpty()) add("в RAG нет документов проекта — добавь и проиндексируй")
-            if (entry.indexedCommit.isBlank()) add("индекс без коммита — обнови проект (⟳)")
-            else if (entry.indexedCommit != head) add("индекс от ${entry.indexedCommit}, HEAD $head — обнови проект")
+            if (sources.isEmpty()) add("в RAG нет документов проекта — запусти индексацию (index-docs workflow)")
+            if (entry.indexedCommit.isBlank()) add("индекс без коммита — запусти индексацию")
+            else if (remoteShort.isNotBlank() && entry.indexedCommit.take(7) != remoteShort) {
+                add("индекс от ${entry.indexedCommit}, на GitHub $remoteShort — доки обновились, индекс устарел")
+            }
             if (stale.isNotEmpty()) add("исчезло файлов: ${stale.size}")
         }.joinToString("; ")
         return entry to ReviewFreshness(
             docsFound = sources.size, chunks = chunks,
-            indexedCommit = entry.indexedCommit, headCommit = head,
+            indexedCommit = entry.indexedCommit, headCommit = head, remoteCommit = remoteShort,
             upToDate = upToDate, staleFiles = stale.take(20), warning = warn,
         )
     }
@@ -854,6 +862,42 @@ class RagService(
         }
     }
 
+    // Отдельная тяжёлая операция для ночного workflow: клон (если новый) +
+    // pull + полная доиндексация. Ревью её НЕ вызывает — там только дешёвая
+    // проверка через ls-remote, чтобы не ждать получаса эмбеддингов на каждый PR.
+    suspend fun indexProject(
+        projectName: String?,
+        repoUrl: String? = null,
+        repoToken: String? = null,
+        onLog: (String) -> Unit = {},
+    ): ReviewFreshness = withContext(Dispatchers.IO) {
+        val name = projectName?.trim()?.takeIf { it.isNotBlank() }
+            ?: repoUrl?.let { ProjectLoader.repoNameFromUrl(it) }
+            ?: throw IllegalStateException("не указан проект: передай project или repoUrl")
+        val known = projects.get(name)
+        if (known == null) {
+            ensureProject(name, repoUrl, repoToken, onLog)
+        } else if (repoUrl != null && known.gitUrl.isBlank()) {
+            // уже зарегистрирован локальным путём — просто обновляем
+            onLog("проект $name: обновляю индекс")
+            val strat = store.allDocs()
+                .filter { it.source.startsWith(ProjectLoader.prefix(name)) }
+                .map { it.strategy }.groupingBy { it }.eachCount()
+                .maxByOrNull { it.value }?.key
+                .takeIf { it == "fixed" || it == "structure" } ?: "both"
+            updateProject(name, strat, authToken = repoToken, onLog = onLog)
+        } else {
+            val note = tryRefreshProject(name, repoToken)
+            if (note.isNotBlank()) onLog(note)
+        }
+        val (_, fresh) = reviewFreshness(name, repoToken)
+        onLog(
+            "индекс готов: доков ${fresh.docsFound}, чанков ${fresh.chunks}, " +
+                "коммит ${fresh.indexedCommit}, GitHub ${fresh.remoteCommit.ifBlank { "?" }}, актуален=${fresh.upToDate}"
+        )
+        fresh
+    }
+
     // Best-effort обновление индекса проекта перед ревью (VPS-режим).
     // Возвращает строку для warning (пусто — всё свежо). Никогда не бросает наружу.
     private suspend fun tryRefreshProject(projectName: String?, authToken: String? = null): String {
@@ -883,26 +927,25 @@ class RagService(
         apiKey: String? = null,
         maxFiles: Int = 15,
         perFileTopK: Int = 4,
-        refresh: Boolean = true,
+        refresh: Boolean = false,
+        ensureIfMissing: Boolean = true,
         repoUrl: String? = null,
         repoToken: String? = null,
         onLog: (String) -> Unit = {},
     ): ReviewResult = withContext(Dispatchers.IO) {
-        // Авто-флоу: имя из project, иначе из repoUrl; проект заводится сам при первом обращении.
+        // Ревью быстрое: индекс НЕ пересобирается (это работа ночного index-job).
+        // Проверяем только, что индекс вообще есть и не отстал ли от GitHub.
         val effectiveName = projectName?.trim()?.takeIf { it.isNotBlank() }
             ?: repoUrl?.let { ProjectLoader.repoNameFromUrl(it) }
             ?: selectedProject()?.name
             ?: throw IllegalStateException("не указан проект: передай project или repoUrl")
-        if (repoUrl != null || projects.get(effectiveName) == null) {
-            onLog("проект $effectiveName новый — клон + индексация доков")
+        val known = projects.get(effectiveName)
+        if (known == null && ensureIfMissing) {
+            onLog("проект $effectiveName не проиндексирован — клон и первичная индексация (долго, обычно делает index-job)")
             ensureProject(effectiveName, repoUrl, repoToken, onLog)
         }
-        val refreshNote = if (refresh) tryRefreshProject(effectiveName, repoToken) else ""
-        onLog(if (refreshNote.isBlank()) "RAG свежий" else refreshNote)
-        val (entry, baseFresh) = reviewFreshness(effectiveName)
-        val fresh = if (refreshNote.isNotBlank()) {
-            baseFresh.copy(warning = listOf(baseFresh.warning, refreshNote).filter { it.isNotBlank() }.joinToString("; "))
-        } else baseFresh
+        if (refresh) onLog(tryRefreshProject(effectiveName, repoToken))
+        val (entry, fresh) = reviewFreshness(effectiveName, repoToken)
         if (diffText.isBlank()) {
             return@withContext ReviewResult(summary = "Пустой diff — ревью нечего.", freshness = fresh)
         }

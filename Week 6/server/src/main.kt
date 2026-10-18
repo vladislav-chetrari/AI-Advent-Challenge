@@ -2,6 +2,7 @@ package server
 
 import com.sun.net.httpserver.HttpServer
 import core.rag.RagService
+import core.rag.ReviewFreshness
 import core.rag.ReviewResult
 import java.net.InetSocketAddress
 import java.util.concurrent.Executors
@@ -25,7 +26,17 @@ private data class ReviewRequest(
     val repoUrl: String? = null,
     val repoToken: String? = null,
     val maxFiles: Int = 15,
-    val refresh: Boolean = true,
+    // Ревью по умолчанию НЕ трогает индекс: индексация — отдельная ночная задача.
+    val refresh: Boolean = false,
+    // Если проект вообще не зарегистрирован — клон + первичная индексация (долго).
+    val ensureIfMissing: Boolean = true,
+)
+
+@Serializable
+private data class IndexRequest(
+    val project: String? = null,
+    val repoUrl: String? = null,
+    val repoToken: String? = null,
 )
 
 private val json = Json { prettyPrint = false; ignoreUnknownKeys = true; isLenient = true }
@@ -82,7 +93,8 @@ fun main() {
                 val t0 = System.currentTimeMillis()
                 val r = svc.reviewDiff(
                     req.project, req.diff, apiKey = llmKey, maxFiles = req.maxFiles.coerceIn(1, 50),
-                    refresh = req.refresh, repoUrl = req.repoUrl, repoToken = req.repoToken,
+                    refresh = req.refresh, ensureIfMissing = req.ensureIfMissing,
+                    repoUrl = req.repoUrl, repoToken = req.repoToken,
                     onLog = { m -> log(m) },
                 )
                 log("ревью готово за ${(System.currentTimeMillis() - t0) / 1000}с: файлов ${r.filesReviewed}, inline ${r.comments.size}")
@@ -103,6 +115,47 @@ fun main() {
             ex.close()
         }
     }
+    // Тяжёлая индексация доков — отдельная задача (ночной workflow), не часть ревью.
+    server.createContext("/index") { ex ->
+        try {
+            if (ex.requestMethod != "POST") {
+                ex.sendResponseHeaders(405, -1)
+                return@createContext
+            }
+            if (ex.requestHeaders.getFirst("Authorization").orEmpty() != "Bearer $token") {
+                ex.sendResponseHeaders(401, -1)
+                return@createContext
+            }
+            val repoToken = ex.requestHeaders.getFirst("X-Repo-Token")?.trim()?.takeIf { it.isNotBlank() }
+            val body = ex.requestBody.bufferedReader().readText()
+            val req = try {
+                json.decodeFromString(IndexRequest.serializer(), body)
+            } catch (e: Exception) {
+                val msg = "bad request: ${e.message}".toByteArray()
+                ex.sendResponseHeaders(400, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+                return@createContext
+            }
+            val t0 = System.currentTimeMillis()
+            val fresh = runBlocking {
+                svc.indexProject(req.project, req.repoUrl, repoToken, onLog = { m -> log(m) })
+            }
+            log("индексация завершена за ${(System.currentTimeMillis() - t0) / 1000}с")
+            val out = outJson.encodeToString(ReviewFreshness.serializer(), fresh).toByteArray()
+            ex.responseHeaders.add("Content-Type", "application/json")
+            ex.sendResponseHeaders(200, out.size.toLong())
+            ex.responseBody.use { it.write(out) }
+        } catch (e: Exception) {
+            val msg = "index failed: ${e.message}".take(500).toByteArray()
+            try {
+                ex.sendResponseHeaders(500, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+            } catch (_: Exception) {
+            }
+        } finally {
+            ex.close()
+        }
+    }
     server.start()
-    println("review-server on :$port (VPS_TOKEN set: ${token.isNotBlank()})")
+    log("review-server on :$port (эндпоинты: /health /review /index; VPS_TOKEN задан: ${token.isNotBlank()})")
 }

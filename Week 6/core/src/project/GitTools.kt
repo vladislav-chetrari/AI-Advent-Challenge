@@ -27,6 +27,18 @@ object GitTools {
         return out.trim().take(20)
     }
 
+    // Голова ветки на удалённом репозитории — одним ls-remote, без fetch/pull.
+    // Нужна, чтобы ревью честно сказало «доки в индексе отстали», не качая репозиторий.
+    // null = не удалось узнать (нет сети/токена/не git).
+    fun remoteHead(dir: File, authToken: String? = null, timeoutSec: Long = 15): String? {
+        val prefix = if (!authToken.isNullOrBlank()) {
+            listOf("-c", "http.extraHeader=AUTHORIZATION: bearer $authToken")
+        } else emptyList()
+        val (code, out) = run(dir, timeoutSec, *(prefix + listOf("ls-remote", "origin", "HEAD")).toTypedArray())
+        if (code != 0 || out.isBlank()) return null
+        return out.trim().split("\\s+".toRegex()).firstOrNull()?.take(40)
+    }
+
     fun listFiles(dir: File, limit: Int = 200): List<String> {
         val (code, out) = run(dir, 10, "ls-files")
         if (code == 0 && out.isNotBlank()) return out.lines().filter { it.isNotBlank() }.take(limit)

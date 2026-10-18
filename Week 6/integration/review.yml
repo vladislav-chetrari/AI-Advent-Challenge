@@ -66,11 +66,13 @@ jobs:
           payload = json.dumps({
               "diff": diff,
               "project": os.environ.get('REVIEW_PROJECT') or None,
-              # Сервер сам склонирует доки при первом обращении и подтянет при следующих.
               "repoUrl": os.environ.get('REPO_URL') or None,
               "repoToken": os.environ.get('REPO_TOKEN') or None,
               "maxFiles": 15,
-              "refresh": True,
+              # Индекс НЕ пересобирается здесь: это работа ночного index-docs.
+              # Ревью только проверяет через ls-remote, не устарел ли индекс.
+              "refresh": False,
+              "ensureIfMissing": True,
           }).encode()
           req = urllib.request.Request(
               base.rstrip('/') + '/review', data=payload, method='POST',
