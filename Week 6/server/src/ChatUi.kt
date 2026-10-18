@@ -23,7 +23,9 @@ val CHAT_HTML = """
   .logo { width: 38px; height: 38px; border-radius: 10px; background: var(--accent); display: grid; place-items: center; font-weight: 700; }
   h1 { font-size: 17px; margin: 0; }
   .sub { color: var(--dim); font-size: 13px; }
-  .ticket { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; }
+  .ticket { display: flex; gap: 8px; align-items: center; margin-bottom: 14px; font-size: 13px; }
+  .ticket b { font-size: 14px; }
+  .ticket a { color: var(--dim); }
   .ticket label { color: var(--dim); font-size: 13px; }
   input { background: var(--card); border: 1px solid var(--line); color: var(--text); border-radius: 9px; padding: 9px 12px; font: inherit; }
   #chatId { width: 110px; }
@@ -52,12 +54,6 @@ val CHAT_HTML = """
     </div>
   </header>
 
-  <div class="ticket">
-    <label for="chatId">Ваше обращение</label>
-    <input id="chatId" value="3" inputmode="numeric">
-    <span class="sub">номер тикета — его назовёт поддержка</span>
-  </div>
-
   <div class="log" id="log"></div>
 
   <form id="f">
@@ -72,7 +68,18 @@ val CHAT_HTML = """
   const form = document.getElementById('f');
   const input = document.getElementById('msg');
   const send = document.getElementById('send');
-  const chatId = document.getElementById('chatId');
+  // Пользователь ни о чём не спрашивает, кроме сути проблемы: номер обращения
+  // ему знать не нужно — ассистент сам находит подходящее обращение в CRM.
+  // chatId — просто идентификатор сессии (нужен, чтобы помнить переписку).
+  const chatId = (() => {
+    const KEY = 'cf-support-chat';
+    let id = localStorage.getItem(KEY);
+    if (!id) {
+      id = 'web-' + Math.random().toString(36).slice(2, 10);
+      localStorage.setItem(KEY, id);
+    }
+    return id;
+  })();
 
   function add(role, text, sources, meta) {
     const div = document.createElement('div');
@@ -112,13 +119,15 @@ val CHAT_HTML = """
       const res = await fetch('/support/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ chatId: chatId.value.trim(), message: text })
+        body: JSON.stringify({ chatId: chatId, message: text })
       });
       const data = await res.json();
       pending.textContent = data.text || ('Ошибка: ' + (data.warning || res.status));
       const meta = [];
-      if (data.ticketId) meta.push('обращение #' + data.ticketId + (data.ticketStatus ? ' (' + data.ticketStatus + ')' : ''));
-      if (data.usedTicket) meta.push('учтён в ответе');
+      if (data.usedTicket) {
+        meta.push('обращение #' + data.ticketId + ' учтено в ответе');
+        if (data.ticketStatus) meta.push(data.ticketStatus);
+      }
       if (meta.length) {
         const m = document.createElement('div');
         m.className = 'meta';

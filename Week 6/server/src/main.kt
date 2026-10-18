@@ -16,6 +16,7 @@ import core.support.RawIssue
 import core.support.SUPPORT_TOP_K
 import core.support.SupportReply
 import core.support.SupportService
+import core.support.SupportSessions
 import core.support.SupportTicket
 import core.support.TICKET_STATUSES
 import java.net.InetSocketAddress
@@ -224,6 +225,9 @@ fun main() {
     // чатам десктоп-ассистента разработчика.
     val supportChats = ChatStore(svcAppDir(), "support_chats.json")
     val throttle = Throttle()
+    // Диалог помнит, какое обращение обсуждаем: продолжение разговора
+    // («а сроки какие?») не должно терять контекст тикета.
+    val sessions = SupportSessions()
 
     // POST /mcp — CRM как MCP-сервер (JSON-RPC 2.0).
     server.createContext("/mcp") { ex ->
@@ -433,7 +437,10 @@ fun main() {
                 SupportService.ask(
                     rag = svc, project = project, chatId = chatId, message = req.message.trim(),
                     apiKey = llmKey, history = history, crm = crm,
-                    topK = req.topK.coerceIn(1, 20), onLog = { m -> log(m) },
+                    topK = req.topK.coerceIn(1, 20),
+                    sessionTicketId = sessions.ticketOf(chatId),
+                    onTicketFound = { id -> sessions.remember(chatId, id) },
+                    onLog = { m -> log(m) },
                 )
             }
             // История — по тикету: то, что бот уже отвечал, влияет на следующий ответ.
@@ -517,7 +524,10 @@ fun main() {
                     // Ключ не от клиента: сервер берёт свой (env DEEPSEEK_API_KEY)
                     // либо локальную модель, если ключа нет.
                     apiKey = ex.requestHeaders.getFirst("X-LLM-Key")?.trim()?.takeIf { it.isNotBlank() },
-                    history = history, crm = crm, onLog = { m -> log(m) },
+                    history = history, crm = crm,
+                    sessionTicketId = sessions.ticketOf(chatId),
+                    onTicketFound = { id -> sessions.remember(chatId, id) },
+                    onLog = { m -> log(m) },
                 )
             }
             supportChats.appendMessage(chatId, RagMessage("user", req.message.trim()))

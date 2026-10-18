@@ -402,6 +402,8 @@ private suspend fun runCommand(args: Array<String>) {
                 val reply = SupportService.ask(
                     rag = svc, project = project, chatId = chatId, message = message,
                     apiKey = key, history = history, crm = crm, topK = topK,
+                    sessionTicketId = localSessions.ticketOf(chatId),
+                    onTicketFound = { id -> localSessions.remember(chatId, id) },
                     onLog = { m -> System.err.println("  · $m") },
                 )
                 chats.appendMessage(chatId, RagMessage("user", message))
@@ -701,6 +703,9 @@ private fun localCrmFor(project: String) =
 // RagService для локальных хелперов: создаётся один раз на процесс.
 private var localSvcInstance: RagService? = null
 
+// Тикет, обсуждаемый в диалоге: продолжение разговора не теряет контекст.
+private val localSessions = core.support.SupportSessions()
+
 private fun localSvc(): RagService =
     localSvcInstance ?: RagService().also { localSvcInstance = it }
 
@@ -716,6 +721,8 @@ private suspend fun askSupport(svc: RagService, c: SupportCase, server: String?)
         SupportService.ask(
             rag = svc, project = c.project, chatId = c.chatId, message = c.message,
             apiKey = llmKey(), crm = localCrmFor(c.project),
+            sessionTicketId = localSessions.ticketOf(c.chatId),
+            onTicketFound = { id -> localSessions.remember(c.chatId, id) },
         )
     }
 

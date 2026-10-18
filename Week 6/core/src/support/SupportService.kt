@@ -34,6 +34,43 @@ const val SUPPORT_MIN_SCORE = 0.3f
 const val SUPPORT_TOP_K = 8
 const val SUPPORT_FINAL_K = 4
 
+// Порог совпадения тикета с текстом обращения. Ниже — считаем, что такого
+// обращения в CRM нет, и отвечаем только по FAQ.
+const val SUPPORT_TICKET_MATCH = 0.45f
+
+// Совпадение по вектору недостаточно: «экран гаснет» и «обрыв загрузки модели»
+// похожи для эмбеддинга (0.64), но это разные проблемы. Поэтому требуем ещё и
+// общее содержательное слово — иначе тикет не берём.
+const val SUPPORT_TICKET_STRONG = 0.78f
+
+private val STOP_WORDS = setOf(
+    "не", "ни", "и", "в", "во", "на", "с", "со", "по", "у", "за", "из", "то", "что", "как",
+    "это", "все", "всё", "вот", "быть", "для", "от", "до", "при", "же", "или", "а", "но",
+    "уже", "бы", "если", "так", "который", "этот", "очень", "может", "можно", "меня", "мне",
+    "мой", "моя", "мои", "себе", "себя", "ещё", "еще", "там", "тут", "тогда", "чтобы",
+)
+
+// Слова пользователя и тикета для сопоставления: без стоп-слов, по началу слова.
+private fun contentWords(text: String): Set<String> =
+    text.lowercase()
+        .split(Regex("[^\\p{L}\\p{N}]+"))
+        .filter { it.length >= 4 && it !in STOP_WORDS }
+        .map { it.take(6) }
+        .toSet()
+
+// Только собственные слова тикета: заголовок и текст обращения.
+// Служебные строки блока (статус, подсказка «что сообщить») не считаем —
+// иначе любое слово «проблема» из подсказки создавало бы совпадение.
+private fun ticketOwnWords(ticketText: String): Set<String> {
+    val title = ticketText.substringAfter("— ", "").substringBefore('\n')
+    val body = if (ticketText.contains("Текст обращения:")) {
+        ticketText.substringAfter("Текст обращения:")
+    } else {
+        title
+    }
+    return contentWords("$title $body")
+}
+
 // Префикс RAG-документов тикетов: изолирует их от доков проекта в том же индексе.
 fun ticketPrefix(project: String) = "proj:$project:$TICKET_SOURCE_DIR/"
 
@@ -110,6 +147,22 @@ object SupportService {
         return refsFromHits(rag.search(query, "both", limit, sources), excerptLen = 0)
     }
 
+    // Найти тикет по тексту обращения — без номера. Пользователь номера не знает:
+    // он просто пишет вопрос, а ассистент сам сопоставляет его с обращением в CRM
+    // (семантический поиск по корпусу тикетов, тот же индекс, что и FAQ).
+    // Возвращает номер тикета и score совпадения.
+    suspend fun findTicketByMessage(
+        rag: RagService,
+        project: String,
+        message: String,
+    ): Pair<String, Float>? {
+        val best = searchTicketRefs(rag, project, message, limit = 3).maxByOrNull { it.score } ?: return null
+        if (best.score < SUPPORT_TICKET_MATCH) return null
+        val id = best.source.substringAfterLast('/').removeSuffix(".md")
+        if (id.isBlank() || id == "tickets") return null
+        return id to best.score
+    }
+
     // Один шаг диалога.
     //   mcp != null — CRM по MCP (обычный режим: бот здесь, CRM на VPS);
     //   mcp == null и crm != null — локальный режим CLI (без сети).
@@ -124,33 +177,66 @@ object SupportService {
         crm: CrmTools? = null,
         topK: Int = SUPPORT_TOP_K,
         temperature: Float = SUPPORT_MIN_SCORE,
+        // Тикет, который уже обсуждаем в этом диалоге (продолжение разговора).
+        sessionTicketId: String? = null,
+        // Вызывается, когда найдено обращение, — вызывающий запоминает его на сессию.
+        onTicketFound: (String) -> Unit = {},
         onLog: (String) -> Unit = {},
     ): SupportReply = withContext(Dispatchers.IO) {
         val clean = ProjectLoader.sanitizeName(project)
         val id = chatId.trim()
 
-        // 1) Тикет из CRM: точный доступ по номеру, а не догадка модели.
+        // 1) Тикет из CRM. Пользователь номера обращения не знает — он просто
+        // пишет вопрос. Поэтому сначала пробуем явный номер (если клиент его
+        // знает), а иначе САМИ ищем подходящее обращение по тексту сообщения.
         // Блок тикета всегда начинается с "Тикет #N" — этим же проверяем, что CRM
         // ответил данными, а не «не найдено».
-        val ticketText = resolveTicket(clean, id, mcp, crm, onLog)
+        var ticketText = resolveTicket(clean, id, mcp, crm, onLog)
+        var ticketId = ticketIdOf(ticketText)
+        if (!ticketText.startsWith(TICKET_HEADER)) {
+            val found = findTicketByMessage(rag, clean, message)
+            if (found != null) {
+                val (foundId, score) = found
+                val candidate = resolveTicket(clean, foundId, mcp, crm, onLog)
+                val shared = if (candidate.startsWith(TICKET_HEADER)) {
+                    contentWords(message).count { it in ticketOwnWords(candidate) }
+                } else {
+                    0
+                }
+                if (candidate.startsWith(TICKET_HEADER) && (shared > 0 || score >= SUPPORT_TICKET_STRONG)) {
+                    ticketText = candidate
+                    ticketId = foundId
+                    onLog(
+                        "обращение #$foundId найдено по тексту вопроса " +
+                            "(совпадение ${"%.2f".format(score)}, общих слов: $shared)"
+                    )
+                } else {
+                    onLog(
+                        "векторно похоже на #$foundId (${"%.2f".format(score)}), " +
+                            "но общих слов нет — обращение не берём"
+                    )
+                }
+            } else {
+                onLog("подходящего обращения в CRM не нашлось по тексту вопроса")
+            }
+            // Продолжение разговора: «а сроки какие?» — про то же обращение.
+            if (!ticketText.startsWith(TICKET_HEADER) && !sessionTicketId.isNullOrBlank()) {
+                val remembered = resolveTicket(clean, sessionTicketId, mcp, crm, onLog)
+                if (remembered.startsWith(TICKET_HEADER)) {
+                    ticketText = remembered
+                    ticketId = sessionTicketId
+                    onLog("продолжаем обращение #$sessionTicketId из этого диалога")
+                }
+            }
+        }
         val usedTicket = ticketText.startsWith(TICKET_HEADER)
-        val ticketId = ticketIdOf(ticketText).ifBlank { id }
+        if (usedTicket) onTicketFound(ticketId)
+        // В промпт тикет идёт только если он реально найден: текст «не найдено»
+        // модели видеть не нужно.
+        val ticketBlock = if (usedTicket) ticketText else ""
 
         // 2) FAQ/доки проекта.
         val (hits, faqWarning) = searchFaq(rag, clean, message, topK, temperature)
-
-        // 3) Похожие обращения — только если FAQ не ответил: иначе чужой баг
-        //    перебил бы документированный ответ.
-        val similar = if (hits.isEmpty() && id.isNotBlank()) {
-            val text = mcp?.callTool("search_tickets", buildJsonObject {
-                put("query", message)
-                put("project", clean)
-                put("limit", 3)
-            }) ?: crm?.let { c -> runCatching { findSimilar(c, clean, message) }.getOrNull() }
-            text.orEmpty()
-        } else {
-            ""
-        }
 
         val historyBlock = recentHistoryBlock(history)
 
@@ -168,9 +254,8 @@ object SupportService {
         }
 
         val faqContext = if (hits.isEmpty()) "" else buildContextBlock(hits)
-        val system = buildSupportSystem(clean, ticketText, maxOf(hits.size, 1), historyBlock)
-        val user = buildSupportUser(ticketText, faqContext, historyBlock, message) + similarBlock(similar)
-        if (similar.isNotBlank()) onLog("похожие обращения подмешаны: ${similar.take(160)}…")
+        val system = buildSupportSystem(clean, ticketBlock, maxOf(hits.size, 1), historyBlock)
+        val user = buildSupportUser(ticketBlock, faqContext, historyBlock, message)
 
         val key = rag.resolveApiKey(apiKey)
         val debug = RetrievalDebug(
@@ -184,7 +269,7 @@ object SupportService {
                 text = r.text.trim(),
                 chatId = id,
                 ticketId = ticketId,
-                ticketStatus = ticketStatusOf(ticketText),
+                ticketStatus = ticketStatusOf(ticketBlock),
                 usedTicket = usedTicket,
                 faqRefs = refsFromHits(hits),
                 historyUsed = history.size,
@@ -194,27 +279,24 @@ object SupportService {
             is core.llm.LlmResult.HttpError -> SupportReply(
                 text = "Поддержка временно недоступна (${rag.llmLabelOrProvider()} HTTP ${r.code}). " +
                     "Обращение #$ticketId уже зафиксировано — ответим, как связь восстановится.",
-                chatId = id, ticketId = ticketId, ticketStatus = ticketStatusOf(ticketText),
+                chatId = id, ticketId = ticketId, ticketStatus = ticketStatusOf(ticketBlock),
                 usedTicket = usedTicket, warning = "llm http ${r.code}",
             )
             is core.llm.LlmResult.NetworkError -> SupportReply(
                 text = "Поддержка временно недоступна: ${r.detail.take(120)}. " +
                     "Обращение #$ticketId уже зафиксировано.",
-                chatId = id, ticketId = ticketId, ticketStatus = ticketStatusOf(ticketText),
+                chatId = id, ticketId = ticketId, ticketStatus = ticketStatusOf(ticketBlock),
                 usedTicket = usedTicket, warning = "llm network",
             )
             core.llm.LlmResult.Empty -> SupportReply(
                 text = "Поддержка временно недоступна: пустой ответ модели.",
-                chatId = id, ticketId = ticketId, ticketStatus = ticketStatusOf(ticketText),
+                chatId = id, ticketId = ticketId, ticketStatus = ticketStatusOf(ticketBlock),
                 usedTicket = usedTicket, warning = "llm empty",
             )
         }
     }
 
     private const val TICKET_HEADER = "Тикет #"
-
-    private fun similarBlock(similar: String) = if (similar.isBlank()) "" else
-        "\n\nПОХОЖИЕ ОБРАЩЕНИЯ ДРУГИХ ПОЛЬЗОВАТЕЛЕЙ (справка, не подменяй ими ответ):\n$similar"
 
     // Тикет через MCP или локально. Отсутствие тикета — не ошибка: у пользователя
     // бывает вопрос до того, как он оформил обращение.
@@ -242,22 +324,6 @@ object SupportService {
             onLog("CRM не отдал тикет #$id: ${e.message}")
             ""
         }
-    }
-
-    // Лексический добор похожих обращений для локального режима (без MCP):
-    // слова запроса ищем в title/body/component тикетов.
-    private fun findSimilar(crm: CrmTools, project: String, query: String, limit: Int = 3): String {
-        val words = query.lowercase().split(Regex("[^\\p{L}\\p{N}]+")).filter { it.length >= 4 }.toSet()
-        if (words.isEmpty()) return ""
-        return crm.store(project).all()
-            .map { t ->
-                val hay = (t.title + " " + t.body + " " + t.component).lowercase()
-                t to words.count { hay.contains(it) }
-            }
-            .filter { it.second > 0 }
-            .sortedByDescending { it.second }
-            .take(limit)
-            .joinToString("\n\n") { ticketSummary(it.first) }
     }
 
     // Из текстового блока тикета обратно в структуру (блок строит CRM-тул).

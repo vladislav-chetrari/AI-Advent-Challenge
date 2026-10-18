@@ -430,6 +430,21 @@ class CrmStore(
     }
 }
 
+// Помним, какое обращение обсуждаем в диалоге. Продолжение разговора
+// («а сроки какие?») не содержит ключевых слов и заново не ищется — иначе
+// ассистент теряет контекст между репликами.
+class SupportSessions(private val max: Int = 1000) {
+    private val map = java.util.concurrent.ConcurrentHashMap<String, String>()
+
+    fun ticketOf(chatId: String): String? = map[chatId]?.takeIf { it.isNotBlank() }
+
+    fun remember(chatId: String, ticketId: String) {
+        if (ticketId.isBlank()) return
+        if (map.size > max) map.clear()
+        map[chatId] = ticketId
+    }
+}
+
 @Serializable
 data class CrmImportResult(
     val project: String = "",
