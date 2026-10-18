@@ -307,7 +307,20 @@ private suspend fun runCommand(args: Array<String>) {
             check(valid.size == 2 && valid.none { it.line == 99 }) { "validate: $valid" }
             check(valid.map { it.severity }.toSet() == setOf("bug", "arch")) { "sev: $valid" }
             check(core.project.ProjectLoader.repoNameFromUrl("https://github.com/o/my-svc.git") == "my-svc") { "repourl" }
-            check(core.project.ProjectLoader.repoNameFromUrl("https://github.com/o/my-svc") == "my-svc") { "repourl2" }
+            check(core.project.ProjectLoader.repoNameFromUrl("https://github.com/o/my-svc") == "my-svc") { "rejourl2" }
+            // Имя проекта приходит из HTTP-запроса и подставляется в путь repos/<имя>:
+            // любой разделитель пути обязан отсекаться, иначе это выход за пределы каталога.
+            val okNames = listOf("my-svc", "CallowFellow", "a.b", "a_b", "A1", "x")
+            okNames.forEach {
+                check(core.project.ProjectLoader.sanitizeName(it) == it) { "должно приниматься: $it" }
+            }
+            val badNames = listOf("a/b", "..", "../etc", "a\\b", "_x", "-x", "", "a b", "x/y", "a:b")
+            badNames.forEach {
+                val accepted = try {
+                    core.project.ProjectLoader.sanitizeName(it); true
+                } catch (_: Exception) { false }
+                check(!accepted) { "НЕЛЬЗЯ принимать имя проекта: '$it'" }
+            }
             println("VERIFY-REVIEW PASSED")
         }
         // Task 2: ревью PR. Ключ ТОЛЬКО из env (GH Secrets -> DEEPSEEK_API_KEY), на диск не пишем.
