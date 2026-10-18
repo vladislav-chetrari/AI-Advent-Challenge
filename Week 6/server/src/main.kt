@@ -88,6 +88,14 @@ private data class SupportAskRequest(
     val topK: Int = SUPPORT_TOP_K,
 )
 
+// Публичный запрос из чата в браузере: пользователю не нужен ни токен, ни ключ.
+@Serializable
+private data class SupportChatRequest(
+    val project: String = "",
+    val chatId: String = "",
+    val message: String = "",
+)
+
 private val json = Json { prettyPrint = false; ignoreUnknownKeys = true; isLenient = true }
 private val outJson = Json { prettyPrint = true; encodeDefaults = true }
 
@@ -215,6 +223,7 @@ fun main() {
     // История диалогов живёт рядом с CRM: отдельный chats.json, чтобы не мешать
     // чатам десктоп-ассистента разработчика.
     val supportChats = ChatStore(svcAppDir(), "support_chats.json")
+    val throttle = Throttle()
 
     // POST /mcp — CRM как MCP-сервер (JSON-RPC 2.0).
     server.createContext("/mcp") { ex ->
@@ -449,14 +458,106 @@ fun main() {
         }
     }
 
+    // ===== Пользовательская часть: чат в браузере =====
+    //
+    // Конечный пользователь не имеет ни VPS_TOKEN, ни DEEPSEEK_API_KEY.
+    // Поэтому /support/chat открыт наружу, а ключ модели берётся на сервере
+    // (env DEEPSEEK_API_KEY или локальная Ollama). Чтобы это не превратилось
+    // в открытый доступ к чужому ключу — простой троттлинг по IP.
+
+    server.createContext("/chat") { ex ->
+        try {
+            val b = CHAT_HTML.toByteArray()
+            ex.responseHeaders.add("Content-Type", "text/html; charset=utf-8")
+            ex.sendResponseHeaders(200, b.size.toLong())
+            ex.responseBody.use { it.write(b) }
+        } catch (e: Exception) {
+            fail(ex, "chat ui failed", e)
+        } finally {
+            ex.close()
+        }
+    }
+
+    server.createContext("/support/chat") { ex ->
+        try {
+            if (ex.requestMethod != "POST") {
+                ex.sendResponseHeaders(405, -1)
+                return@createContext
+            }
+            val ip = ex.remoteAddress?.address?.hostAddress ?: "?"
+            if (!throttle.allow(ip)) {
+                val msg = "Слишком много сообщений подряд. Подождите минуту."
+                val b = msg.toByteArray()
+                ex.sendResponseHeaders(429, b.size.toLong())
+                ex.responseBody.use { it.write(b) }
+                return@createContext
+            }
+            val body = ex.requestBody.bufferedReader().readText()
+            val req = try {
+                json.decodeFromString(SupportChatRequest.serializer(), body)
+            } catch (e: Exception) {
+                val msg = "bad request: ${e.message}".toByteArray()
+                ex.sendResponseHeaders(400, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+                return@createContext
+            }
+            if (req.message.isBlank()) {
+                val msg = "empty message".toByteArray()
+                ex.sendResponseHeaders(400, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+                return@createContext
+            }
+            val project = req.project.trim().ifBlank { defaultProject }
+            val chatId = req.chatId.trim().ifBlank { "guest" }
+            val history = supportChats.state.messages[chatId].orEmpty().takeLast(10)
+            val t0 = System.currentTimeMillis()
+            val res: SupportReply = runBlocking {
+                SupportService.ask(
+                    rag = svc, project = project, chatId = chatId, message = req.message.trim(),
+                    // Ключ не от клиента: сервер берёт свой (env DEEPSEEK_API_KEY)
+                    // либо локальную модель, если ключа нет.
+                    apiKey = ex.requestHeaders.getFirst("X-LLM-Key")?.trim()?.takeIf { it.isNotBlank() },
+                    history = history, crm = crm, onLog = { m -> log(m) },
+                )
+            }
+            supportChats.appendMessage(chatId, RagMessage("user", req.message.trim()))
+            supportChats.appendMessage(chatId, RagMessage("assistant", res.text, refs = res.faqRefs))
+            log("чат $project/$chatId за ${(System.currentTimeMillis() - t0) / 1000}с: тикет=${res.usedTicket} faq=${res.faqRefs.size}")
+            sendJson(ex, 200, outJson.encodeToString(SupportReply.serializer(), res))
+        } catch (e: Exception) {
+            fail(ex, "support chat failed", e)
+        } finally {
+            ex.close()
+        }
+    }
+
     server.start()
     log(
         "review-server on :$port (эндпоинты: /health /review /index /mcp /crm/import /crm/tickets " +
-            "/crm/ticket /support/ask; продукт поддержки: $defaultProject; VPS_TOKEN задан: ${token.isNotBlank()})"
+            "/crm/ticket /support/ask; ПУБЛИЧНО: /chat (страница) /support/chat; " +
+            "продукт поддержки: $defaultProject; VPS_TOKEN задан: ${token.isNotBlank()})"
     )
 }
 
 private fun svcAppDir(): java.io.File = core.llm.ApiKeyProvider.appDir()
+
+// Троттлинг публичного чата: N сообщений в минуту с одного IP.
+// Живой в памяти процесса — для демо этого достаточно.
+private class Throttle(private val perMinute: Int = 12) {
+    private val hits = java.util.concurrent.ConcurrentHashMap<String, java.util.ArrayDeque<Long>>()
+
+    fun allow(ip: String): Boolean {
+        val now = System.currentTimeMillis()
+        val q = hits.computeIfAbsent(ip) { java.util.ArrayDeque() }
+        synchronized(q) {
+            while (q.isNotEmpty() && now - q.peekFirst() > 60_000) q.pollFirst()
+            if (q.size >= perMinute) return false
+            q.addLast(now)
+        }
+        if (hits.size > 5000) hits.entries.removeIf { it.value.isEmpty() }
+        return true
+    }
+}
 
 // Авторизация общая для всех защищённых ручек: Bearer-токен, без разных секретов.
 private fun authed(ex: HttpExchange, token: String): Boolean {
