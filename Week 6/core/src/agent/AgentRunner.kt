@@ -36,8 +36,10 @@ class AgentRunner(
         project: String,
         seedHistory: List<ChatMsg> = emptyList(),
         apiKey: String? = null,
+        // Прогон пишется в историю агентного чата; пусто = CLI без чата.
+        chatId: String = "",
     ): AgentRun {
-        var run = AgentMachine.newRun(project, goal)
+        var run = AgentMachine.newRun(project, goal, chatId)
         // Снапшоты пишем в папку RunStore — по ней же работает откат.
         // Без этого откат искал бы файлы не там и (до фикса метки) удалял их.
         workspace.runIdForSnapshot = run.id

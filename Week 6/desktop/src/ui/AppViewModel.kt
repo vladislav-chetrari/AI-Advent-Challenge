@@ -20,6 +20,8 @@ import core.llm.LlmSettings
 import core.llm.LlmSettingsStore
 import core.project.GitTools
 import core.project.ProjectEntry
+import core.rag.CHAT_KIND_AGENT
+import core.rag.CHAT_KIND_RAG
 import core.rag.ChatStore
 import core.rag.DocInfo
 import core.rag.EmbedSettings
@@ -50,6 +52,9 @@ data class UiState(
     val status: String? = null,
     val showCreateChat: Boolean = false,
     val createName: String = "",
+    // Какой чат создаём: CHAT_KIND_RAG (вопросы по базе) или CHAT_KIND_AGENT
+    // (только работа с файлами). Разделены в сайдбаре на две секции.
+    val createKind: String = CHAT_KIND_RAG,
     // Стратегия чанкинга для новых статей: "fixed" | "structure" | "both".
     val addStrategy: String = "both",
     // Week 6 Task 1: проекты вместо wiki-статей.
@@ -112,6 +117,14 @@ data class UiState(
     // Автопринятие правок (как --auto-approve в CLI): по умолчанию выключено.
     val agentAutoApprove: Boolean = false,
 ) {
+    // Две секции сайдбара. Держать один список было путано: у информационного
+    // чата вопросы по базе, у агентного — только прогоны по файлам.
+    val ragChats: List<RagChat> get() = chats.filter { !it.isAgent }
+    val agentChats: List<RagChat> get() = chats.filter { it.isAgent }
+
+    // История прогонов активного агентного чата (у каждого своя).
+    val chatRuns: List<AgentRun> get() = agentRuns.filter { it.chatId == activeChatId }
+
     val indexSummary: String
         get() {
             val sel = selectedProject
@@ -144,9 +157,11 @@ class AppViewModel(private val scope: CoroutineScope) {
             activeChatId = first,
             messages = st.messages[first].orEmpty(),
             taskMemory = first?.let { chats.getMemory(it) },
+            showAgentPanel = st.chats.firstOrNull { it.id == first }?.isAgent == true,
             embedLabel = svc.embedLabel,
             llmLabel = svc.llmLabel,
         )
+        refreshAgentRuns()
         refreshProjects()
     }
 
@@ -158,29 +173,63 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     // --- чаты ---
 
-    fun openCreateChat() = update { it.copy(showCreateChat = true, createName = "") }
+    fun openCreateChat(kind: String = CHAT_KIND_RAG) = update { it.copy(showCreateChat = true, createName = "", createKind = kind) }
     fun closeCreateChat() = update { it.copy(showCreateChat = false) }
     fun setCreateName(v: String) = update { it.copy(createName = v) }
 
     fun commitCreateChat() {
-        val name = _state.value.createName.trim().ifBlank { "Чат" }
-        val chat = RagChat(id = newChatId(), name = name)
+        val kind = _state.value.createKind
+        val name = _state.value.createName.trim().ifBlank { if (kind == CHAT_KIND_AGENT) "Агентный чат" else "Чат" }
+        val chat = RagChat(id = newChatId(), name = name, kind = kind, ragEnabled = kind != CHAT_KIND_AGENT)
         chats.upsertChat(chat)
-        update { it.copy(showCreateChat = false, chats = chats.state.chats, activeChatId = chat.id, messages = emptyList(), taskMemory = TaskMemory(), viewingDoc = null) }
+        update {
+            it.copy(
+                showCreateChat = false, chats = chats.state.chats, activeChatId = chat.id,
+                messages = emptyList(), taskMemory = TaskMemory(), viewingDoc = null,
+                // Агентный чат открывается сразу на панели агента и пустой целью.
+                showAgentPanel = kind == CHAT_KIND_AGENT, agentGoal = "", agentRun = null,
+                agentLog = emptyList(), showAgentDiff = false,
+            )
+        }
+        refreshAgentRuns()
     }
 
     fun selectChat(id: String) {
-        update { it.copy(activeChatId = id, messages = chats.state.messages[id].orEmpty(), taskMemory = chats.getMemory(id), viewingDoc = null, status = null) }
+        val chat = chats.state.chats.firstOrNull { it.id == id }
+        update {
+            it.copy(
+                activeChatId = id,
+                messages = chats.state.messages[id].orEmpty(),
+                taskMemory = chats.getMemory(id),
+                viewingDoc = null,
+                status = null,
+                // Панель агента — только в агентном чате; в информационном её нет.
+                showAgentPanel = chat?.isAgent == true,
+                agentGoal = "",
+                agentLog = emptyList(),
+            )
+        }
+        if (chat?.isAgent == true) {
+            // Открываем чат на его последнем прогоне — иначе панель пустая.
+            agentStore.load()
+            update { it.copy(agentRuns = agentStore.runs, agentRun = agentStore.latestForChat(id), showAgentDiff = false) }
+        }
     }
 
     fun deleteChat(id: String) {
         chats.deleteChat(id)
+        // Прогоны удалённого чата остаются в agent_runs.json (их видно и откатывать
+        // можно из CLI), но из панели чата исчезают — привязки больше нет.
+        agentStore.detachChat(id)
         val rest = chats.state.chats
+        val next = if (_state.value.activeChatId == id) rest.firstOrNull()?.id else _state.value.activeChatId
         update {
             it.copy(
                 chats = rest,
-                activeChatId = if (it.activeChatId == id) rest.firstOrNull()?.id else it.activeChatId,
-                messages = chats.state.messages[if (it.activeChatId == id) rest.firstOrNull()?.id else it.activeChatId].orEmpty(),
+                activeChatId = next,
+                messages = next?.let { cid -> chats.state.messages[cid].orEmpty() }.orEmpty(),
+                taskMemory = next?.let { cid -> chats.getMemory(cid) },
+                agentRuns = agentStore.runs,
                 viewingDoc = null,
             )
         }
@@ -188,6 +237,8 @@ class AppViewModel(private val scope: CoroutineScope) {
 
     fun toggleRag(id: String) {
         val c = chats.state.chats.firstOrNull { it.id == id } ?: return
+        // У агентного чата нет RAG: он работает с файлами проекта, а не с базой знаний.
+        if (c.isAgent) return
         if (!c.ragEnabled) {
             // Включение RAG — сначала проба связи с моделью.
             // Нет модели на порту — чистая ошибка, тумблер не двигается.
@@ -229,6 +280,12 @@ class AppViewModel(private val scope: CoroutineScope) {
         val chat = chats.state.chats.firstOrNull { it.id == chatId } ?: return
         val text = st.input.trim()
         if (st.busy || text.isEmpty()) return
+        // Агентный чат — только работа с файлами: вопросов по базе знаний в нём нет,
+        // цель ставится полем в панели агента, а не перепиской.
+        if (chat.isAgent) {
+            update { it.copy(input = "", status = "В агентном чате нет переписки — поставь цель в панели агента.") }
+            return
+        }
         // Week 6 Task 1: локальные команды проекта (без LLM, через MCP-тулы).
         if (handleLocalCommand(text, chatId)) {
             update { it.copy(input = "") }
@@ -515,7 +572,10 @@ class AppViewModel(private val scope: CoroutineScope) {
         val auto = _state.value.agentAutoApprove
         val gate = PermissionGate(agentPerms, if (auto) null else { change -> requestApproval(change) })
         val seed = chatId?.let { id ->
-            chats.state.messages[id].orEmpty().takeLast(6).map { ChatMsg(it.role, it.content) }
+            // В агентном чате переписка — это лог прошлых прогонов; скармливать его
+            // модели за контекст незачем. Историю задаёт сам агентный чат через RunStore.
+            if (chats.state.chats.firstOrNull { it.id == id }?.isAgent == true) emptyList()
+            else chats.state.messages[id].orEmpty().takeLast(6).map { ChatMsg(it.role, it.content) }
         }.orEmpty()
 
         update {
@@ -535,7 +595,7 @@ class AppViewModel(private val scope: CoroutineScope) {
                 onUpdate = { r -> update { it.copy(agentRun = r, agentRuns = agentStore.runs) } },
                 onLog = { line -> update { it.copy(agentLog = (it.agentLog + line).takeLast(200)) } },
             )
-            val run = runner.run(goal, project, seedHistory = seed)
+            val run = runner.run(goal, project, seedHistory = seed, chatId = chatId ?: "")
             approval?.cancel()
             approval = null
             // Финальный ответ агента — обычное сообщение чата: так он остаётся
@@ -598,6 +658,12 @@ class AppViewModel(private val scope: CoroutineScope) {
         val n = agentStore.revert(run, Workspace(dir))
         update { it.copy(agentRun = agentStore.get(run.id) ?: run, agentRuns = agentStore.runs) }
         log("Откачено файлов: $n")
+    }
+
+    // Открыть прогон в панели агента: щелчок по строке истории чата.
+    fun openRun(id: String) {
+        val run = agentStore.get(id) ?: return
+        update { it.copy(agentRun = run, showAgentPanel = true, showAgentDiff = run.diff.isNotBlank()) }
     }
 
     // --- единый диалог настроек: LLM + эмбеддинги (как Week 5 SettingsTab) ---

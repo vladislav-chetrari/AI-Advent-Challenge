@@ -83,6 +83,9 @@ data class AgentRun(
     val id: String,
     val project: String,
     val goal: String = "",
+    // Прогон принадлежит агентному чату: у каждого своя история прогонов,
+    // дифов и откатов. Пусто = headless-прогон из CLI, без чата.
+    val chatId: String = "",
     val state: RunState = RunState.Idle,
     val steps: Int = 0,
     val invocations: List<ToolInvocation> = emptyList(),
@@ -365,12 +368,13 @@ object AgentMachine {
         !run.state.let { it is RunState.Done || it is RunState.Failed || it is RunState.Cancelled } &&
             budgetReason(run, cfg) == null
 
-    fun newRun(project: String, goal: String): AgentRun {
+    fun newRun(project: String, goal: String, chatId: String = ""): AgentRun {
         val now = System.currentTimeMillis()
         return AgentRun(
             id = "run_" + now.toString(36) + "_" + java.util.UUID.randomUUID().toString().take(4),
             project = project,
             goal = goal,
+            chatId = chatId,
             startedAt = now,
             updatedAt = now,
         )
@@ -430,6 +434,21 @@ class RunStore(appDir: File = core.llm.ApiKeyProvider.appDir()) {
     fun get(id: String): AgentRun? = runs.firstOrNull { it.id == id }
 
     fun latest(): AgentRun? = runs.lastOrNull()
+
+    // История прогонов одного агентного чата. Без неё в панели агента нельзя
+    // показать «что этот чат уже делал» — все чаты делили один список.
+    fun forChat(chatId: String): List<AgentRun> = runs.filter { it.chatId == chatId }
+
+    fun latestForChat(chatId: String): AgentRun? = forChat(chatId).lastOrNull()
+
+    // Отвязать прогоны от удалённого чата: история не пропадает (её видно в
+    // CLI), но в панели чата больше не всплывает.
+    fun detachChat(chatId: String) {
+        synchronized(lock) {
+            runs = runs.map { if (it.chatId == chatId) it.copy(chatId = "") else it }
+            persistLocked()
+        }
+    }
 
     fun delete(id: String) {
         synchronized(lock) {

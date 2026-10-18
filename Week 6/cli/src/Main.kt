@@ -12,6 +12,8 @@ import core.rag.DEFAULT_RETRIEVE_K
 import core.rag.RagChat
 import core.rag.RagMessage
 import core.rag.RagService
+import core.rag.agentChats
+import core.rag.ragChats
 import core.rag.RerankModes
 import core.rag.ReviewResult
 import core.rag.newChatId
@@ -619,8 +621,8 @@ private suspend fun runCommand(args: Array<String>) {
             println("VERIFY-SUPPORT PASSED")
         }
         // ===== Task 4: агент, который сам работает с файлами проекта =====
-        //   agent-run --goal "цель" [--project P] [--auto-approve] [--max-steps N]
-        //            [--max-files N] [--out run.json] [--format json|md]
+        //   agent-run --goal "цель" [--project P] [--chat <имя>] [--auto-approve]
+        //            [--max-steps N] [--max-files N] [--out run.json] [--format json|md]
         "agent-run" -> {
             val (_, rest) = splitPaths(args)
             val goal = flag(rest, "--goal")?.takeIf { it.isNotBlank() } ?: fail("нужен --goal \"<цель>\"")
@@ -643,6 +645,11 @@ private suspend fun runCommand(args: Array<String>) {
             )
             println("Проект: $projectName · ${ws.listFiles(limit = 5000).size} файлов")
             println("Цель: $goal")
+            // --chat <имя> — привязать прогон к агентному чату: та же история
+            // прогонов и дифов, что и в desktop, но без окна.
+            val chatName = flag(rest, "--chat")
+            val chatId = chatName?.let { findOrCreateAgentChat(ChatStore(), it) }.orEmpty()
+            if (chatName != null) println("Агентный чат: $chatName")
             if (auto) println("Режим --auto-approve: изменения пишутся без подтверждения.")
             println("—".repeat(60))
             val runner = core.agent.AgentRunner(
@@ -658,7 +665,7 @@ private suspend fun runCommand(args: Array<String>) {
                 },
                 onLog = { println("   · $it") },
             )
-            val run = runner.run(goal, projectName)
+            val run = runner.run(goal, projectName, chatId = chatId)
             println("—".repeat(60))
             printRun(run)
             val out = flag(rest, "--out")
@@ -700,7 +707,8 @@ private suspend fun runCommand(args: Array<String>) {
                 println("Прогонов пока нет.")
             } else {
                 store.runs.sortedBy { it.startedAt }.forEach { r ->
-                    println("${r.id}  ${r.label()}  файлов=${r.changedFiles.size}  ${r.goal.take(60)}")
+                    val chat = r.chatId.takeIf { it.isNotBlank() }
+                    println("${r.id}  ${r.label()}  файлов=${r.changedFiles.size}${chat?.let { "  чат=$it" } ?: ""}  ${r.goal.take(60)}")
                 }
             }
         }
@@ -1227,6 +1235,35 @@ private fun verifyAgent() {
         }
         println("OK обязательные аргументы")
 
+        // --- 14. Разделение чатов: информационные и агентные ---
+        // Ключевая проверка разделения: у агентного чата свой список прогонов,
+        // а удаление чата не стирает историю, а отвязывает её.
+        val chatStore = ChatStore(tmp, "chats_split.json")
+        val infoChat = RagChat(id = "c1", name = "вопросы")
+        val agentChat = RagChat(id = "a1", name = "правки", ragEnabled = false, kind = core.rag.CHAT_KIND_AGENT)
+        chatStore.upsertChat(infoChat)
+        chatStore.upsertChat(agentChat)
+        check(!infoChat.isAgent && agentChat.isAgent) { "вид чата определён неверно" }
+        check(infoChat.kind == core.rag.CHAT_KIND_RAG) { "чат по умолчанию должен быть информационным" }
+        check(chatStore.state.ragChats().map { it.id } == listOf("c1")) { "информационные чаты отфильтрованы неверно" }
+        check(chatStore.state.agentChats().map { it.id } == listOf("a1")) { "агентные чаты отфильтрованы неверно" }
+        val runStore = core.agent.RunStore(tmp)
+        val rA = core.agent.AgentMachine.newRun("demo", "найти X", chatId = "a1")
+        val rB = core.agent.AgentMachine.newRun("demo", "найти Y", chatId = "a1")
+        val rC = core.agent.AgentMachine.newRun("demo", "headless")
+        listOf(rA, rB, rC).forEach { runStore.save(it) }
+        check(runStore.forChat("a1").map { it.id } == listOf(rA.id, rB.id)) {
+            "прогоны агентного чата не те, что нужно: ${runStore.forChat("a1").map { it.id }}"
+        }
+        check(runStore.latestForChat("a1")?.id == rB.id) { "последний прогон чата выбран неверно" }
+        check(runStore.forChat("c1").isEmpty()) { "у информационного чата появились прогоны" }
+        check(runStore.forChat("a1").none { it.chatId == "" }) { "отвязанный прогон попал в чат" }
+        runStore.detachChat("a1")
+        check(runStore.forChat("a1").isEmpty()) { "после удаления чата прогоны остались в нём" }
+        check(runStore.runs.size == 3) { "отвязка чата удалила прогоны из истории" }
+        check(runStore.get(rC.id)?.chatId == null || runStore.get(rC.id)?.chatId == "") { "headless-прогон привязался к чату" }
+        println("OK разделение чатов и история прогонов")
+
         println("VERIFY-AGENT PASSED")
     } finally {
         try {
@@ -1278,7 +1315,7 @@ private fun usage() {
     println("week6 verify-support")
     println("  Task 3: оффлайн-проверка слоя поддержки (фронтматтер, MCP, промпт, CRM).")
     println()
-    println("week6 agent-run --goal \"цель\" [--project <имя>] [--auto-approve] [--max-steps 8] [--max-files 10] [--out run.json]")
+    println("week6 agent-run --goal \"цель\" [--project <имя>] [--chat <имя>] [--auto-approve] [--max-steps 8] [--max-files 10] [--out run.json]")
     println("  Task 4: агент с доступом к файлам. Цель ставит человек, файлы выбирает агент.")
     println("  Без --auto-approve каждое изменение спрашивает подтверждение (показывается diff).")
     println("week6 agent-tools [--project <имя>]")
@@ -1294,6 +1331,15 @@ private fun usage() {
 private fun findOrCreateChat(chats: ChatStore, name: String): String {
     chats.state.chats.firstOrNull { it.name == name }?.let { return it.id }
     val chat = RagChat(id = newChatId(), name = name)
+    chats.upsertChat(chat)
+    return chat.id
+}
+
+// Task 4: агентный чат по имени — прогон из CLI попадает в его историю,
+// и в desktop он виден в секции «Агентные чаты» вместе с diff.
+private fun findOrCreateAgentChat(chats: ChatStore, name: String): String {
+    chats.state.chats.firstOrNull { it.isAgent && it.name == name }?.let { return it.id }
+    val chat = RagChat(id = newChatId(), name = name, ragEnabled = false, kind = core.rag.CHAT_KIND_AGENT)
     chats.upsertChat(chat)
     return chat.id
 }

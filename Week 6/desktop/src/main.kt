@@ -62,6 +62,8 @@ import com.mikepenz.markdown.m3.Markdown
 import core.agent.PendingChange
 import core.llm.LlmSettings
 import core.project.ProjectEntry
+import core.rag.CHAT_KIND_AGENT
+import core.rag.CHAT_KIND_RAG
 import core.rag.DocInfo
 import core.rag.RagChat
 import core.rag.RagMessage
@@ -82,24 +84,43 @@ fun Root() {
     val st by vm.state.collectAsState()
 
     Row(Modifier.fillMaxSize()) {
-        // Слева: дерево как в Week 2
+        // Слева: две секции чатов — информационные и агентные
         Column(
             Modifier.width(340.dp).fillMaxHeight().background(Color(0xFF1E1E1E)).padding(8.dp)
         ) {
             Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
                 Text("Чаты", color = Color.White, fontWeight = FontWeight.Bold)
-                Button(onClick = vm::openCreateChat) { Text("+") }
+                Button(onClick = { vm.openCreateChat(CHAT_KIND_RAG) }) { Text("+") }
             }
             Spacer(Modifier.height(4.dp))
-            LazyColumn(Modifier.fillMaxWidth().heightIn(max = 260.dp)) {
-                items(st.chats, key = { "c${it.id}" }) { c ->
+            LazyColumn(Modifier.fillMaxWidth().heightIn(max = 180.dp)) {
+                items(st.ragChats, key = { "c${it.id}" }) { c ->
                     ChatRow(c, selected = c.id == st.activeChatId,
                         onOpen = { vm.selectChat(c.id) },
                         onToggleRag = { vm.toggleRag(c.id) },
                         onDelete = { vm.deleteChat(c.id) })
                 }
-                if (st.chats.isEmpty()) {
+                if (st.ragChats.isEmpty()) {
                     item { Text("Нет чатов — создай через +", color = Color(0xFF888888), fontSize = 12.sp) }
+                }
+            }
+            Spacer(Modifier.height(8.dp))
+            // Агентные чаты — отдельной секцией: у них своя история прогонов
+            // и им не нужны вопросы по базе знаний.
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween, verticalAlignment = Alignment.CenterVertically) {
+                Text("🎯 Агентные чаты", color = Color(0xFF9CCC9C), fontWeight = FontWeight.Bold)
+                Button(onClick = { vm.openCreateChat(CHAT_KIND_AGENT) }) { Text("+") }
+            }
+            Spacer(Modifier.height(4.dp))
+            LazyColumn(Modifier.fillMaxWidth().heightIn(max = 140.dp)) {
+                items(st.agentChats, key = { "a${it.id}" }) { c ->
+                    ChatRow(c, selected = c.id == st.activeChatId,
+                        onOpen = { vm.selectChat(c.id) },
+                        onToggleRag = {},
+                        onDelete = { vm.deleteChat(c.id) })
+                }
+                if (st.agentChats.isEmpty()) {
+                    item { Text("Агент работает с файлами проекта — заведи чат через +", color = Color(0xFF888888), fontSize = 12.sp) }
                 }
             }
             Spacer(Modifier.height(8.dp))
@@ -160,6 +181,8 @@ fun Root() {
                 val chat = st.chats.firstOrNull { it.id == st.activeChatId }
                 if (chat == null) {
                     Text("Выбери чат слева или создай новый (+)", modifier = Modifier.padding(12.dp))
+                } else if (chat.isAgent) {
+                    AgentChatPane(vm, chat)
                 } else {
                     ChatPane(vm, chat)
                 }
@@ -181,20 +204,32 @@ fun Root() {
 
 @Composable
 fun ChatRow(c: RagChat, selected: Boolean, onOpen: () -> Unit, onToggleRag: () -> Unit, onDelete: () -> Unit) {
+    val agent = c.isAgent
     Row(
         Modifier.fillMaxWidth()
             .background(if (selected) Color(0xFF2D2D2D) else Color.Transparent)
             .padding(horizontal = 8.dp, vertical = 4.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        // У агентного чата нет переключателя RAG — значок просто метка вида.
         Text(
-            "💬", fontSize = 13.sp,
-            modifier = Modifier.padding(end = 6.dp).clickable(onClick = onToggleRag),
-            color = if (c.ragEnabled) Color(0xFF7DD87D) else Color(0xFF777777),
+            if (agent) "🎯" else "💬", fontSize = 13.sp,
+            modifier = if (agent) Modifier.padding(end = 6.dp) else Modifier.padding(end = 6.dp).clickable(onClick = onToggleRag),
+            color = when {
+                agent -> Color(0xFF1E88E5)
+                c.ragEnabled -> Color(0xFF7DD87D)
+                else -> Color(0xFF777777)
+            },
         )
         Text(
-            c.name + if (c.ragEnabled) "" else "  (без RAG)",
-            color = if (selected) Color(0xFF7DD87D) else Color(0xFF9CCC9C),
+            c.name + if (!agent && !c.ragEnabled) "  (без RAG)" else "",
+            color = if (selected) {
+                if (agent) Color(0xFF90CAF9) else Color(0xFF7DD87D)
+            } else if (agent) {
+                Color(0xFF64B5F6)
+            } else {
+                Color(0xFF9CCC9C)
+            },
             fontSize = 14.sp, modifier = Modifier.weight(1f).clickable(onClick = onOpen), maxLines = 1,
         )
         Text("×", color = Color(0xFF777777), fontSize = 14.sp, modifier = Modifier.clickable(onClick = onDelete).padding(start = 4.dp))
@@ -312,18 +347,8 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
                 TextButton(onClick = vm::openRagSettings) { Text("RAG ⚙", fontSize = 12.sp) }
             }
             Spacer(Modifier.width(8.dp))
-            TextButton(onClick = vm::toggleAgentPanel) {
-                Text(
-                    if (st.showAgentPanel) "🎯 Агент ▲" else "🎯 Агент",
-                    fontSize = 12.sp,
-                    color = if (st.agentRun != null) Color(0xFF1E88E5) else Color.Gray,
-                )
-            }
             TextButton(onClick = { vm.clearChat(chat.id) }) { Text("очистить", fontSize = 12.sp) }
         }
-        // Task 4: панель агента над перепиской — видна и по кнопке, и сама
-        // при старте прогона, чтобы ход не терялся в общем потоке сообщений.
-        if (st.showAgentPanel) AgentPane(vm, st.agentRun)
         if (!chat.ragEnabled) {
             Text(
                 "RAG выключен — отвечаю без базы знаний",
@@ -397,6 +422,102 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
             Button(onClick = vm::send, enabled = !st.busy && st.input.isNotBlank()) {
                 Text(if (st.busy) "..." else "➤")
             }
+        }
+    }
+}
+
+// Агентный чат: без переписки и RAG-вопросов. Тут цель, ход агента и история
+// прогонов ИМЕННО этого чата (у каждого агентного чата она своя).
+@Composable
+fun AgentChatPane(vm: AppViewModel, chat: RagChat) {
+    val st by vm.state.collectAsState()
+    Column(Modifier.fillMaxHeight()) {
+        Row(
+            Modifier.fillMaxWidth().background(Color(0xFFEAF1FB)).padding(horizontal = 12.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("🎯 ${chat.name}", fontWeight = FontWeight.Bold, fontSize = 15.sp, modifier = Modifier.weight(1f), maxLines = 1)
+            Text(
+                st.selectedProject?.let { "проект: $it" } ?: "проект не выбран",
+                fontSize = 12.sp, color = if (st.selectedProject != null) Color.Gray else Color(0xFFB00020),
+            )
+            Spacer(Modifier.width(8.dp))
+            TextButton(onClick = { vm.clearChat(chat.id) }) { Text("очистить лог", fontSize = 12.sp) }
+        }
+        if (st.selectedProject == null) {
+            Text(
+                "Агент работает с файлами проекта — выбери проект в «Проекты» ниже.",
+                fontSize = 11.sp, color = Color(0xFFB00020), modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp),
+            )
+        }
+        // Ход текущего прогона: цель, вызовы тулов, журнал, diff.
+        if (st.showAgentPanel) AgentPane(vm, st.agentRun)
+        // История прогонов чата: клик открывает прогон (его trace и diff).
+        val runs = st.chatRuns
+        Text(
+            "прогоны этого чата: ${runs.size}",
+            fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.DarkGray,
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+        )
+        if (runs.isEmpty()) {
+            Text(
+                "Прогонов пока нет. Поставь цель выше и нажми «▶ Старт».",
+                fontSize = 12.sp, color = Color.Gray, modifier = Modifier.padding(horizontal = 12.dp),
+            )
+        } else {
+            LazyColumn(Modifier.fillMaxWidth().heightIn(max = 170.dp)) {
+                items(runs.reversed(), key = { "r${it.id}" }) { r ->
+                    val active = st.agentRun?.id == r.id
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .background(if (active) Color(0xFFEDF3FB) else Color.Transparent)
+                            .clickable { vm.openRun(r.id) }
+                            .padding(horizontal = 12.dp, vertical = 3.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Box(
+                            Modifier.background((STATE_COLORS[stateKey(r)] ?: Color.Gray).copy(alpha = 0.15f))
+                                .padding(horizontal = 6.dp, vertical = 1.dp),
+                        ) {
+                            Text(r.label(), fontSize = 10.sp, color = STATE_COLORS[stateKey(r)] ?: Color.Gray, fontWeight = FontWeight.Bold)
+                        }
+                        Spacer(Modifier.width(6.dp))
+                        Column(Modifier.weight(1f)) {
+                            Text(r.goal.ifBlank { "(без цели)" }, fontSize = 12.sp, maxLines = 1)
+                            Text(
+                                "${r.id} · шагов ${r.steps} · вызовов ${r.invocations.size} · файлов ${r.changedFiles.size}",
+                                fontSize = 10.sp, color = Color.Gray, maxLines = 1,
+                            )
+                        }
+                        if (r.changedFiles.isNotEmpty()) {
+                            TextButton(onClick = { vm.revertRun(r.id) }) { Text("откатить", fontSize = 10.sp) }
+                        }
+                    }
+                }
+            }
+        }
+        // Лог чата: цель и финальный ответ по каждому прогону. Переписки нет —
+        // это след, а не диалог с ассистентом.
+        val messages = st.messages
+        if (messages.isNotEmpty()) {
+            Text(
+                "лог чата",
+                fontSize = 12.sp, fontWeight = FontWeight.Bold, color = Color.DarkGray,
+                modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp),
+            )
+            val logState = rememberLazyListState()
+            LaunchedEffect(chat.id, messages.size) { logState.scrollToItem(messages.size - 1) }
+            Box(Modifier.weight(1f).fillMaxWidth()) {
+                LazyColumn(state = logState, modifier = Modifier.fillMaxSize().padding(start = 12.dp, end = 20.dp)) {
+                    items(messages, key = { it.id }) { m -> MessageBubble(m) }
+                }
+                VerticalScrollbar(
+                    adapter = rememberScrollbarAdapter(logState),
+                    modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight().padding(end = 4.dp),
+                )
+            }
+        } else {
+            Spacer(Modifier.weight(1f))
         }
     }
 }
@@ -735,21 +856,30 @@ fun RagSettingsDialog(vm: AppViewModel) {
 @Composable
 fun CreateChatDialog(vm: AppViewModel) {
     val st by vm.state.collectAsState()
+    val agent = st.createKind == CHAT_KIND_AGENT
     AlertDialog(
         onDismissRequest = vm::closeCreateChat,
-        title = { Text("Новый чат") },
+        title = { Text(if (agent) "Новый агентный чат" else "Новый чат") },
         text = {
-            OutlinedTextField(
-                value = st.createName, onValueChange = vm::setCreateName,
-                label = { Text("Название") }, singleLine = true,
-                modifier = Modifier.onPreviewKeyEvent { e ->
-                    // Название всегда в одну строку — Enter / NumPadEnter сразу создаёт чат.
-                    if (isConfirmKey(e)) {
-                        vm.commitCreateChat()
-                        true
-                    } else false
-                },
-            )
+            Column {
+                Text(
+                    if (agent) "Цель ставишь ты, файлы выбирает агент. Прогоны и diff хранятся в этом чате."
+                    else "Переписка с вопросами по базе знаний проекта.",
+                    fontSize = 12.sp, color = Color.Gray,
+                )
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = st.createName, onValueChange = vm::setCreateName,
+                    label = { Text("Название") }, singleLine = true,
+                    modifier = Modifier.onPreviewKeyEvent { e ->
+                        // Название всегда в одну строку — Enter / NumPadEnter сразу создаёт чат.
+                        if (isConfirmKey(e)) {
+                            vm.commitCreateChat()
+                            true
+                        } else false
+                    },
+                )
+            }
         },
         confirmButton = { Button(onClick = vm::commitCreateChat) { Text("Создать") } },
         dismissButton = { TextButton(onClick = vm::closeCreateChat) { Text("Отмена") } },
@@ -900,7 +1030,6 @@ fun AgentPane(vm: AppViewModel, run: core.agent.AgentRun?) {
             if (st.busy) {
                 TextButton(onClick = vm::cancelAgent) { Text("⏹ стоп", fontSize = 11.sp, color = Color(0xFFB00020)) }
             }
-            TextButton(onClick = vm::toggleAgentPanel) { Text("скрыть", fontSize = 11.sp) }
         }
         // Цель ставит человек; агент сам выбирает файлы под неё.
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -928,7 +1057,19 @@ fun AgentPane(vm: AppViewModel, run: core.agent.AgentRun?) {
             }
         }
         // Список вызовов: каждая строка — состояние тула (значок + аргументы).
-        val invocations = run?.invocations.orEmpty()
+        var traceOpen by remember(run?.id) { mutableStateOf(true) }
+        if (run != null && (run.invocations.isNotEmpty() || st.agentLog.isNotEmpty())) {
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    "ход прогона · ${run.invocations.size} вызовов",
+                    fontSize = 11.sp, color = Color.Gray, modifier = Modifier.weight(1f),
+                )
+                TextButton(onClick = { traceOpen = !traceOpen }) {
+                    Text(if (traceOpen) "свернуть ▲" else "развернуть ▼", fontSize = 10.sp)
+                }
+            }
+        }
+        val invocations = if (traceOpen) run?.invocations.orEmpty() else emptyList()
         if (invocations.isNotEmpty()) {
             Spacer(Modifier.height(4.dp))
             Column(Modifier.fillMaxWidth().heightIn(max = 150.dp).verticalScroll(rememberScrollState())) {
@@ -961,7 +1102,7 @@ fun AgentPane(vm: AppViewModel, run: core.agent.AgentRun?) {
             }
         }
         // Журнал: что агент говорил между шагами.
-        if (st.agentLog.isNotEmpty()) {
+        if (st.agentLog.isNotEmpty() && traceOpen) {
             Spacer(Modifier.height(2.dp))
             Column(Modifier.fillMaxWidth().heightIn(max = 70.dp).verticalScroll(rememberScrollState())) {
                 st.agentLog.takeLast(20).forEach {

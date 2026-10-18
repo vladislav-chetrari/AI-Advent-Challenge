@@ -5,6 +5,13 @@ import java.io.File
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.Json
 
+// Два вида чатов. Информационный — вопросы по базе знаний проекта (RAG).
+// Агентный — только работа с файлами: цель ставит человек, файлы выбирает агент.
+// Смешивать их в одном списке путало: панель агента висела поверх переписки с
+// вопросами, и история прогонов была общей на всех чатов.
+const val CHAT_KIND_RAG = "RAG"
+const val CHAT_KIND_AGENT = "AGENT"
+
 // Чаты и сообщения (как дерево Week 2, но минимально):
 // state.json рядом с rag.db, тексты документов НЕ дублируются (лежат в файлах).
 @Serializable
@@ -13,7 +20,10 @@ data class RagChat(
     val name: String,
     val ragEnabled: Boolean = true,
     val createdAt: Long = System.currentTimeMillis(),
-)
+    val kind: String = CHAT_KIND_RAG,
+) {
+    val isAgent: Boolean get() = kind == CHAT_KIND_AGENT
+}
 
 @Serializable
 data class RagMessage(
@@ -37,6 +47,11 @@ data class ChatState(
 )
 
 fun newChatId(): String = java.util.UUID.randomUUID().toString().take(8)
+
+// Списки для двух секций сайдбара. Порядок — как в ChatStore.upsertChat (по времени).
+fun ChatState.ragChats(): List<RagChat> = chats.filter { !it.isAgent }
+
+fun ChatState.agentChats(): List<RagChat> = chats.filter { it.isAgent }
 
 class ChatStore(
     appDir: File = ApiKeyProvider.appDir(),
