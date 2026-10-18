@@ -52,6 +52,7 @@ data class ToolSpec(
 // сырые строки от мелких локальных моделей регулярно приходят битыми, и падать
 // на этом нельзя — тогда rejected=true и агент отдаст модели текст ошибки
 // вместо того, чтобы крутить цикл на одном и том же невалидном вызове.
+@kotlinx.serialization.Serializable
 data class ToolCall(
     val id: String,
     val name: String,

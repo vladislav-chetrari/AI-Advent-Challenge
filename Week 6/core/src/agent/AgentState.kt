@@ -35,7 +35,12 @@ sealed interface ToolState {
     data class Failed(val tool: String = "", val error: String = "") : ToolState
 }
 
-val ToolState.isTerminal: Boolean get() = this is ToolState.Done || this is ToolState.Failed
+// Состояние прогона терминально, если работа окончена (успех/отказ/отмена).
+    // Пауза терминальной НЕ является: её можно продолжить.
+    val RunState.isTerminal: Boolean
+        get() = this is RunState.Done || this is RunState.Failed || this is RunState.Cancelled
+
+    val ToolState.isTerminal: Boolean get() = this is ToolState.Done || this is ToolState.Failed
 
 // Состояние прогона.
 @Serializable
@@ -54,6 +59,12 @@ sealed interface RunState {
 
     @Serializable
     data class Applying(val path: String = "") : RunState
+
+    // Пауза по ⏹ или по «приложение закрыто». Не терминальная: тот же прогон
+    // продолжается с того же места — с восстановленным транскриптом, тем же
+    // счётчиком шагов и тем же списком изменённых файлов.
+    @Serializable
+    data class Paused(val reason: String = "") : RunState
 
     @Serializable
     data class Done(val summary: String = "") : RunState
@@ -100,11 +111,11 @@ data class AgentRun(
 
     fun byId(id: String): ToolInvocation? = invocations.lastOrNull { it.id == id }
 
-    // Прогон имеет смысл продолжать: он не довёл задачу до конца — упал,
-    // отменён или встал на лимит (тогда state = Done, а error объясняет почему).
-    // Успешный прогон продолжать незачем: задача уже закрыта.
+    // Прогон имеет смысл продолжить: он на паузе (⏹ или приложение закрылось),
+    // упал или был отменён. Успешный продолжать незачем: задача уже закрыта.
     val resumable: Boolean
-        get() = state is RunState.Failed || state is RunState.Cancelled || (state is RunState.Done && error.isNotBlank())
+        get() = state is RunState.Paused || state is RunState.Failed || state is RunState.Cancelled ||
+            (state is RunState.Done && error.isNotBlank())
 
     fun label(): String = when (val s = state) {
         is RunState.Idle -> "ожидание"
@@ -112,6 +123,7 @@ data class AgentRun(
         is RunState.Thinking -> "шаг ${s.step}"
         is RunState.AwaitingApproval -> "ждёт подтверждения: ${s.change.path}"
         is RunState.Applying -> "записывает ${s.path}"
+        is RunState.Paused -> "на паузе: ${s.reason.ifBlank { "остановлен" }}"
         is RunState.Done -> "готово"
         is RunState.Failed -> "ошибка: ${s.error}"
         is RunState.Cancelled -> "отменено"
@@ -173,8 +185,12 @@ sealed interface AgentEvent {
     @Serializable
     data object Cancelled : AgentEvent
 
+@Serializable
+    data class Failed(val error: String = "") : AgentEvent
+
+    // ⏹ или потеря приложения: работа заморожена, но не потеряна.
     @Serializable
-    data class Failed(val error: String) : AgentEvent
+    data class Paused(val reason: String = "") : AgentEvent
 }
 
 // Что редьюсер просит у цикла сделать. Пустой список = событие только
@@ -341,12 +357,20 @@ object AgentMachine {
                 true,
             )
 
-            is AgentEvent.Failed -> Triple(
-                run.copy(state = RunState.Failed(event.error), error = event.error, updatedAt = now),
-                listOf(AgentCommand.AbortStep),
-                true,
-            )
-        }
+is AgentEvent.Failed -> Triple(
+            run.copy(state = RunState.Failed(event.error), error = event.error, updatedAt = now),
+            listOf(AgentCommand.AbortStep),
+            true,
+        )
+
+        // Пауза не обрывает прогон: terminal = false, иначе следующий шаг
+        // возобновления был бы отвергнут гардом терминального состояния.
+        is AgentEvent.Paused -> Triple(
+            run.copy(state = RunState.Paused(event.reason), updatedAt = now),
+            emptyList(),
+            false,
+        )
+    }
 
         // Бюджет проверяем после шага, а не в каждом событии: иначе прогон,
         // уложившийся в лимит файлов, останавливался бы на первом же чтении.
@@ -392,7 +416,11 @@ object AgentMachine {
 // По образцу ChatStore — синхронизация, запись целиком, отказ молча при
 // нечитаемом файле. Это долговременная история: без неё прогон нельзя
 // ни показать, ни откатить, ни воспроизвести.
-class RunStore(appDir: File = core.llm.ApiKeyProvider.appDir()) {
+
+// Причина паузы у прогона, который остался незавершённым после перезапуска
+// процесса (закрыли окно или он упал).
+const val INTERRUPTED_REASON = "прерван: приложение закрыто"
+class RunStore(val appDir: File = core.llm.ApiKeyProvider.appDir()) {
     private val json = kotlinx.serialization.json.Json {
         prettyPrint = true
         ignoreUnknownKeys = true
@@ -419,6 +447,17 @@ class RunStore(appDir: File = core.llm.ApiKeyProvider.appDir()) {
                 if (file.isFile) json.decodeFromString<List<AgentRun>>(file.readText()) else emptyList()
             } catch (_: Exception) {
                 emptyList()
+            }
+            // Прогон, оставшийся в нетерминальном состоянии, значит процесс
+            // умер (закрыли окно, краш). Работа не потеряна: транскрипт лежит
+            // рядом, поэтому такой прогон помечается паузой и продолжается
+            // кнопкой «продолжить» с последнего сохранённого шага.
+            val recovered = runs.map { r ->
+                if (r.state.isTerminal) r else r.copy(state = RunState.Paused(INTERRUPTED_REASON))
+            }
+            if (recovered != runs) {
+                runs = recovered
+                persistLocked()
             }
         }
     }
@@ -462,6 +501,9 @@ class RunStore(appDir: File = core.llm.ApiKeyProvider.appDir()) {
             runs = runs.filterNot { it.id == id }
             persistLocked()
         }
+        // Вместе с прогоном уходит и его транскрипт — иначе в agent_runs/
+        // остаются файлы удалённых прогонов.
+        TranscriptStore(appDir).delete(id)
     }
 
     // Откат прогона: файлы возвращаются к состоянию до первого изменения.

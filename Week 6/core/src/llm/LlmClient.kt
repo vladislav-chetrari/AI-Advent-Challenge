@@ -90,6 +90,9 @@ sealed interface LlmResult {
     data object Empty : LlmResult
 }
 
+// Сериализуется намеренно: транскрипт агента сохраняется на диск, и без
+// @Serializable продолжить прогон после остановки было бы нечем.
+@kotlinx.serialization.Serializable
 data class ChatMsg(
     val role: String,
     val content: String,

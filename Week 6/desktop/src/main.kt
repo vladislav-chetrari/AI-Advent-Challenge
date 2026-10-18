@@ -63,6 +63,7 @@ import kotlinx.coroutines.launch
 import com.mikepenz.markdown.m3.Markdown
 import core.llm.LlmSettings
 import core.project.ProjectEntry
+import core.agent.isTerminal
 import core.rag.CHAT_KIND_AGENT
 import core.rag.CHAT_KIND_RAG
 import core.rag.DocInfo
@@ -452,7 +453,7 @@ fun AgentChatPane(vm: AppViewModel, chat: RagChat) {
             )
             if (st.busy) {
                 Spacer(Modifier.width(8.dp))
-                TextButton(onClick = vm::cancelAgent) { Text("⏹ стоп", fontSize = 12.sp, color = Color(0xFFB00020)) }
+                TextButton(onClick = vm::cancelAgent) { Text("⏸ стоп", fontSize = 12.sp, color = Color(0xFFB00020)) }
             }
         }
         val runs = st.chatRuns
@@ -552,18 +553,15 @@ fun AgentRunCard(vm: AppViewModel, run: core.agent.AgentRun, st: UiState) {
                 "шагов ${run.steps} · вызовов ${run.invocations.size} · ${run.id}",
                 fontSize = 10.sp, color = Color.Gray, modifier = Modifier.weight(1f), maxLines = 1,
             )
-            // Продолжение: прогон встал на лимит, упал или отменён — задача не
-            // закрыта, и кнопка прямо под этим прогоном. Пока идёт он сам,
-            // кнопку не показываем.
+            // Продолжение: прогон на паузе (⏹ или приложение закрылось), упал или был
+            // отменён. Кнопка возвращает агента в тот же разговор и ту же работу.
             if (run.resumable && !(run.id == st.agentRun?.id && st.busy)) {
                 TextButton(
                     onClick = { vm.resumeRun(run.id) },
                     enabled = !st.busy,
                 ) { Text("▶ продолжить", fontSize = 11.sp, color = Color(0xFF1E88E5)) }
             }
-            if (run.state !is core.agent.RunState.Done && run.state !is core.agent.RunState.Cancelled &&
-                run.state !is core.agent.RunState.Failed
-            ) {
+            if (!run.state.isTerminal) {
                 Text("●", fontSize = 11.sp, color = color)
             }
         }
@@ -1132,6 +1130,7 @@ private val STATE_COLORS = mapOf(
     "thinking" to Color(0xFF6A1B9A),
     "awaiting" to Color(0xFFEF6C00),
     "applying" to Color(0xFF00838F),
+    "paused" to Color(0xFFEF6C00),
     "done" to Color(0xFF2E7D32),
     "failed" to Color(0xFFB00020),
     "idle" to Color(0xFF757575),
@@ -1144,6 +1143,7 @@ private fun stateKey(run: core.agent.AgentRun): String = when (run.state) {
     is core.agent.RunState.Thinking -> "thinking"
     is core.agent.RunState.AwaitingApproval -> "awaiting"
     is core.agent.RunState.Applying -> "applying"
+    is core.agent.RunState.Paused -> "paused"
     is core.agent.RunState.Done -> "done"
     is core.agent.RunState.Failed -> "failed"
     is core.agent.RunState.Cancelled -> "cancelled"

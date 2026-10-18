@@ -38,10 +38,14 @@ class AgentRunner(
         apiKey: String? = null,
         // Прогон пишется в историю агентного чата; пусто = CLI без чата.
         chatId: String = "",
-        // Продолжение задачи: факты прошлых прогонов, чтобы агент не начинал заново.
-        resumeOf: List<AgentRun> = emptyList(),
+        // Продолжение ТОГО ЖЕ прогона: тот же id, тот же счётчик шагов, тот же
+        // список изменённых файлов и восстановленный транскрипт. Ничего не
+        // начинается заново — цикл продолжает с места остановки.
+        resume: AgentRun? = null,
     ): AgentRun {
-        var run = AgentMachine.newRun(project, goal, chatId)
+        val transcripts = TranscriptStore(runStore.appDir)
+        val run0 = resume ?: AgentMachine.newRun(project, goal, chatId)
+        var run = run0.copy(chatId = chatId.ifBlank { run0.chatId })
         // Снапшоты пишем в папку RunStore — по ней же работает откат.
         // Без этого откат искал бы файлы не там и (до фикса метки) удалял их.
         workspace.runIdForSnapshot = run.id
@@ -70,18 +74,26 @@ class AgentRunner(
         val defs = tools.definitions()
         val specs = defs.map { it.spec }
 
-        apply(AgentMachine.reduce(run, AgentEvent.GoalAccepted(goal), config))
-
         val transcript = ArrayList<ChatMsg>()
-        transcript += ChatMsg("system", buildAgentSystem(project, specs.map { it.name }, workspace.rootFile.name))
-        // Хвост переписки — чтобы «обнови доки по тому, о чём говорили» работало.
-        seedHistory.takeLast(SEED_HISTORY).forEach { transcript += it }
-        val projectCtx = projectLine(project)
-        transcript += ChatMsg(
-            "user",
-            if (resumeOf.isEmpty()) buildAgentUser(goal, projectCtx)
-            else buildResumePrompt(goal, projectCtx, resumeOf),
-        )
+        // Транскрипт на диск: состояние агента обязано пережить падение процесса.
+        fun persist() = transcripts.save(run.id, run.goal, transcript)
+        val saved = resume?.let { transcripts.load(it.id) }
+        val resumed = resume != null && !saved?.messages.isNullOrEmpty()
+        if (resumed) {
+            // Тот же контекст, что был у провайдера. Одно короткое сообщение —
+            // «продолжай» — и цикл идёт дальше, а не начинает задачу заново.
+            transcript += saved.messages
+            transcript += ChatMsg("user", RESUME_USER_LINE)
+            onLog("продолжаю прогон ${run.id}: в контексте ${transcript.size} сообщений")
+        } else {
+            transcript += ChatMsg("system", buildAgentSystem(project, specs.map { it.name }, workspace.rootFile.name))
+            // Хвост переписки — чтобы «обнови доки по тому, о чём говорили» работало.
+            seedHistory.takeLast(SEED_HISTORY).forEach { transcript += it }
+            transcript += ChatMsg("user", buildAgentUser(goal, projectLine(project)))
+        }
+        // Цель принимается в обоих случаях: на паузе это и есть «продолжить».
+        apply(AgentMachine.reduce(run, AgentEvent.GoalAccepted(goal), config))
+        persist()
 
         while (true) {
             val step = run.steps + 1
@@ -114,7 +126,7 @@ class AgentRunner(
                         return apply(AgentMachine.reduce(run, AgentEvent.Finished(r.text), config)).run
                     }
                     onLog("вызовы из текста (без native tools): ${parsed.joinToString(", ") { it.name }}")
-                    runCalls(parsed, textAnswer = r.text, native = false, defs = defs, tools = tools, transcript = transcript) { t -> apply(t) }?.let { early -> return early }
+                    runCalls(parsed, textAnswer = r.text, native = false, defs = defs, tools = tools, transcript = transcript, persist = ::persist) { t -> apply(t) }?.let { early -> return early }
                     // Бюджет проверяется и здесь: иначе прогон без native-tools
                     // тихо крутил бы цикл, пока не вырвется по maxToolCalls.
                     if (!AgentMachine.needsContinuation(run, config)) {
@@ -142,7 +154,7 @@ class AgentRunner(
                     // Рассуждение модели рядом с вызовом — в журнал, иначе оно
                     // просто теряется между шагами.
                     if (r.text.isNotBlank()) onLog(r.text.take(NARRATION_CHARS))
-                    runCalls(r.calls, textAnswer = r.text, native = true, defs = defs, tools = tools, transcript = transcript) { t -> apply(t) }?.let { early -> return early }
+                    runCalls(r.calls, textAnswer = r.text, native = true, defs = defs, tools = tools, transcript = transcript, persist = ::persist) { t -> apply(t) }?.let { early -> return early }
 
                     // Продолжать ли — решает редьюсер (opencode: продолжение
                     // = был локально исполненный тул).
@@ -177,6 +189,9 @@ class AgentRunner(
         defs: List<AgentTool>,
         tools: FileTools,
         transcript: ArrayList<ChatMsg>,
+        // Сохранить транскрипт на диск: после каждой пачки вызовов, иначе
+        // падение между шагами откатывало бы агента назад.
+        persist: () -> Unit = {},
         apply: (Transition) -> Transition,
     ): AgentRun? {
         if (native) {
@@ -210,6 +225,7 @@ class AgentRunner(
         if (!native && collected.isNotEmpty()) {
             transcript += ChatMsg("user", fallbackToolMessage(collected))
         }
+        persist()
         val o = outcome ?: return null
         if (o.finish != null) {
             return apply(AgentMachine.reduce(currentRun(), AgentEvent.Finished(o.finish), config)).run
@@ -320,5 +336,10 @@ class AgentRunner(
         const val FAILED_PREFIX = "__failed__: "
         const val FINISH_PREFIX = "Итог: "
         const val FINISH_TOOL = "finish"
+
+        // Единственное, что добавляется к восстановленному контексту при
+        // продолжении. Никакого пересказа задачи: модель и так видит всю свою
+        // прошлую работу в транскрипте.
+        const val RESUME_USER_LINE = "Продолжи с того места, где остановился."
     }
 }

@@ -1,6 +1,7 @@
 package desktop.ui
 
 import core.agent.AgentConfig
+import core.agent.AgentEvent
 import core.agent.AgentMachine
 import core.agent.AgentRun
 import core.agent.AgentRunner
@@ -13,6 +14,7 @@ import core.agent.RunState
 import core.agent.RunStore
 import core.agent.ToolState
 import core.agent.Workspace
+import core.agent.isTerminal
 import core.llm.ApiKeyProvider
 import core.llm.ChatMsg
 import core.llm.LlmClient
@@ -551,7 +553,7 @@ class AppViewModel(private val scope: CoroutineScope) {
         startAgent(text, chat.id)
     }
 
-    fun startAgent(goal: String, chatId: String? = null, resumeOf: List<AgentRun> = emptyList()) {
+    fun startAgent(goal: String, chatId: String? = null, resume: AgentRun? = null) {
         val p = svc.selectedProject()
         val dir = p?.let { svc.projectDir(it.name) }
         if (p == null || dir == null) {
@@ -591,22 +593,21 @@ class AppViewModel(private val scope: CoroutineScope) {
                 onUpdate = { r -> update { it.copy(agentRun = r, agentRuns = agentStore.runs) } },
                 onLog = { line -> update { it.copy(agentLog = (it.agentLog + line).takeLast(200)) } },
             )
-            runner.run(goal, project, seedHistory = seed, chatId = chatId ?: "", resumeOf = resumeOf)
+            runner.run(goal, project, seedHistory = seed, chatId = chatId ?: "", resume = resume)
             approval?.cancel()
             approval = null
             update { it.copy(busy = false, agentRuns = agentStore.runs, pendingChange = null) }
         }
     }
 
-    // Продолжить задачу с места остановки. Новый прогон получает бриф по
-    // предыдущим прогонам ЭТОГО чата (включая выбранный): цель та же, бюджет
-    // свой, а модель видит, что уже сделано и где остановились.
+    // Продолжить с того же места: тот же прогон (id, счётчик шагов, список
+    // изменённых файлов) и его сохранённый транскрипт. Никакого нового
+    // прогона «с нуля» — агент возвращается к тому разговору, который вёл.
     fun resumeRun(id: String) {
         val run = agentStore.get(id) ?: return
         val chatId = _state.value.activeChatId ?: return
         if (!run.resumable) return
-        val previous = _state.value.chatRuns.filter { it.startedAt <= run.startedAt }.ifEmpty { listOf(run) }
-        startAgent(run.goal, chatId, resumeOf = previous)
+        startAgent(run.goal, chatId, resume = run)
     }
 
     // Запрос разрешения показывается карточкой В ЛЕНТЕ ЧАТА: решение принимается там
@@ -636,12 +637,33 @@ class AppViewModel(private val scope: CoroutineScope) {
         if (_state.value.pendingChange != null) rejectAgent()
     }
 
+// ⏹ — это пауза, а не отмена: работа не теряется, прогон переходит в Paused
+    // вместе с сохранённым транскриптом, и «продолжить» вернёт агента туда же.
     fun cancelAgent() {
-        agentJob?.cancel()
-        agentJob = null
+        val id = _state.value.agentRun?.id
+        // Если агент ждал разрешения, отвечаем отказом — иначе корутина зависнет
+        // на await и не успеет записать состояние.
         approval?.complete(PermissionReply.Reject)
         approval = null
-        update { it.copy(busy = false, pendingChange = null, status = "Прогон остановлен") }
+        agentJob?.cancel()
+        agentJob = null
+        scope.launch {
+            // Корутина могла дописать своё терминальное состояние в момент
+            // отмены — поэтому состояние читаем из стора, а не из UI.
+            kotlinx.coroutines.delay(100)
+            val run = id?.let { agentStore.get(it) }
+            if (run != null && !run.state.isTerminal) {
+                agentStore.save(AgentMachine.reduce(run, AgentEvent.Paused("остановлен пользователем")).run)
+            }
+            update {
+                it.copy(
+                    busy = false,
+                    agentRuns = agentStore.runs,
+                    pendingChange = null,
+                    status = "Прогон на паузе — продолжи с этого места",
+                )
+            }
+}
     }
 
     fun revertRun(id: String) {

@@ -4,7 +4,9 @@ import core.llm.ApiKeyProvider
 import core.llm.intOf
 import core.llm.missingRequired
 import core.llm.strOf
+import core.agent.isTerminal
 import core.rag.ChatStore
+import java.io.File as JFile
 import core.rag.DEFAULT_FINAL_K
 import core.rag.DEFAULT_MIN_SCORE
 import core.rag.DEFAULT_PROBES
@@ -626,10 +628,14 @@ private suspend fun runCommand(args: Array<String>) {
         //            [--out run.json] [--format json|md]
         "agent-run" -> {
             val (_, rest) = splitPaths(args)
-            // Продолжение: цель и бриф берём из прошлого прогона.
+            // Продолжение: цель и транскрипт берём из самого прогона.
             val resumeStore = core.agent.RunStore()
             val resumeId = flag(rest, "--resume")
-            val resumeRun = resumeId?.let { resumeStore.get(it) ?: fail("прогон $it не найден") }
+            val resumeRun = resumeId?.let {
+                val r = resumeStore.get(it) ?: fail("прогон $it не найден")
+                if (!r.resumable) fail("прогон ${r.id} завершён (${r.label()}) — продолжать нечего")
+                r
+            }
             val goal = resumeRun?.goal?.takeIf { it.isNotBlank() }
                 ?: flag(rest, "--goal")?.takeIf { it.isNotBlank() } ?: fail("нужен --goal \"<цель>\" или --resume <run-id>")
             val projectName = flag(rest, "--project") ?: svc.selectedProject()?.name
@@ -660,16 +666,14 @@ private suspend fun runCommand(args: Array<String>) {
                 ?: resumeRun?.chatId?.takeIf { it.isNotBlank() }
                 ?: ""
             if (chatName != null) println("Агентный чат: $chatName")
-            // Бриф: что уже сделано в прошлых прогонах этого чата (включая тот,
-            // который продолжаем). Без него агент начал бы задачу с нуля.
-            val previous = if (resumeRun == null) {
-                emptyList()
-            } else {
-                store.runs.filter { it.chatId == resumeRun.chatId && it.startedAt <= resumeRun.startedAt }
-                    .ifEmpty { listOf(resumeRun) }
-            }
+            // Продолжение = тот же прогон и его сохранённый транскрипт, а не
+            // новый прогон с пересказом задачи.
             if (resumeRun != null) {
-                println("Продолжение прогона ${resumeRun.id} (${resumeRun.label()}): предыдущих прогонов в брифе — ${previous.size}")
+                val saved = core.agent.TranscriptStore(store.appDir).load(resumeRun.id)
+                println(
+                    "Продолжаю прогон ${resumeRun.id} (${resumeRun.label()}): " +
+                        "шагов ${resumeRun.steps}, в контексте ${saved?.messages?.size ?: 0} сообщений",
+                )
             }
             if (auto) println("Режим --auto-approve: изменения пишутся без подтверждения.")
             println("—".repeat(60))
@@ -686,7 +690,7 @@ private suspend fun runCommand(args: Array<String>) {
                 },
                 onLog = { println("   · $it") },
             )
-            val run = runner.run(goal, projectName, chatId = chatId, resumeOf = previous)
+            val run = runner.run(goal, projectName, chatId = chatId, resume = resumeRun)
             println("—".repeat(60))
             printRun(run)
             val out = flag(rest, "--out")
@@ -1300,39 +1304,54 @@ private fun verifyAgent() {
         check(runStore.get(rC.id)?.chatId == null || runStore.get(rC.id)?.chatId == "") { "headless-прогон привязался к чату" }
         println("OK разделение чатов и история прогонов")
 
-        // --- 15. Возобновление задачи ---
-        // Продолжение обязано нести факты прошлого прогона, иначе агент
-        // переделает всё с нуля, и нашлось бы «продолжение», которого нет.
-        val stopped = core.agent.AgentMachine.newRun("demo", "обнови документацию", chatId = "a1").let {
-            core.agent.AgentMachine.reduce(
-                it,
-                core.agent.AgentEvent.BudgetExhausted("лимит шагов (16)"),
-            ).run
+        // --- 15. Пауза и продолжение с того же места ---
+        // Продолжение обязано восстановить РАЗГОВОР, иначе агент начинает
+        // задачу заново: это и было исходной жалобой.
+        val tstore = core.agent.TranscriptStore(tmp)
+        val started = core.agent.AgentMachine.newRun("demo", "обнови документацию", chatId = "a1")
+        val paused = core.agent.AgentMachine.reduce(started, core.agent.AgentEvent.StepStarted(1)).run.let {
+            core.agent.AgentMachine.reduce(it, core.agent.AgentEvent.Paused("⏹")).run
         }
-        check(stopped.resumable) { "прогон, вставший на лимит, нельзя продолжить" }
-        check(stopped.error == "лимит шагов (16)") { "причина остановки потеряна: ${stopped.error}" }
-        val doneOk = core.agent.AgentMachine.reduce(
-            core.agent.AgentMachine.newRun("demo", "найти X"),
-            core.agent.AgentEvent.Finished("всё сделано"),
-        ).run
-        check(!doneOk.resumable) { "успешный прогон предложено продолжать" }
-        val failedRun = core.agent.AgentMachine.reduce(
-            core.agent.AgentMachine.newRun("demo", "сломать"),
-            core.agent.AgentEvent.Failed("модель вернула мусор"),
-        ).run
-        check(failedRun.resumable) { "упавший прогон нельзя продолжить" }
-        val resume = core.agent.buildResumePrompt(
-            "обнови документацию",
-            "Проект: demo. Ветка: main.",
-            listOf(stopped),
+        check(paused.state is core.agent.RunState.Paused) { "⏹ не переводит прогон на паузу: ${paused.state}" }
+        check(paused.resumable) { "прогон на паузе нельзя продолжить" }
+        check(!paused.state.isTerminal) { "пауза сделана терминальной — продолжить не выйдет" }
+        // Продолжение возвращает тот же прогон в работу: тот же id и счётчик шагов.
+        val continued = core.agent.AgentMachine.reduce(paused, core.agent.AgentEvent.GoalAccepted(paused.goal))
+        check(continued.run.id == paused.id && continued.run.steps == paused.steps) {
+            "продолжение создало новый прогон вместо возврата к старому"
+        }
+        check(!continued.terminal) { "продолжение не должно закрывать прогон" }
+        val finished = core.agent.AgentMachine.reduce(paused, core.agent.AgentEvent.Finished("всё сделано"))
+        check(!finished.run.resumable) { "успешный прогон предложено продолжать" }
+
+        // Транскрипт переживает процесс и не бьёт провайдера незакрытой парой
+        // «вызов тула → результат».
+        val toolCall = core.llm.ToolCall("c1", "read_file", kotlinx.serialization.json.JsonObject(emptyMap()), "{}")
+        val clean = listOf(
+            core.llm.ChatMsg("system", "system"),
+            core.llm.ChatMsg("user", "ЦЕЛЬ"),
+            core.llm.ChatMsg("assistant", "", toolCalls = listOf(toolCall)),
+            core.llm.ChatMsg("tool", "прочитано", toolCallId = "c1", name = "read_file"),
         )
-        check(resume.contains("ПРОДОЛЖЕНИЕ ЗАДАЧИ")) { "в брифе нет отметки о продолжении" }
-        check(resume.contains("обнови документацию")) { "цель не попала в бриф" }
-        check(resume.contains(stopped.id)) { "в брифе нет id предыдущего прогона" }
-        check(resume.contains("лимит шагов (16)")) { "в брифе нет причины остановки" }
-        check(resume.contains("git_diff")) { "в брифе нет правила проверить состояние файлов" }
-        check(resume.length < 4000) { "бриф раздулся: ${resume.length}" }
-        println("OK возобновление задачи")
+        val cut = core.agent.TranscriptStore.completeTail(clean.take(3))
+        check(cut.size == 2) { "незакрытый вызов тула не отброшен: $cut" }
+        check(core.agent.TranscriptStore.completeTail(clean).size == 4) { "полный хвост обрезан зря" }
+        tstore.save("run_x", "цель", clean.take(3))
+        val loaded = tstore.load("run_x")
+        check(loaded != null && loaded.messages.size == 2) { "транскрипт не перечитан с диска: $loaded" }
+        check(loaded.goal == "цель") { "цель прогона потеряна" }
+
+        // Незавершённый прогон после перезапуска процесса становится паузой,
+        // а не остаётся висеть в Thinking навсегда.
+        val crashStore = core.agent.RunStore(JFile(tmp, "crash"))
+        crashStore.save(started.copy(state = core.agent.RunState.Thinking(3)))
+        val afterRestart = core.agent.RunStore(JFile(tmp, "crash"))
+        val recovered = afterRestart.runs.single()
+        check(recovered.state is core.agent.RunState.Paused) { "краш не превратился в паузу: ${recovered.state}" }
+        check(recovered.steps == started.steps) { "шаги потеряны при восстановлении" }
+        check(recovered.resumable) { "прогон после краша нельзя продолжить" }
+        check(!core.agent.RunStore(JFile(tmp, "crash")).runs.single().state.isTerminal) { "повторная загрузка снова не терминальна" }
+        println("OK пауза и продолжение с того же места")
 
         println("VERIFY-AGENT PASSED")
     } finally {
