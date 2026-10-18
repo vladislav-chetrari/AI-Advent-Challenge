@@ -264,7 +264,7 @@ fun main() {
                 ex.responseBody.use { it.write(msg) }
                 return@createContext
             }
-            val project = req.project.ifBlank { defaultProject }
+            val project = req.project.trim().ifBlank { defaultProject }
             if (req.issues.isEmpty() && !req.forceEmpty) {
                 // Не даём случайному пустому запросу обнулить CRM.
                 val store0 = crm.store(project)
@@ -309,7 +309,7 @@ fun main() {
             if (!authed(ex, token)) return@createContext
             val body = ex.requestBody.bufferedReader().readText()
             val project = try {
-                json.decodeFromString(CrmPatchRequest.serializer(), body).project.ifBlank { defaultProject }
+                json.decodeFromString(CrmPatchRequest.serializer(), body).project.trim().ifBlank { defaultProject }
             } catch (_: Exception) {
                 defaultProject
             }
@@ -375,7 +375,7 @@ fun main() {
                 ex.responseBody.use { it.write(msg) }
                 return@createContext
             }
-            val project = req.project.ifBlank { defaultProject }
+            val project = req.project.trim().ifBlank { defaultProject }
             require(req.ticketId.isNotBlank()) { "нужен ticketId" }
             req.status?.let { require(it in TICKET_STATUSES) { "статус должен быть одним из $TICKET_STATUSES" } }
             val store = crm.store(project)
@@ -416,7 +416,7 @@ fun main() {
                 ex.responseBody.use { it.write(msg) }
                 return@createContext
             }
-            val project = req.project.ifBlank { defaultProject }
+            val project = req.project.trim().ifBlank { defaultProject }
             val chatId = req.chatId.ifBlank { "0" }
             val history = supportChats.state.messages[chatId].orEmpty().takeLast(12)
             val t0 = System.currentTimeMillis()

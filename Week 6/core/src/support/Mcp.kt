@@ -127,7 +127,7 @@ class CrmTools(
     private val stores = ConcurrentHashMap<String, CrmStore>()
 
     fun store(project: String = defaultProject): CrmStore =
-        stores.computeIfAbsent(project) { CrmStore(it, appDir) }
+        stores.computeIfAbsent(project.trim()) { CrmStore(it, appDir) }
 
     // Какие проекты вообще есть в CRM на диске. Нужно, когда имя проекта задано
     // секретом: в логах GitHub оно замаскировано, и не понятно, куда легли тикеты.

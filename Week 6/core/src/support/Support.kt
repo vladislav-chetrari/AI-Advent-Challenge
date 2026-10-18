@@ -307,9 +307,13 @@ const val TICKET_SOURCE_DIR = "support/tickets"
 // Хранилище CRM на сервере: импорт из GitHub + локальные правки поверх.
 // crm/<project>.json — снимок, crm/<project>.overrides.json — наши правки.
 class CrmStore(
-    private val project: String,
+    project: String,
     appDir: File = ApiKeyProvider.appDir(),
 ) {
+    // Имя проекта нормализуем: в секрете REVIEW_PROJECT часто остаётся пробел
+    // (" CallowFellow"), и тогда CRM писала в файл " CallowFellow.json", а RAG
+    // смотрел в "CallowFellow" — тикеты находились, но не для того проекта.
+    private val project = project.trim()
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true }
     private val file = File(appDir, "crm/$project.json")
     private val overridesFile = File(appDir, "crm/$project.overrides.json")

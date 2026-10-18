@@ -386,7 +386,7 @@ private suspend fun runCommand(args: Array<String>) {
             if (server != null) {
                 val key = System.getenv("DEEPSEEK_API_KEY")?.trim()?.takeIf { it.isNotBlank() }
                 val payload = buildJsonObject {
-                    put("project", project)
+                    put("project", project.trim())
                     put("chatId", chatId)
                     put("message", message)
                     put("topK", topK)
@@ -707,7 +707,7 @@ private fun localSvc(): RagService =
 private suspend fun askSupport(svc: RagService, c: SupportCase, server: String?): SupportReply =
     if (server != null) {
         val payload = buildJsonObject {
-            put("project", c.project)
+            put("project", c.project.trim())
             put("chatId", c.chatId)
             put("message", c.message)
         }
