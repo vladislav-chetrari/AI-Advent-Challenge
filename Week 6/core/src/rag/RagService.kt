@@ -816,7 +816,12 @@ class RagService(
     // Авто-флоу сервера: проект заводится сам при первом обращении по repoUrl,
     // дальше только подтягивается. Без repoUrl и без регистрации — честная ошибка.
     // Пустой индекс (нет доков) — не ошибка: ревью идёт по общим правилам + warning.
-    suspend fun ensureProject(name: String, repoUrl: String?, repoToken: String? = null): ProjectEntry {
+    suspend fun ensureProject(
+        name: String,
+        repoUrl: String?,
+        repoToken: String? = null,
+        onLog: (String) -> Unit = {},
+    ): ProjectEntry {
         val clean = ProjectLoader.sanitizeName(name)
         projects.get(clean)?.let { return it }
         val url = repoUrl?.trim()
@@ -825,19 +830,26 @@ class RagService(
         val mutex = projectMutexes.getOrPut(clean) { kotlinx.coroutines.sync.Mutex() }
         return mutex.withLock {
             projects.get(clean)?.let { return@withLock it }
+            onLog("клон $url -> repos/$clean")
+            val t0 = System.currentTimeMillis()
             val dir = ProjectLoader.cloneFresh(clean, url, appDir, repoToken)
+            onLog("клон готов за ${(System.currentTimeMillis() - t0) / 1000}с")
             val docs = try {
                 ProjectLoader.scan(clean, dir)
             } catch (e: IllegalArgumentException) {
                 emptyList() // доков нет — регистрируем пустым, ревью будет общим
             }
+            onLog("доков для индексации: ${docs.size}")
             if (docs.isNotEmpty()) {
                 markIndexing(docs, "both")
-                indexNewDocs(docs, "both")
+                indexNewDocs(docs, "both", onDocProgress = { source, done, total ->
+                    onLog("эмбеддинги $source: $done/$total")
+                }, onLog = { onLog(it) })
             }
             val commit = try { GitTools.commit(dir) } catch (_: Exception) { "" }
             val entry = ProjectEntry(clean, dir.absolutePath, url, commit, System.currentTimeMillis())
             projects.upsert(entry)
+            onLog("проект зарегистрирован за ${(System.currentTimeMillis() - t0) / 1000}с")
             entry
         }
     }
@@ -874,6 +886,7 @@ class RagService(
         refresh: Boolean = true,
         repoUrl: String? = null,
         repoToken: String? = null,
+        onLog: (String) -> Unit = {},
     ): ReviewResult = withContext(Dispatchers.IO) {
         // Авто-флоу: имя из project, иначе из repoUrl; проект заводится сам при первом обращении.
         val effectiveName = projectName?.trim()?.takeIf { it.isNotBlank() }
@@ -881,9 +894,11 @@ class RagService(
             ?: selectedProject()?.name
             ?: throw IllegalStateException("не указан проект: передай project или repoUrl")
         if (repoUrl != null || projects.get(effectiveName) == null) {
-            ensureProject(effectiveName, repoUrl, repoToken)
+            onLog("проект $effectiveName новый — клон + индексация доков")
+            ensureProject(effectiveName, repoUrl, repoToken, onLog)
         }
         val refreshNote = if (refresh) tryRefreshProject(effectiveName, repoToken) else ""
+        onLog(if (refreshNote.isBlank()) "RAG свежий" else refreshNote)
         val (entry, baseFresh) = reviewFreshness(effectiveName)
         val fresh = if (refreshNote.isNotBlank()) {
             baseFresh.copy(warning = listOf(baseFresh.warning, refreshNote).filter { it.isNotBlank() }.joinToString("; "))
@@ -902,7 +917,11 @@ class RagService(
         val allComments = mutableListOf<ReviewComment>()
         val allFindings = mutableListOf<String>()
         val summaries = mutableListOf<String>()
-        for ((path, fdiff) in byFile) {
+        val total = byFile.size
+        onLog("файлов к ревью: $total (лимит ${maxFiles.coerceIn(1, 50)})")
+        byFile.forEachIndexed { idx, (path, fdiff) ->
+            val tf = System.currentTimeMillis()
+            onLog("[${idx + 1}/$total] $path")
             val q = "$path\n${fdiff.take(1500)}"
             val hits = try {
                 val v = embedder().embed(listOf(q)).first()
@@ -918,6 +937,7 @@ class RagService(
                 LlmResult.Empty -> throw IllegalStateException("Пустой ответ модели")
             }
             val (sum, findings, comments) = parseReviewJson(raw)
+            onLog("[${idx + 1}/$total] $path: правил ${hits.size}, замечаний ${comments.size}, ${(System.currentTimeMillis() - tf) / 1000}с")
             if (sum.isNotBlank()) summaries += "### $path\n$sum"
             allFindings += findings.map { "[$path] $it".take(500) }
             allComments += comments

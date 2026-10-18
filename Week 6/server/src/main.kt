@@ -31,6 +31,13 @@ private data class ReviewRequest(
 private val json = Json { prettyPrint = false; ignoreUnknownKeys = true; isLenient = true }
 private val outJson = Json { prettyPrint = true; encodeDefaults = true }
 
+// Логи прогресса ревью: без них запрос на 5+ минут выглядит как зависший.
+// Ключи и токены сюда не попадают — только пути, счётчики и тайминги.
+private fun log(msg: String) {
+    println("[${java.time.LocalDateTime.now().toString().take(19)}] $msg")
+    System.out.flush()
+}
+
 fun main() {
     val port = System.getenv("PORT")?.toIntOrNull() ?: 8080
     val token = System.getenv("VPS_TOKEN")?.trim().orEmpty()
@@ -72,7 +79,14 @@ fun main() {
                 return@createContext
             }
             val res: ReviewResult = runBlocking {
-                svc.reviewDiff(req.project, req.diff, apiKey = llmKey, maxFiles = req.maxFiles.coerceIn(1, 50), refresh = req.refresh, repoUrl = req.repoUrl, repoToken = req.repoToken)
+                val t0 = System.currentTimeMillis()
+                val r = svc.reviewDiff(
+                    req.project, req.diff, apiKey = llmKey, maxFiles = req.maxFiles.coerceIn(1, 50),
+                    refresh = req.refresh, repoUrl = req.repoUrl, repoToken = req.repoToken,
+                    onLog = { m -> log(m) },
+                )
+                log("ревью готово за ${(System.currentTimeMillis() - t0) / 1000}с: файлов ${r.filesReviewed}, inline ${r.comments.size}")
+                r
             }
             val out = outJson.encodeToString(ReviewResult.serializer(), res).toByteArray()
             ex.responseHeaders.add("Content-Type", "application/json")
