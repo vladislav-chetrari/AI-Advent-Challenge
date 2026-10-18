@@ -53,7 +53,7 @@ jobs:
           TICKET_LABEL: ${{ vars.TICKET_LABEL || 'support' }}
         run: |
           python3 - <<'EOF'
-          import json, os, sys, urllib.request, urllib.error, urllib.parse
+          import json, os, sys, time, urllib.request, urllib.error, urllib.parse
 
           base = os.environ.get('VPS_URL', '').strip()
           if not base.startswith(('http://', 'https://')):
@@ -110,18 +110,36 @@ jobs:
               print(f"  #{i['number']} [{i['state']}] {','.join(i['labels']) or '-'} — {i['title'][:60]}")
 
           payload = json.dumps({'project': project, 'issues': issues}).encode()
-          req = urllib.request.Request(
-              base.rstrip('/') + '/crm/import', data=payload, method='POST',
-              headers={'Content-Type': 'application/json',
-                       'Authorization': 'Bearer ' + os.environ.get('VPS_TOKEN', '')},
-          )
-          try:
-              body = urllib.request.urlopen(req, timeout=2400).read()
-          except urllib.error.HTTPError as e:
-              print(f'FAIL: VPS HTTP {e.code}: {e.read().decode(errors="replace")[:600]}', file=sys.stderr)
+
+          def post(path, payload, timeout, retries=4):
+              """Повторяем при 502/503/504: сервер мог в этот момент перезапускаться
+              (systemd + ./kotlin run компилирует проект перед стартом, порт не занят)."""
+              for attempt in range(1, retries + 1):
+                  req = urllib.request.Request(
+                      base.rstrip('/') + path, data=payload, method='POST',
+                      headers={'Content-Type': 'application/json',
+                               'Authorization': 'Bearer ' + os.environ.get('VPS_TOKEN', '')},
+                  )
+                  try:
+                      return urllib.request.urlopen(req, timeout=timeout).read()
+                  except urllib.error.HTTPError as e:
+                      if e.code in (502, 503, 504) and attempt < retries:
+                          wait = 30 * attempt
+                          print(f'VPS HTTP {e.code} — сервер перезапускается, повтор {attempt}/{retries - 1} через {wait}s', file=sys.stderr)
+                          time.sleep(wait)
+                          continue
+                      print(f'FAIL: VPS HTTP {e.code}: {e.read().decode(errors="replace")[:600]}', file=sys.stderr)
+                      raise SystemExit(1)
+                  except urllib.error.URLError as e:
+                      if attempt < retries:
+                          wait = 30 * attempt
+                          print(f'VPS недоступен ({e.reason}), повтор {attempt}/{retries - 1} через {wait}s', file=sys.stderr)
+                          time.sleep(wait)
+                          continue
+                      print(f'FAIL: cannot reach VPS host {host}: {e.reason}', file=sys.stderr)
+                      raise SystemExit(1)
               raise SystemExit(1)
-          except urllib.error.URLError as e:
-              print(f'FAIL: cannot reach VPS host {host}: {e.reason}', file=sys.stderr)
-              raise SystemExit(1)
+
+          body = post('/crm/import', payload, 2400)
           print('crm import ok:', body.decode(errors='replace')[:1200])
           EOF
