@@ -551,7 +551,7 @@ class AppViewModel(private val scope: CoroutineScope) {
         startAgent(text, chat.id)
     }
 
-    fun startAgent(goal: String, chatId: String? = null) {
+    fun startAgent(goal: String, chatId: String? = null, resumeOf: List<AgentRun> = emptyList()) {
         val p = svc.selectedProject()
         val dir = p?.let { svc.projectDir(it.name) }
         if (p == null || dir == null) {
@@ -591,11 +591,22 @@ class AppViewModel(private val scope: CoroutineScope) {
                 onUpdate = { r -> update { it.copy(agentRun = r, agentRuns = agentStore.runs) } },
                 onLog = { line -> update { it.copy(agentLog = (it.agentLog + line).takeLast(200)) } },
             )
-            runner.run(goal, project, seedHistory = seed, chatId = chatId ?: "")
+            runner.run(goal, project, seedHistory = seed, chatId = chatId ?: "", resumeOf = resumeOf)
             approval?.cancel()
             approval = null
             update { it.copy(busy = false, agentRuns = agentStore.runs, pendingChange = null) }
         }
+    }
+
+    // Продолжить задачу с места остановки. Новый прогон получает бриф по
+    // предыдущим прогонам ЭТОГО чата (включая выбранный): цель та же, бюджет
+    // свой, а модель видит, что уже сделано и где остановились.
+    fun resumeRun(id: String) {
+        val run = agentStore.get(id) ?: return
+        val chatId = _state.value.activeChatId ?: return
+        if (!run.resumable) return
+        val previous = _state.value.chatRuns.filter { it.startedAt <= run.startedAt }.ifEmpty { listOf(run) }
+        startAgent(run.goal, chatId, resumeOf = previous)
     }
 
     // Запрос разрешения показывается карточкой В ЛЕНТЕ ЧАТА: решение принимается там

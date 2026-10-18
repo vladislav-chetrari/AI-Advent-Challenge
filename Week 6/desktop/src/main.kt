@@ -535,6 +535,15 @@ fun AgentRunCard(vm: AppViewModel, run: core.agent.AgentRun, st: UiState) {
                 "шагов ${run.steps} · вызовов ${run.invocations.size} · ${run.id}",
                 fontSize = 10.sp, color = Color.Gray, modifier = Modifier.weight(1f), maxLines = 1,
             )
+            // Продолжение: прогон встал на лимит, упал или отменён — задача не
+            // закрыта, и кнопка прямо под этим прогоном. Пока идёт он сам,
+            // кнопку не показываем.
+            if (run.resumable && !(run.id == st.agentRun?.id && st.busy)) {
+                TextButton(
+                    onClick = { vm.resumeRun(run.id) },
+                    enabled = !st.busy,
+                ) { Text("▶ продолжить", fontSize = 11.sp, color = Color(0xFF1E88E5)) }
+            }
             if (run.state !is core.agent.RunState.Done && run.state !is core.agent.RunState.Cancelled &&
                 run.state !is core.agent.RunState.Failed
             ) {

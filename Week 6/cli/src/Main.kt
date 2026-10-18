@@ -622,10 +622,16 @@ private suspend fun runCommand(args: Array<String>) {
         }
         // ===== Task 4: агент, который сам работает с файлами проекта =====
         //   agent-run --goal "цель" [--project P] [--chat <имя>] [--auto-approve]
-        //            [--max-steps N] [--max-files N] [--out run.json] [--format json|md]
+        //            [--resume <run-id>] [--max-steps N] [--max-files N]
+        //            [--out run.json] [--format json|md]
         "agent-run" -> {
             val (_, rest) = splitPaths(args)
-            val goal = flag(rest, "--goal")?.takeIf { it.isNotBlank() } ?: fail("нужен --goal \"<цель>\"")
+            // Продолжение: цель и бриф берём из прошлого прогона.
+            val resumeStore = core.agent.RunStore()
+            val resumeId = flag(rest, "--resume")
+            val resumeRun = resumeId?.let { resumeStore.get(it) ?: fail("прогон $it не найден") }
+            val goal = resumeRun?.goal?.takeIf { it.isNotBlank() }
+                ?: flag(rest, "--goal")?.takeIf { it.isNotBlank() } ?: fail("нужен --goal \"<цель>\" или --resume <run-id>")
             val projectName = flag(rest, "--project") ?: svc.selectedProject()?.name
                 ?: fail("проект не выбран: добавь через project-add или укажи --project")
             val dir = svc.projectDir(projectName) ?: fail("папка проекта пропала: $projectName")
@@ -648,8 +654,22 @@ private suspend fun runCommand(args: Array<String>) {
             // --chat <имя> — привязать прогон к агентному чату: та же история
             // прогонов и дифов, что и в desktop, но без окна.
             val chatName = flag(rest, "--chat")
-            val chatId = chatName?.let { findOrCreateAgentChat(ChatStore(), it) }.orEmpty()
+            // Продолжение наследует чат того прогона, который продолжаем.
+            val chatId = chatName?.let { findOrCreateAgentChat(ChatStore(), it) }
+                ?: resumeRun?.chatId?.takeIf { it.isNotBlank() }
+                ?: ""
             if (chatName != null) println("Агентный чат: $chatName")
+            // Бриф: что уже сделано в прошлых прогонах этого чата (включая тот,
+            // который продолжаем). Без него агент начал бы задачу с нуля.
+            val previous = if (resumeRun == null) {
+                emptyList()
+            } else {
+                store.runs.filter { it.chatId == resumeRun.chatId && it.startedAt <= resumeRun.startedAt }
+                    .ifEmpty { listOf(resumeRun) }
+            }
+            if (resumeRun != null) {
+                println("Продолжение прогона ${resumeRun.id} (${resumeRun.label()}): предыдущих прогонов в брифе — ${previous.size}")
+            }
             if (auto) println("Режим --auto-approve: изменения пишутся без подтверждения.")
             println("—".repeat(60))
             val runner = core.agent.AgentRunner(
@@ -665,7 +685,7 @@ private suspend fun runCommand(args: Array<String>) {
                 },
                 onLog = { println("   · $it") },
             )
-            val run = runner.run(goal, projectName, chatId = chatId)
+            val run = runner.run(goal, projectName, chatId = chatId, resumeOf = previous)
             println("—".repeat(60))
             printRun(run)
             val out = flag(rest, "--out")
@@ -1264,6 +1284,40 @@ private fun verifyAgent() {
         check(runStore.get(rC.id)?.chatId == null || runStore.get(rC.id)?.chatId == "") { "headless-прогон привязался к чату" }
         println("OK разделение чатов и история прогонов")
 
+        // --- 15. Возобновление задачи ---
+        // Продолжение обязано нести факты прошлого прогона, иначе агент
+        // переделает всё с нуля, и нашлось бы «продолжение», которого нет.
+        val stopped = core.agent.AgentMachine.newRun("demo", "обнови документацию", chatId = "a1").let {
+            core.agent.AgentMachine.reduce(
+                it,
+                core.agent.AgentEvent.BudgetExhausted("лимит шагов (16)"),
+            ).run
+        }
+        check(stopped.resumable) { "прогон, вставший на лимит, нельзя продолжить" }
+        check(stopped.error == "лимит шагов (16)") { "причина остановки потеряна: ${stopped.error}" }
+        val doneOk = core.agent.AgentMachine.reduce(
+            core.agent.AgentMachine.newRun("demo", "найти X"),
+            core.agent.AgentEvent.Finished("всё сделано"),
+        ).run
+        check(!doneOk.resumable) { "успешный прогон предложено продолжать" }
+        val failedRun = core.agent.AgentMachine.reduce(
+            core.agent.AgentMachine.newRun("demo", "сломать"),
+            core.agent.AgentEvent.Failed("модель вернула мусор"),
+        ).run
+        check(failedRun.resumable) { "упавший прогон нельзя продолжить" }
+        val resume = core.agent.buildResumePrompt(
+            "обнови документацию",
+            "Проект: demo. Ветка: main.",
+            listOf(stopped),
+        )
+        check(resume.contains("ПРОДОЛЖЕНИЕ ЗАДАЧИ")) { "в брифе нет отметки о продолжении" }
+        check(resume.contains("обнови документацию")) { "цель не попала в бриф" }
+        check(resume.contains(stopped.id)) { "в брифе нет id предыдущего прогона" }
+        check(resume.contains("лимит шагов (16)")) { "в брифе нет причины остановки" }
+        check(resume.contains("git_diff")) { "в брифе нет правила проверить состояние файлов" }
+        check(resume.length < 4000) { "бриф раздулся: ${resume.length}" }
+        println("OK возобновление задачи")
+
         println("VERIFY-AGENT PASSED")
     } finally {
         try {
@@ -1315,8 +1369,9 @@ private fun usage() {
     println("week6 verify-support")
     println("  Task 3: оффлайн-проверка слоя поддержки (фронтматтер, MCP, промпт, CRM).")
     println()
-    println("week6 agent-run --goal \"цель\" [--project <имя>] [--chat <имя>] [--auto-approve] [--max-steps 8] [--max-files 10] [--out run.json]")
+    println("week6 agent-run --goal \"цель\" [--project <имя>] [--chat <имя>] [--resume <run-id>] [--auto-approve] [--max-steps 8] [--max-files 10] [--out run.json]")
     println("  Task 4: агент с доступом к файлам. Цель ставит человек, файлы выбирает агент.")
+    println("  --resume <run-id>: продолжить задачу с места остановки (бриф по прошлым прогонам).")
     println("  Без --auto-approve каждое изменение спрашивает подтверждение (показывается diff).")
     println("week6 agent-tools [--project <имя>]")
     println("  Task 4: схемы тулов агента — ровно то, что видит модель и MCP-клиент.")

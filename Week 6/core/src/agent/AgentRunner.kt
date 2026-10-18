@@ -38,6 +38,8 @@ class AgentRunner(
         apiKey: String? = null,
         // Прогон пишется в историю агентного чата; пусто = CLI без чата.
         chatId: String = "",
+        // Продолжение задачи: факты прошлых прогонов, чтобы агент не начинал заново.
+        resumeOf: List<AgentRun> = emptyList(),
     ): AgentRun {
         var run = AgentMachine.newRun(project, goal, chatId)
         // Снапшоты пишем в папку RunStore — по ней же работает откат.
@@ -74,7 +76,12 @@ class AgentRunner(
         transcript += ChatMsg("system", buildAgentSystem(project, specs.map { it.name }, workspace.rootFile.name))
         // Хвост переписки — чтобы «обнови доки по тому, о чём говорили» работало.
         seedHistory.takeLast(SEED_HISTORY).forEach { transcript += it }
-        transcript += ChatMsg("user", buildAgentUser(goal, projectLine(project)))
+        val projectCtx = projectLine(project)
+        transcript += ChatMsg(
+            "user",
+            if (resumeOf.isEmpty()) buildAgentUser(goal, projectCtx)
+            else buildResumePrompt(goal, projectCtx, resumeOf),
+        )
 
         while (true) {
             val step = run.steps + 1

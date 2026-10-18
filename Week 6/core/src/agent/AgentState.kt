@@ -100,6 +100,12 @@ data class AgentRun(
 
     fun byId(id: String): ToolInvocation? = invocations.lastOrNull { it.id == id }
 
+    // Прогон имеет смысл продолжать: он не довёл задачу до конца — упал,
+    // отменён или встал на лимит (тогда state = Done, а error объясняет почему).
+    // Успешный прогон продолжать незачем: задача уже закрыта.
+    val resumable: Boolean
+        get() = state is RunState.Failed || state is RunState.Cancelled || (state is RunState.Done && error.isNotBlank())
+
     fun label(): String = when (val s = state) {
         is RunState.Idle -> "ожидание"
         is RunState.Goal -> "цель принята"
