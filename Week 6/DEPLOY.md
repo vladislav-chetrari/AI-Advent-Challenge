@@ -84,9 +84,12 @@ export PORT=8080 VPS_TOKEN=$(openssl rand -hex 32)
 Публичность ограничена троттлингом: 12 сообщений в минуту с одного IP.
 
 ```sh
-# ключ на VPS (нужен для облачной модели)
+# ключ на VPS (нужен для облачной модели).
+# Имя файла на VPS — именно .env, с точкой: сервер ищет ~/.ai-advent-week6/.env
+# и больше нигде (локальное имя файла не важно).
 scp ~/IdeaProjects/AI-Advent-Challenge/.env <user>@<vps>:~/.ai-advent-week6/.env
 # или через systemd: Environment=DEEPSEEK_API_KEY=sk-...
+chmod 600 ~/.ai-advent-week6/.env
 ```
 
 Проверка: открыть `https://<vps>/chat` и написать вопрос.
