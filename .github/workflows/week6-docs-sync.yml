@@ -1,0 +1,187 @@
+name: week6-docs-sync
+
+# Синхронизация документации этого репозитория после merge в Week 6.
+# Тот же движок, что у ревью: VPS, если задан VPS_URL, иначе локальная сборка
+# Amper в раннере (для видео и проверки без секретов).
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Week 6/**'
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'Коммит, с которого считать изменения'
+        required: false
+      dry_run:
+        description: 'Только разбор изменений, без модели и без PR'
+        type: boolean
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: week6-docs-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docs-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    defaults:
+      run:
+        working-directory: Week 6
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.sha }}
+
+      - name: Sync docs via VPS
+        id: sync
+        if: ${{ secrets.VPS_URL != '' }}
+        env:
+          VPS_URL: ${{ secrets.VPS_URL }}
+          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          REVIEW_PROJECT: ${{ vars.REVIEW_PROJECT || 'AI-Advent-Challenge' }}
+          REPO_URL: ${{ format('{0}/{1}', github.server_url, github.repository) }}
+          REPO_TOKEN: ${{ github.event.repository.private && secrets.GITHUB_TOKEN || '' }}
+          BASE_INPUT: ${{ inputs.base }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          base="$BASE_INPUT"
+          if [ -z "$base" ]; then base="$(git rev-parse HEAD~1 2>/dev/null || echo '')"; fi
+          if [ -z "$base" ]; then echo "FAIL: не на чем строить diff" >&2; exit 1; fi
+          echo "диапазон: $base...HEAD"
+          export BASE_SHA="$base"
+          python3 - <<'EOF'
+          import json, os, sys, urllib.request, urllib.error, urllib.parse
+
+          base = os.environ.get('VPS_URL', '').strip()
+          if not base.startswith(('http://', 'https://')):
+              print('FAIL: VPS_URL must start with http:// or https:// (scheme missing)', file=sys.stderr)
+              raise SystemExit(1)
+          print('docs-sync endpoint host:', urllib.parse.urlparse(base).netloc)
+
+          payload = json.dumps({
+              "project": os.environ.get('REVIEW_PROJECT') or None,
+              "base": os.environ['BASE_SHA'],
+              "head": "HEAD",
+              "repoUrl": os.environ.get('REPO_URL') or None,
+              "repoToken": os.environ.get('REPO_TOKEN') or None,
+              "maxFilesChanged": 6,
+              "maxDocCandidates": 8,
+              "dryRun": os.environ.get('DRY_RUN') == 'true',
+              "restore": True,
+          }).encode()
+          req = urllib.request.Request(
+              base.rstrip('/') + '/docs-sync', data=payload, method='POST',
+              headers={'Content-Type': 'application/json',
+                       'Authorization': 'Bearer ' + os.environ.get('VPS_TOKEN', ''),
+                       'X-LLM-Key': os.environ.get('DEEPSEEK_API_KEY', ''),
+                       'X-Repo-Token': os.environ.get('REPO_TOKEN', '')},
+          )
+          try:
+              body = urllib.request.urlopen(req, timeout=1500).read()
+          except urllib.error.HTTPError as e:
+              print(f'FAIL: VPS HTTP {e.code}: {e.read().decode(errors="replace")[:600]}', file=sys.stderr)
+              raise SystemExit(1)
+          open('docs-sync.json', 'wb').write(body)
+          res = json.loads(body)
+          print('изменено файлов кода:', len(res.get('changedCodeFiles') or []))
+          print('обновлено документов:', len(res.get('updatedFiles') or []))
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write('open_pr=%s\n' % ('true' if res.get('updatedFiles') else 'false'))
+              f.write('pr_title=%s\n' % (res.get('prTitle') or 'docs: синхронизировать документацию'))
+          with open('pr-body.md', 'w', encoding='utf-8') as f:
+              f.write(res.get('prBody') or '')
+          EOF
+
+      # Без VPS — тот же код локально: та же классификация, тот же гейт.
+      # Проект добавляется по локальному пути, индекс доков не нужен.
+      - name: Sync docs locally (Amper CLI)
+        id: sync-local
+        if: ${{ secrets.VPS_URL == '' }}
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          BASE_INPUT: ${{ inputs.base }}
+        run: |
+          set -euo pipefail
+          base="$BASE_INPUT"
+          if [ -z "$base" ]; then base="$(git rev-parse HEAD~1 2>/dev/null || echo '')"; fi
+          if [ -z "$base" ]; then echo "FAIL: не на чем строить diff" >&2; exit 1; fi
+          ./kotlin run --module cli -- project-add --name week6-repo --input "$GITHUB_WORKSPACE" > /dev/null 2>&1 || true
+          ./kotlin run --module cli -- docs-sync --project week6-repo --base "$base" --out docs-sync.json --print-pr
+          python3 - <<'EOF'
+          import json, os
+          res = json.load(open('docs-sync.json', encoding='utf-8'))
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write('open_pr=%s\n' % ('true' if res.get('updatedFiles') else 'false'))
+              f.write('pr_title=%s\n' % (res.get('prTitle') or 'docs: синхронизировать документацию'))
+          with open('pr-body.md', 'w', encoding='utf-8') as f:
+              f.write(res.get('prBody') or '')
+          EOF
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### docs-sync"
+            echo ""
+            if [ -f docs-sync.json ]; then
+              echo '```'
+              python3 -c "import json;r=json.load(open('docs-sync.json',encoding='utf-8'));print('изменения:',r.get('changeNote'));print('пропуск:',r.get('skipReason') or 'нет');print('обновлено:',', '.join(r.get('updatedFiles') or []) or 'ничего')"
+              echo '```'
+            else
+              echo "Ответа нет — смотрите лог предыдущего шага."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Create branch with updated docs
+        if: steps.sync.outputs.open_pr == 'true' || steps.sync-local.outputs.open_pr == 'true'
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          branch="ai/docs-sync-${SHA::7}"
+          git config user.name "docs-sync-bot"
+          git config user.email "docs-sync-bot@users.noreply.github.com"
+          git checkout -b "$branch"
+          python3 - <<'EOF'
+          import json, os
+          res = json.load(open('docs-sync.json', encoding='utf-8'))
+          for f in res.get('updates') or []:
+              path = f['path']
+              if path.startswith('/') or '..' in path.split('/'):
+                  raise SystemExit(f'FAIL: небезопасный путь из ответа: {path}')
+              os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+              with open(path, 'w', encoding='utf-8', newline='\n') as out:
+                  out.write(f['content'])
+              print('применён:', path)
+          EOF
+          git add -A
+          if git diff --cached --quiet; then
+            echo "изменений нет — PR не нужен"
+          else
+            git commit -q -m "docs: синхронизировать документацию с кодом"
+            git push -u origin "$branch"
+          fi
+
+      - name: Open PR
+        if: steps.sync.outputs.open_pr == 'true' || steps.sync-local.outputs.open_pr == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_TITLE: ${{ steps.sync.outputs.pr_title || steps.sync-local.outputs.pr_title }}
+        run: |
+          set -euo pipefail
+          gh pr create \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "$(git rev-parse --abbrev-ref HEAD)" \
+            --title "$PR_TITLE" \
+            --body-file pr-body.md \
+            || echo "PR для этой ветки уже есть — нормально при повторном запуске"

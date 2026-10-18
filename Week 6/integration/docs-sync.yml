@@ -1,0 +1,193 @@
+name: ai-docs-sync
+
+# Копировать в целевой репозиторий как .github/workflows/ai-docs-sync.yml
+# После merge в код подтягивает документацию: VPS-движок Week 6 получает
+# диапазон коммитов, агент правит ТОЛЬКО доки и возвращает готовый PR.
+# Настройка — те же секреты, что у ai-review (см. integration/README.md).
+
+on:
+  push:
+    branches: [main, master]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - '.github/workflows/ai-docs-sync.yml'
+  schedule:
+    # Раз в сутки: подчищает то, что не поймал push (force-push, merge другого
+    # способа, ручные правки на VPS).
+    - cron: '23 4 * * *'
+  workflow_dispatch:
+    inputs:
+      base:
+        description: 'Коммит, с которого считать изменения (по умолчанию — предыдущий push)'
+        required: false
+      dry_run:
+        description: 'Только разбор изменений, без модели и без PR'
+        type: boolean
+        required: false
+
+permissions:
+  contents: write   # создаём ветку и коммит с обновлёнными доками
+  pull-requests: write
+
+concurrency:
+  # Два прогона на main одновременно = два PR с одними и теми же правками.
+  group: ai-docs-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  docs-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # diff считается на сервере, но base нужен и здесь
+
+      - name: Ask VPS to sync docs
+        id: sync
+        env:
+          VPS_URL: ${{ secrets.VPS_URL }}
+          VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          REVIEW_PROJECT: ${{ vars.REVIEW_PROJECT || github.event.repository.name }}
+          REPO_URL: ${{ format('{0}/{1}', github.server_url, github.repository) }}
+          REPO_TOKEN: ${{ github.event.repository.private && secrets.GITHUB_TOKEN || '' }}
+          DRY_RUN: ${{ inputs.dry_run && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+          base="${{ inputs.base }}"
+          if [ -z "$base" ]; then
+            # Перед текущим HEAD. Для первого прогона после force-push, когда
+            # предыдущего SHA уже нет на сервере, берём коммит недели назад.
+            base="$(git rev-parse HEAD~1 2>/dev/null || echo '')"
+          fi
+          if [ -z "$base" ]; then
+            echo "FAIL: не на чем строить diff — задай base вручную (workflow_dispatch)" >&2
+            exit 1
+          fi
+          echo "диапазон: $base...HEAD"
+          # Heredoc ниже quoted ('EOF'), поэтому $base не подставится сам —
+          # отдаём его скрипту через переменную окружения.
+          export BASE_SHA="$base"
+
+          # VPS_URL — секрет, GitHub маскирует его целиком в логах: печатаем
+          # только схему и host, иначе причина ошибки не видна.
+          python3 - <<'EOF'
+          import json, os, sys, urllib.request, urllib.error, urllib.parse
+
+          base = os.environ.get('VPS_URL', '').strip()
+          if not base.startswith(('http://', 'https://')):
+              print('FAIL: VPS_URL must start with http:// or https:// (scheme missing)', file=sys.stderr)
+              raise SystemExit(1)
+          host = urllib.parse.urlparse(base).netloc
+          print('docs-sync endpoint host:', host, '| scheme:', base.split(':')[0])
+
+          payload = json.dumps({
+              "project": os.environ.get('REVIEW_PROJECT') or None,
+              "base": os.environ['BASE_SHA'],
+              "head": "HEAD",
+              "repoUrl": os.environ.get('REPO_URL') or None,
+              "repoToken": os.environ.get('REPO_TOKEN') or None,
+              # Документов за прогон меньше, чем кода: агент не успеет разойтись
+              # по проекту за лимит шагов.
+              "maxFilesChanged": 6,
+              "maxDocCandidates": 8,
+              "dryRun": os.environ.get('DRY_RUN') == 'true',
+              "restore": True,
+          }).encode()
+          req = urllib.request.Request(
+              base.rstrip('/') + '/docs-sync', data=payload, method='POST',
+              headers={'Content-Type': 'application/json',
+                       'Authorization': 'Bearer ' + os.environ.get('VPS_TOKEN', ''),
+                       'X-LLM-Key': os.environ.get('DEEPSEEK_API_KEY', ''),
+                       'X-Repo-Token': os.environ.get('REPO_TOKEN', '')},
+          )
+          try:
+              body = urllib.request.urlopen(req, timeout=1500).read()
+          except urllib.error.HTTPError as e:
+              print(f'FAIL: VPS HTTP {e.code}: {e.read().decode(errors="replace")[:600]}', file=sys.stderr)
+              raise SystemExit(1)
+          except urllib.error.URLError as e:
+              print(f'FAIL: cannot reach VPS host {host}: {e.reason}', file=sys.stderr)
+              raise SystemExit(1)
+          open('docs-sync.json', 'wb').write(body)
+          res = json.loads(body)
+          print('изменено файлов кода:', len(res.get('changedCodeFiles') or []))
+          print('обновлено документов:', len(res.get('updatedFiles') or []),
+                '| кандидаты:', len(res.get('candidateDocs') or []))
+          if res.get('warning'):
+              print('предупреждение:', res['warning'][:200])
+          # Решение «открывать PR или нет» одной строкой: пустой список —
+          # это честный ответ «документация уже соответствует коду».
+          with open(os.environ['GITHUB_OUTPUT'], 'a', encoding='utf-8') as f:
+              f.write('open_pr=%s\n' % ('true' if res.get('updatedFiles') else 'false'))
+              f.write('pr_title=%s\n' % (res.get('prTitle') or 'docs: синхронизировать документацию'))
+          with open('pr-body.md', 'w', encoding='utf-8') as f:
+              f.write(res.get('prBody') or '')
+          EOF
+
+      - name: Summary
+        if: always()
+        env:
+          OPEN_PR: ${{ steps.sync.outputs.open_pr }}
+        run: |
+          {
+            echo "### docs-sync"
+            echo ""
+            if [ -f docs-sync.json ]; then
+              echo '```'
+              python3 -c "import json;r=json.load(open('docs-sync.json',encoding='utf-8'));print('изменения:',r.get('changeNote'));print('пропуск:',r.get('skipReason') or 'нет');print('обновлено:',', '.join(r.get('updatedFiles') or []) or 'ничего')"
+              echo '```'
+            else
+              echo "VPS недоступен или ответ не получен — смотрите лог шага."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Пустой результат — это не ошибка: доки уже соответствуют коду.
+      # PR открываем только когда агент реально что-то поправил.
+      - name: Create branch with updated docs
+        if: steps.sync.outputs.open_pr == 'true'
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          branch="ai/docs-sync-${SHA::7}"
+          git config user.name "docs-sync-bot"
+          git config user.email "docs-sync-bot@users.noreply.github.com"
+          git checkout -b "$branch"
+          python3 - <<'EOF'
+          import json, os
+          res = json.load(open('docs-sync.json', encoding='utf-8'))
+          for f in res.get('updates') or []:
+              path = f['path']
+              if path.startswith('/') or '..' in path.split('/'):
+                  raise SystemExit(f'FAIL: небезопасный путь из ответа VPS: {path}')
+              os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
+              with open(path, 'w', encoding='utf-8', newline='\n') as out:
+                  out.write(f['content'])
+              print('применён:', path)
+          EOF
+          git add -A
+          if git diff --cached --quiet; then
+            echo "изменений нет — PR не нужен"
+          else
+            git commit -q -m "docs: синхронизировать документацию с кодом"
+            git push -u origin "$branch"
+          fi
+
+      - name: Open PR
+        if: steps.sync.outputs.open_pr == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BRANCH: ${{ steps.sync.outputs.pr_title }}
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse HEAD)"
+          gh pr create \
+            --base "${{ github.event.repository.default_branch }}" \
+            --head "$(git rev-parse --abbrev-ref HEAD)" \
+            --title "$BRANCH" \
+            --body-file pr-body.md \
+            || echo "PR уже существует для этой ветки — это нормально при повторном запуске"
+          echo "открыт PR из $sha"

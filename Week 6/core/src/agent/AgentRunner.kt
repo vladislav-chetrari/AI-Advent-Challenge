@@ -38,10 +38,16 @@ class AgentRunner(
         apiKey: String? = null,
         // Прогон пишется в историю агентного чата; пусто = CLI без чата.
         chatId: String = "",
-        // Продолжение ТОГО ЖЕ прогона: тот же id, тот же счётчик шагов, тот же
+// Продолжение ТОГО ЖЕ прогона: тот же id, тот же счётчик шагов, тот же
         // список изменённых файлов и восстановленный транскрипт. Ничего не
         // начинается заново — цикл продолжает с места остановки.
         resume: AgentRun? = null,
+        // Task 5 (docs-sync): другая задача — другая роль в промпте.
+        // Переопределение оставляет цикл, тулы, бюджет и редьюсер теми же:
+        // различается только текст, который видит модель. На продолжении
+        // (`resume`) параметры не действуют — там уже сохранённый транскрипт.
+        systemPrompt: ((toolNames: List<String>) -> String)? = null,
+        userPrompt: ((contextLine: String) -> String)? = null,
     ): AgentRun {
         val transcripts = TranscriptStore(runStore.appDir)
         val run0 = resume ?: AgentMachine.newRun(project, goal, chatId)
@@ -75,7 +81,7 @@ class AgentRunner(
         val specs = defs.map { it.spec }
 
         val transcript = ArrayList<ChatMsg>()
-        // Транскрипт на диск: состояние агента обязано пережить падение процесса.
+// Транскрипт на диск: состояние агента обязано пережить падение процесса.
         fun persist() = transcripts.save(run.id, run.goal, transcript)
         val saved = resume?.let { transcripts.load(it.id) }
         val resumed = resume != null && !saved?.messages.isNullOrEmpty()
@@ -86,14 +92,18 @@ class AgentRunner(
             transcript += ChatMsg("user", RESUME_USER_LINE)
             onLog("продолжаю прогон ${run.id}: в контексте ${transcript.size} сообщений")
         } else {
-            transcript += ChatMsg("system", buildAgentSystem(project, specs.map { it.name }, workspace.rootFile.name))
+            // Свежий старт: системный и пользовательский промпт можно переопределить
+            // (docs-sync Task 5) — по умолчанию это обычный агент-разработчик.
+            val system = systemPrompt?.invoke(specs.map { it.name })
+                ?: buildAgentSystem(project, specs.map { it.name }, workspace.rootFile.name)
+            transcript += ChatMsg("system", system)
             // Хвост переписки — чтобы «обнови доки по тому, о чём говорили» работало.
             seedHistory.takeLast(SEED_HISTORY).forEach { transcript += it }
-            transcript += ChatMsg("user", buildAgentUser(goal, projectLine(project)))
+            transcript += ChatMsg(
+                "user",
+                userPrompt?.invoke(projectLine(project)) ?: buildAgentUser(goal, projectLine(project)),
+            )
         }
-        // Цель принимается в обоих случаях: на паузе это и есть «продолжить».
-        apply(AgentMachine.reduce(run, AgentEvent.GoalAccepted(goal), config))
-        persist()
 
         while (true) {
             val step = run.steps + 1

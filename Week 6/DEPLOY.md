@@ -137,6 +137,52 @@ curl -s -X POST http://127.0.0.1:8080/crm/tickets \
 - при недоступных эмбеддингах `/support/ask` отвечает по тикету и пишет предупреждение
   в `warning`, а не падает.
 
+## 7b. Task 5 — синхронизация документации (тот же VPS)
+
+```
+push в main целевого репозитория
+   └─▶ Action (docs-sync.yml): base...HEAD + секреты
+          └─▶ POST /docs-sync ──▶ git diff → кандидаты-доки → агент Task 4
+                                    └─▶ {updates[{path,content}], prTitle, prBody}
+                 └─▶ Action применяет файлы в ветке ai/docs-sync-<sha> и открывает PR
+```
+
+Отличия от ревью, которые важны при эксплуатации:
+
+- **индексация не нужна.** Агент работает с файлами и git, поэтому `/docs-sync`
+  клонирует проект сам (`ProjectLoader.cloneFresh`) и НЕ зовёт `indexProject`:
+  первый запуск не платит получасовой прогон эмбеддингов;
+- **глубокая история.** Клон проекта делается `--depth 1`, а трёхточечный diff без
+  истории не собрать: сервер доком историю (`fetch --unshallow`, затем
+  `--depth=200`) и только потом считает изменения. Если нужный коммит всё равно не
+  найден — возвращает `⚠ в клоне нет истории для <base>` и работает с тем, что есть;
+- **клон откатывается.** Агент пишет прямо в клон, но содержимое забирается ДО
+  отката (`restore: true` по умолчанию), поэтому рабочее деремо на VPS остаётся
+  чистым и следующий запуск не видит «чужих» правок;
+- **пустой результат — норма.** Если правок нет (тесты, рефакторинг, доки уже
+  актуальны), `updatedFiles` пуст и Action не открывает PR.
+
+```sh
+# dry-run: разбор изменений без модели и без ключа — дымовой тест в CI
+curl -s -X POST http://127.0.0.1:8080/docs-sync \
+  -H "Authorization: Bearer $VPS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"project":"CallowFellow","base":"HEAD~20","dryRun":true}'
+
+# боевой прогон (ключ приходит из X-LLM-Key)
+curl -s -X POST http://127.0.0.1:8080/docs-sync \
+  -H "Authorization: Bearer $VPS_TOKEN" -H "X-LLM-Key: $DEEPSEEK_API_KEY" \
+  -H 'Content-Type: application/json' \
+  -d '{"project":"CallowFellow","base":"HEAD~20","head":"HEAD"}'
+```
+
+Локально (без VPS):
+
+```sh
+./kotlin run --module cli -- docs-sync --project P --base HEAD~20 --dry-run
+./kotlin run --module cli -- docs-sync --project P --base HEAD~20 --print-pr
+./kotlin run --module cli -- verify-docs
+```
+
 ---
 
 # 8. Обновления
@@ -185,6 +231,7 @@ curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/index \
 | `review.yml` | `.github/workflows/review.yml` |
 | `index-docs.yml` | `.github/workflows/index-docs.yml` |
 | `support-index.yml` | `.github/workflows/support-index.yml` (Task 3) |
+| `docs-sync.yml` | `.github/workflows/ai-docs-sync.yml` (Task 5) |
 | `post_review.py` | `.github/scripts/post_review.py` |
 
 ```sh
@@ -222,11 +269,17 @@ systemctl is-active review-server && curl -s localhost:8080/health
 # 2. логика парсинга diff/JSON цела (без сети и БД)
 cd ~/AI-Advent-Challenge/"Week 6" && ./kotlin run --module cli -- verify-review
 
+# 2b. слой docs-sync цел (без сети, БД и LLM)
+./kotlin run --module cli -- verify-docs
+
 # 3. индексация жива — ручной запуск index-docs в целевом репо
 gh workflow run index-docs --repo <owner>/<repo>
 
 # 4. ревью живо — Re-run all jobs на тестовом PR
 gh run list --repo <owner>/<repo> --limit 3
+
+# 5. docs-sync живо — dry-run (без модели) на реальном проекте
+gh workflow run ai-docs-sync --repo <owner>/<repo> -f dry_run=true
 ```
 
 Ожидаемый вывод ревью в PR: общий комментарий (итог + баги/архитектура/рекомендации

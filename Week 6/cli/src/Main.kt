@@ -758,6 +758,87 @@ private suspend fun runCommand(args: Array<String>) {
         // Чистый оффлайн-тест слоя агента: схемы тулов, редьюсер, клетка путей,
         // unified diff, MCP-эндпоинт. Без сети, без БД и без LLM.
         "verify-agent" -> verifyAgent()
+        // ===== Task 5 (День 35): агент-синхронизатор документации =====
+        //   docs-sync --project <имя> [--base origin/main] [--head HEAD]
+        //             [--max-steps N] [--max-files N] [--out result.json]
+        //             [--dry-run] [--keep-changes] [--print-pr] [--server URL]
+        // --dry-run — без LLM: только классификация изменений и кандидаты-доки.
+        // Рабочее дерево после прогона откатывается по снапшотам (--keep-changes
+        // оставляет правки на диске — так удобно смотреть результат вручную).
+        "docs-sync" -> {
+            val (_, rest) = splitPaths(args)
+            val projectName = flag(rest, "--project") ?: svc.selectedProject()?.name
+                ?: fail("проект не выбран: добавь через project-add или укажи --project")
+            val base = flag(rest, "--base")?.takeIf { it.isNotBlank() }
+            val head = flag(rest, "--head") ?: "HEAD"
+            val dryRun = rest.contains("--dry-run")
+            val keep = rest.contains("--keep-changes")
+            val printPr = rest.contains("--print-pr")
+            val out = flag(rest, "--out")
+            val server = flag(rest, "--server") ?: vpsUrl()
+            val cfg = core.agent.AgentConfig(
+                maxSteps = flag(rest, "--max-steps")?.toIntOrNull() ?: core.agent.DocsSync.MAX_STEPS,
+                maxFilesChanged = flag(rest, "--max-files")?.toIntOrNull() ?: core.agent.DocsSync.MAX_FILES_CHANGED,
+            )
+
+            // Режим VPS: движок один на сервере, в целевом репозитории нет Kotlin.
+            if (server != null) {
+                // repoUrl отдаём, только если проект уже есть локально: сервер
+                // сам склонирует его при первом обращении. Приватный репозиторий
+                // без токена не склонируется — там путь через workflow.
+                val repoUrl = svc.projectDir(projectName)
+                    ?.let { core.agent.DocsSync.remoteUrl(it) }
+                val payload = buildJsonObject {
+                    put("project", projectName)
+                    put("base", base ?: "")
+                    put("head", head)
+                    put("maxSteps", cfg.maxSteps)
+                    put("maxFilesChanged", cfg.maxFilesChanged)
+                    put("dryRun", dryRun)
+                    repoUrl?.let { put("repoUrl", it) }
+                }
+                val body = postJson("$server/docs-sync", payload.toString())
+                val res = reviewOutJson.decodeFromString(core.agent.DocsSyncResult.serializer(), body)
+                printDocsSync(res, printPr = printPr, out = out)
+                return@runCommand
+            }
+
+            val dir = svc.projectDir(projectName) ?: fail("папка проекта пропала: $projectName")
+            println("Проект: $projectName")
+            println("Диапазон: ${base ?: "(рабочее дерево)"}...$head")
+            val service = core.agent.DocsSyncService(svc, cfg)
+            val ws = core.agent.Workspace(dir)
+            // Мелкий клон не подойдёт для трёхточечного diff — доком историю.
+            val repoNote = core.agent.DocsSync.prepareRepo(dir, base)
+            if (repoNote.isNotBlank()) println("⚠ $repoNote")
+
+            val apiKey = llmKey()
+            // Один и тот же код для обычного прогона и dry-run: разница только
+            // в том, зовём ли мы модель. Иначе «дымовой тест в CI» проверял бы
+            // другую ветку, а не ту, что работает в бою.
+            val res = core.agent.syncDocs(
+                service = service,
+                project = projectName,
+                dir = dir,
+                base = base,
+                head = head,
+                apiKey = apiKey,
+                dryRun = dryRun,
+            ) { m ->
+                println("   · $m")
+            }
+            // Содержимое уже собрано в res.updates — теперь возвращаем клон/рабочую
+            // копию в исходное состояние, иначе следующий запуск увидит в diff
+            // «чужие» правки и попытается их задокументировать.
+            if (!keep && !dryRun && res.hasUpdates) {
+                val n = service.revert(res, ws)
+                println("Откачено файлов после прогона: $n (--keep-changes оставил бы их)")
+            }
+            printDocsSync(res, printPr = printPr, out = out)
+        }
+        // Оффлайн-проверка слоя docs-sync: классификация, гейт, подбор доков,
+        // PR-шаблон и регресс на «агент не должен трогать код». Без сети и LLM.
+        "verify-docs" -> verifyDocs()
         // Скрытый дымовой тест новых путей: RAG вкл/выкл, фильтр документов. He для видео.
         "selftest" -> {
             val docs = svc.indexedDocs()
@@ -1362,6 +1443,223 @@ private fun verifyAgent() {
     }
 }
 
+// Итог docs-sync: что изменилось в коде, что агент поправил в доках, открыт
+// ли PR. --print-pr печатает готовое тело — его копируют в PR или Action
+// отправляет его в API GitHub.
+private fun printDocsSync(res: core.agent.DocsSyncResult, printPr: Boolean, out: String?) {
+    println()
+    println("Прогон: ${res.runId.ifBlank { "—" }}  ·  шагов: ${res.steps}")
+    println("Изменения: ${res.changeNote}")
+    if (res.changedCodeFiles.isNotEmpty()) {
+        println("Файлы кода:")
+        res.changedCodeFiles.take(20).forEach { println("  · $it") }
+        if (res.changedCodeFiles.size > 20) println("  … и ещё ${res.changedCodeFiles.size - 20}")
+    }
+    println()
+    if (res.skipped) {
+        println("Пропущено: ${res.skipReason}")
+    } else {
+        println("Обновлённые документы (${res.updatedFiles.size}):")
+        res.updatedFiles.forEach { println("  · $it") }
+        if (res.summary.isNotBlank()) println("\nИтог агента:\n${res.summary}")
+        if (!res.warning.isBlank()) println("\n⚠ ${res.warning}")
+        if (res.diff.isNotBlank()) {
+            println("\nDiff:")
+            println(res.diff.take(DIFF_SHOWN))
+            if (res.diff.length > DIFF_SHOWN) println("… диф обрезан (полный — в --out)")
+        }
+    }
+    if (res.candidateDocs.isNotEmpty()) {
+        println()
+        println("Кандидаты-доки, которые агент получит:")
+        res.candidateDocs.forEach { println("  · $it") }
+    }
+    if (res.error.isNotBlank()) println("\nОшибка прогона: ${res.error}")
+    if (printPr && !res.skipped) {
+        println()
+        println("—".repeat(60))
+        println("ЗАГОЛОВОК PR: ${res.prTitle}")
+        println()
+        println(res.prBody)
+    }
+    out?.let {
+        java.io.File(it).writeText(reviewOutJson.encodeToString(core.agent.DocsSyncResult.serializer(), res))
+        println("\nСохранено: $it")
+    }
+    // Машиночитаемая строка для Action: решение «открывать PR или нет».
+    System.err.println("DOCS_SYNC_UPDATES=${res.updatedFiles.size} SKIPPED=${res.skipped}")
+}
+
+// Оффлайн-проверка слоя docs-sync. Ни сети, ни БД, ни LLM: чистые функции
+// и временный каталог — тот же приём, что у verify-review/verify-support/
+// verify-agent. Именно этот тест гоняется в CI без секретов.
+private fun verifyDocs() {
+    val tmp = java.nio.file.Files.createTempDirectory("week6-docs-verify").toFile()
+    val DS = core.agent.DocsSync
+    try {
+        // --- 1. Классификация: код / доки / тесты / конфиги ---
+        check(DS.classify("core/src/agent/DocsSync.kt") == core.agent.DocFileKind.Code) { ".kt не код" }
+        check(DS.classify("server/src/main.py") == core.agent.DocFileKind.Code) { ".py не код" }
+        check(DS.classify("README.md") == core.agent.DocFileKind.Docs) { "README не документация" }
+        check(DS.classify("docs/api.md") == core.agent.DocFileKind.Docs) { "docs/*.md не документация" }
+        check(DS.classify("docs/adr/0001-vps.md") == core.agent.DocFileKind.Docs) { "вложенный док не документация" }
+        check(DS.classify("CHANGELOG.md") == core.agent.DocFileKind.Docs) { "changelog не документация" }
+        // Тест ловим РАНЬШЕ кода: иначе правка теста открывала бы PR с доками.
+        check(DS.classify("core/src/test/AppTest.kt") == core.agent.DocFileKind.Test) { "тест не отделён от кода" }
+        check(DS.classify("src/Foo.spec.ts") == core.agent.DocFileKind.Test) { ".spec.ts не тест" }
+        check(DS.classify(".github/workflows/review.yml") == core.agent.DocFileKind.Neutral) { "yml не конфиг" }
+        check(DS.classify("gradle/libs.versions.toml") == core.agent.DocFileKind.Neutral) { "toml не конфиг" }
+        check(DS.classify("Makefile") == core.agent.DocFileKind.Neutral) { "Makefile — не код и не доки" }
+        check(DS.isDocPath("docs/api.md") && !DS.isDocPath("core/src/App.kt")) { "isDocPath не совпадает с classify" }
+        println("OK классификация файлов")
+
+        // --- 2. Изменения без кода агента не запускают ---
+        val docsOnly = DS.classifyAll(listOf("README.md", "docs/api.md"))
+        check(!docsOnly.worthRunning) { "правка только доков не должна запускать агента" }
+        check(docsOnly.note.contains("только сами документы")) { "нечестная причина пропуска: ${docsOnly.note}" }
+        val configsOnly = DS.classifyAll(listOf("a.yml", "b.toml"))
+        check(!configsOnly.worthRunning) { "правка конфигов не должна запускать агента" }
+        val withCode = DS.classifyAll(listOf("README.md", "core/src/App.kt", "app.yml"))
+        check(withCode.worthRunning) { "изменение кода должно запускать агента" }
+        check(withCode.codeFiles.single().path == "core/src/App.kt") { "код определён неверно" }
+        check(withCode.docFiles.size == 1 && withCode.otherFiles.size == 1) { "разбор по ведрам неверный" }
+        check(withCode.note.contains("кода: 1")) { "сводка неверна: ${withCode.note}" }
+        check(DS.classifyAll(emptyList()).note == "изменений нет") { "пустое изменение не описано" }
+        println("OK когда запускать агента, а когда нет")
+
+        // --- 3. Гейт: писать можно только в документацию ---
+        val gate = core.agent.DocsOnlyGate()
+        val block = kotlinx.coroutines.runBlocking {
+            listOf(
+                "docs/api.md" to core.agent.PermissionEffect.Allow,
+                "README.md" to core.agent.PermissionEffect.Allow,
+                "docs/adr/0001-vps.md" to core.agent.PermissionEffect.Allow,
+                "core/src/App.kt" to core.agent.PermissionEffect.Deny,
+                "README.txt" to core.agent.PermissionEffect.Deny,
+                ".github/workflows/docs-sync.yml" to core.agent.PermissionEffect.Deny,
+            ).map { (path, want) ->
+                val v = gate.check("p", core.agent.PendingChange(path, "edit", "@@ +a @@"))
+                path to (if (v.effect == want.name) null else "хотели ${want.name}, получили ${v.effect}")
+            }
+        }
+        val bad = block.filter { it.second != null }
+        check(bad.isEmpty()) { "гейт ошибся: $bad" }
+        check(core.agent.DocsOnlyGate.denyReason("core/src/App.kt").contains("только документацию")) {
+            "причина отказа без объяснения"
+        }
+        println("OK гейт записи (код и конфиги закрыты)")
+
+        // --- 4. Кандидаты-доки: порядок по релевантности ---
+        tmp.resolve("src").mkdirs()
+        tmp.resolve("src").resolve("RetryPolicy.kt").writeText("class RetryPolicy\n", Charsets.UTF_8)
+        tmp.resolve("src").resolve("Utils.kt").writeText("fun helper() = 1\n", Charsets.UTF_8)
+        tmp.resolve("docs").mkdirs()
+        tmp.resolve("docs").resolve("api.md").writeText("# API\n\nRetryPolicy — повторы запросов.\n", Charsets.UTF_8)
+        tmp.resolve("docs").resolve("unrelated.md").writeText("# Разное\n\nНичего общего.\n", Charsets.UTF_8)
+        tmp.resolve("README.md").writeText("# Проект\n\nRetryPolicy упоминается тут тоже.\n", Charsets.UTF_8)
+        val ws = core.agent.Workspace(tmp)
+        val change = DS.classifyAll(listOf("src/RetryPolicy.kt", "src/Utils.kt"))
+        val cands = DS.candidateDocs(ws, change)
+        check(cands.contains("docs/api.md")) { "док с упоминанием символа не найден: $cands" }
+        check(cands.contains("README.md")) { "README не попал в кандидаты: $cands" }
+        // Упоминания идут ПЕРВЫМИ: агент с лимитом в 16 шагов не должен
+        // листать docs/ в поисках упоминания, которого там нет.
+        val tight = DS.candidateDocs(ws, change, limit = 2)
+        check(tight.toSet() == setOf("docs/api.md", "README.md")) {
+            "в кандидаты пробрался документ без упоминания: $tight"
+        }
+        check(cands.indexOf("docs/unrelated.md") > cands.indexOf("docs/api.md")) {
+            "документ без упоминания оказался раньше документа с упоминанием: $cands"
+        }
+        // Общие имена (Utils) не должны превращать поиск в «совпало всё подряд».
+        check(DS.symbolHint("src/Utils.kt").isEmpty()) { "слишком общее имя не отброшено" }
+        check(DS.symbolHint("core/RetryPolicy.kt") == "RetryPolicy") { "подсказка символа неверна" }
+        println("OK кандидаты-доки (${cands.joinToString(", ")})")
+
+        // --- 5. numstat: переименования и бинарники не ломают разбор ---
+        val ns = core.agent.DocsSync.parseNumstatLine("12\t3\tcore/src/App.kt")
+        check(ns != null && ns.added == 12 && ns.path == "core/src/App.kt") { "numstat разобран неверно" }
+        val ren = core.agent.DocsSync.parseNumstatLine("-\t-\told/{ => new/File.kt")
+        check(ren == null || ren.path.endsWith("File.kt")) { "переименование не разобрано: $ren" }
+        check(core.agent.DocsSync.parseNumstatLine("пустая строка") == null) { "мусор принят за numstat" }
+        println("OK numstat")
+
+        // --- 6. Шаблон PR собирается из результата ---
+        val result = core.agent.DocsSyncResult(
+            project = "demo",
+            changedCodeFiles = listOf("core/src/App.kt"),
+            updatedFiles = listOf("docs/api.md"),
+            updates = listOf(core.agent.DocFileUpdate("docs/api.md", "# API\n")),
+            diff = core.agent.unifiedDiff("docs/api.md", "старое", "новое"),
+            summary = "добавлен раздел про /docs-sync",
+            warning = "агент попытался править код — отклонено",
+        )
+        val body = core.agent.DocsSyncPr.body(result)
+        check(body.contains("core/src/App.kt")) { "в PR нет списка файлов кода" }
+        check(body.contains("docs/api.md")) { "в PR нет списка обновлённых доков" }
+        check(body.contains("добавлен раздел")) { "в PR нет итога агента" }
+        check(body.contains("отклонено")) { "предупреждение не попало в PR" }
+        check(core.agent.DocsSyncPr.title(1, "demo").contains("1 изменение")) {
+            "склонение в заголовке: ${core.agent.DocsSyncPr.title(1, "demo")}"
+        }
+        check(core.agent.DocsSyncPr.title(3, "demo").contains("3 изменения")) { "склонение 3" }
+        check(core.agent.DocsSyncPr.title(11, "demo").contains("11 изменений")) { "склонение 11" }
+        println("OK шаблон PR")
+
+        // --- 7. Промпты: запрет на правку кода и список изменений ---
+        val sys = core.rag.buildDocsSyncSystem("demo", listOf("read_file", "edit_file"), listOf("docs/api.md"))
+        check(sys.contains("ПИСАТЬ МОЖНО ТОЛЬКО В ДОКУМЕНТАЦИЮ")) { "в промпте нет запрета править код" }
+        check(sys.contains("docs/api.md")) { "кандидаты-доки не попали в системный промпт" }
+        check(sys.contains("edit_file")) { "в промпте нет имён тулов" }
+        val usr = core.rag.buildDocsSyncUser("цель", "Проект: demo.", change.codeFiles, cands)
+        check(usr.contains("src/RetryPolicy.kt")) { "изменённые файлы не попали в промпт" }
+        check(usr.indexOf("ИЗМЕНЁННЫЕ ФАЙЛЫ") < usr.indexOf("ГДЕ ИСКАТЬ")) {
+            "сначала должно идти ЧТО изменилось, потом ГДЕ искать"
+        }
+        println("OK промпты docs-sync")
+
+        // --- 8. Сервис на заглушке LLM: пустой diff — это не ошибка ---
+        val fake = object : core.llm.LlmClient() {
+            override suspend fun complete(
+                history: List<core.llm.ChatMsg>,
+                apiKey: String?,
+                temperatureOverride: Double?,
+                maxTokens: Int?,
+                tools: List<core.llm.ToolSpec>?,
+                toolChoice: String?,
+            ): core.llm.LlmResult = core.llm.LlmResult.Ok("Ничего править не нужно: правки только в тестах.")
+        }
+        val service = core.agent.DocsSyncService(
+            rag = core.rag.RagService(appDir = tmp, embedder = object : core.rag.EmbeddingProvider {
+                override val name = "fake"
+                override val dim = 2
+                override suspend fun embed(texts: List<String>): List<FloatArray> = texts.map { floatArrayOf(0f, 1f) }
+            }, llm = fake),
+        )
+        val noCode = kotlinx.coroutines.runBlocking {
+            service.run("demo", ws, DS.classifyAll(listOf("README.md")))
+        }
+        check(noCode.skipped && noCode.skipReason.contains("только сами документы")) {
+            "прогон без изменений кода не пропущен: $noCode"
+        }
+        check(noCode.updates.isEmpty()) { "пропущенный прогон что-то обновил" }
+        val withCodeRes = kotlinx.coroutines.runBlocking { service.run("demo", ws, change) }
+        check(withCodeRes.skipped) { "пустой diff должен быть не ошибкой, а «правок нет»" }
+        check(withCodeRes.prTitle.isNotBlank() && withCodeRes.prBody.isNotBlank()) {
+            "PR собирается даже когда правок нет — шаблон должен быть полным"
+        }
+        check(withCodeRes.changedCodeFiles.contains("src/RetryPolicy.kt")) { "потерян список изменённых файлов" }
+        println("OK сервис: пустой результат — не ошибка")
+
+        println("VERIFY-DOCS PASSED")
+    } finally {
+        try {
+            tmp.deleteRecursively()
+        } catch (_: Exception) {
+        }
+    }
+}
+
 private fun fail(msg: String): Nothing {
     usage()
     throw IllegalArgumentException(msg)
@@ -1415,7 +1713,16 @@ private fun usage() {
     println("  Task 4: список прогонов / diff прогона / откат по снапшотам.")
     println("week6 verify-agent")
     println("  Task 4: оффлайн-проверка слоя агента (редьюсер, клетка путей, diff, MCP) без сети и БД.")
+    println("week6 verify-support")
     println("  Task 3: оффлайн-проверка слоя поддержки (фронтматтер, MCP, промпт, CRM).")
+    println()
+    println("week6 docs-sync --project <имя> [--base origin/main] [--head HEAD] [--max-steps 16] [--max-files 6]")
+    println("      [--out docs-sync.json] [--dry-run] [--keep-changes] [--print-pr] [--server URL]")
+    println("  Task 5: агент-синхронизатор документации. Меняет ТОЛЬКО доки (*.md, docs/) — код закрыт гейтом.")
+    println("  Печатает готовый PR (--print-pr) и откатывает рабочее дерево по снапшотам.")
+    println("  --dry-run: без LLM — только git, классификация изменений и кандидаты-доки (дымовой тест в CI).")
+    println("week6 verify-docs")
+    println("  Task 5: оффлайн-проверка слоя docs-sync (классификация, гейт, кандидаты, PR-шаблон) без сети и LLM.")
 }
 
 // Task 5: чат по имени для CLI — тот же ChatStore, что у desktop.

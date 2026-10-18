@@ -130,12 +130,16 @@ data class PermissionVerdict(
 )
 
 // Связывает правила, диалог и правило «всегда».
-class PermissionGate(
+// open — задача Task 5 (docs-sync) переопределяет проверку целиком:
+// ограничение «писать только в документацию» не выражается правилами
+// проекта, оно свойство самой задачи.
+open class PermissionGate(
     private val store: PermissionStore,
     // null = спрашивать некому (headless/CI): пишем без вопроса.
     private val ask: (suspend (PendingChange) -> PermissionReply)? = null,
 ) {
-    suspend fun check(project: String, change: PendingChange): PermissionVerdict {
+    // open — см. объявление класса: docs-sync переопределяет проверку целиком.
+    open suspend fun check(project: String, change: PendingChange): PermissionVerdict {
         val action = change.action
         when (store.evaluate(project, action, change.path)) {
             PermissionEffect.Allow -> return PermissionVerdict(change.path, PermissionEffect.Allow.name)

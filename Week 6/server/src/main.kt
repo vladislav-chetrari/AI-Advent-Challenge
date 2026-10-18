@@ -97,6 +97,27 @@ private data class SupportChatRequest(
     val message: String = "",
 )
 
+// ===== Task 5: агент-синхронизатор документации =====
+// Action шлёт диапазон коммитов (base...head) и получает готовый PR:
+// список обновлённых документов + их полные содержимое. Клон на VPS после
+// прогона откатывается — рабочее дерево остаётся чистым.
+@Serializable
+private data class DocsSyncRequest(
+    val project: String = "",
+    val base: String = "",
+    val head: String = "HEAD",
+    val repoUrl: String? = null,
+    val repoToken: String? = null,
+    val maxSteps: Int = 16,
+    // Документов за прогон меньше, чем файлов кода: иначе агент расползается
+    // по всему проекту и не успевает за лимит шагов.
+    val maxFilesChanged: Int = 6,
+    val maxDocCandidates: Int = 8,
+    val dryRun: Boolean = false,
+    // Вернуть клон в исходное состояние после прогона (содержимое уже отдано).
+    val restore: Boolean = true,
+)
+
 private val json = Json { prettyPrint = false; ignoreUnknownKeys = true; isLenient = true }
 private val outJson = Json { prettyPrint = true; encodeDefaults = true }
 
@@ -592,15 +613,112 @@ fun main() {
         }
     }
 
+    // ===== Task 5: POST /docs-sync =====
+    //
+    // Один и тот же движок, что у ревью и поддержки: в целевом репозитории
+    // нет ни Kotlin, ни сборки — только workflow и этот вызов.
+    server.createContext("/docs-sync") { ex ->
+        try {
+            if (ex.requestMethod != "POST") {
+                ex.sendResponseHeaders(405, -1)
+                return@createContext
+            }
+            if (!authed(ex, token)) return@createContext
+            val llmKey = ex.requestHeaders.getFirst("X-LLM-Key")?.trim()?.takeIf { it.isNotBlank() }
+            val repoToken = ex.requestHeaders.getFirst("X-Repo-Token")?.trim()?.takeIf { it.isNotBlank() }
+            val body = ex.requestBody.bufferedReader().readText()
+            val req = try {
+                json.decodeFromString(DocsSyncRequest.serializer(), body)
+            } catch (e: Exception) {
+                val msg = "bad request: ${e.message}".toByteArray()
+                ex.sendResponseHeaders(400, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+                return@createContext
+            }
+            val project = req.project.trim().ifBlank { defaultProject }
+            val dir = docsSyncProjectDir(project, req.repoUrl, req.repoToken ?: repoToken, ::log)
+            val ws = core.agent.Workspace(dir)
+            // Историю доком до того, как diff: клон проекта делается мелким.
+            val repoNote = core.agent.DocsSync.prepareRepo(dir, req.base, req.repoToken ?: repoToken)
+            if (repoNote.isNotBlank()) log("$project: $repoNote")
+
+            val service = core.agent.DocsSyncService(
+                rag = svc,
+                config = core.agent.AgentConfig(
+                    maxSteps = req.maxSteps.coerceIn(2, 40),
+                    maxFilesChanged = req.maxFilesChanged.coerceIn(1, 20),
+                ),
+                onLog = { m -> log("docs-sync $project: $m") },
+            )
+            val t0 = System.currentTimeMillis()
+            val res = runBlocking {
+                core.agent.syncDocs(
+                    service = service,
+                    project = project,
+                    dir = dir,
+                    base = req.base.takeIf { it.isNotBlank() },
+                    head = req.head,
+                    apiKey = llmKey,
+                    maxDocCandidates = req.maxDocCandidates.coerceIn(1, 20),
+                    dryRun = req.dryRun,
+                    onLog = { m -> log("docs-sync $project: $m") },
+                )
+            }
+            // Откат обязателен: иначе следующий запуск увидит в git diff
+            // «чужие» правки и попытается их задокументировать.
+            val restored = if (req.restore && res.hasUpdates) service.revert(res, ws) else 0
+            log(
+                "docs-sync $project за ${(System.currentTimeMillis() - t0) / 1000}с: " +
+                    "кода ${res.changedCodeFiles.size}, обновлено ${res.updatedFiles.size}, " +
+                    "откачено $restored${if (res.warning.isNotBlank()) ", ⚠ ${res.warning.take(80)}" else ""}"
+            )
+            val out = res.copy(warning = listOf(repoNote, res.warning).filter { it.isNotBlank() }.joinToString(" "))
+            sendJson(ex, 200, outJson.encodeToString(core.agent.DocsSyncResult.serializer(), out))
+        } catch (e: Exception) {
+            fail(ex, "docs-sync failed", e)
+        } finally {
+            ex.close()
+        }
+    }
+
     server.start()
     log(
-        "review-server on :$port (эндпоинты: /health /review /index /mcp /crm/import /crm/tickets " +
+        "review-server on :$port (эндпоинты: /health /review /index /docs-sync /mcp /crm/import /crm/tickets " +
             "/crm/ticket /support/ask; ПУБЛИЧНО: /chat (страница) /support/chat; " +
             "продукт поддержки: $defaultProject; VPS_TOKEN задан: ${token.isNotBlank()})"
     )
 }
 
 private fun svcAppDir(): java.io.File = core.llm.ApiKeyProvider.appDir()
+
+/**
+ * Папка проекта для docs-sync: зарегистрированный клон или свежий клон.
+ *
+ * В отличие от ревью индексация НЕ нужна: агент Task 5 работает с файлами
+ * и с git, а не с векторами. Поэтому зовём ProjectLoader напрямую, а не
+ * RagService.ensureProject — иначе первый запуск платил бы получасовой
+ * прогон эмбеддингов ради задачи, которой индекс не требуется.
+ */
+private fun docsSyncProjectDir(
+    project: String,
+    repoUrl: String?,
+    repoToken: String?,
+    onLog: (String) -> Unit,
+): java.io.File {
+    val appDir = svcAppDir()
+    val clean = core.project.ProjectLoader.sanitizeName(project)
+    val dest = java.io.File(appDir, "repos/$clean")
+    if (dest.isDirectory && java.io.File(dest, ".git").isDirectory) {
+        onLog("проект $clean: клон на месте")
+        return dest.canonicalFile
+    }
+    val url = repoUrl?.trim()?.takeIf { it.isNotBlank() }
+        ?: throw IllegalStateException(
+            "проект «$clean» не зарегистрирован на сервере — передай repoUrl или добавь через project-add"
+        )
+    onLog("проект $clean: клон $url")
+    return core.project.ProjectLoader.cloneFresh(clean, url, appDir, repoToken)
+}
 
 // Троттлинг публичного чата: N сообщений в минуту с одного IP.
 // Живой в памяти процесса — для демо этого достаточно.
