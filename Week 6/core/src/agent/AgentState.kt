@@ -198,16 +198,16 @@ data class Transition(
     val terminal: Boolean = false,
 )
 
-// Лимиты прогона. Локальная 32B на MPS отвечает минутами, поэтому шагов мало,
-// а бюджет записи ограничен: иначе агент перепишет полпроекта.
-const val DEFAULT_MAX_STEPS = 16
-const val DEFAULT_MAX_TOOL_CALLS = 40
-const val DEFAULT_MAX_FILES_CHANGED = 10
-
+// Лимитов по умолчанию нет. Агент работает, пока не вызовет finish (или его
+// остановят: сеть, отказ по разрешению, ⏹). Раньше стояли 16 шагов / 40 вызовов
+// / 10 файлов, и задача, которая чуть длиннее, заканчивалась «Остановлен: лимит
+// шагов», хотя агент был готов продолжать. Предел задаёт тот, кто запускает:
+// AgentConfig ниже (--max-steps в CLI) — а в приложении его нет вовсе.
 data class AgentConfig(
-    val maxSteps: Int = DEFAULT_MAX_STEPS,
-    val maxToolCalls: Int = DEFAULT_MAX_TOOL_CALLS,
-    val maxFilesChanged: Int = DEFAULT_MAX_FILES_CHANGED,
+    // null = без ограничения.
+    val maxSteps: Int? = null,
+    val maxToolCalls: Int? = null,
+    val maxFilesChanged: Int? = null,
 )
 
 // Редьюсер. Чистый: на входе прогон и событие, на выходе новый прогон и
@@ -361,11 +361,12 @@ object AgentMachine {
 
     // Человеческое объяснение, ПОЧЕМУ остановились. Возвращается в отчёт:
     // «молча остановился на шаге 5» — худший вариант для воспроизводимости.
-    fun budgetReason(run: AgentRun, cfg: AgentConfig): String? = when {
-        run.steps >= cfg.maxSteps -> "лимит шагов (${cfg.maxSteps})"
-        run.invocations.size >= cfg.maxToolCalls -> "лимит вызовов тулов (${cfg.maxToolCalls})"
-        run.changedFiles.size >= cfg.maxFilesChanged -> "лимит изменённых файлов (${cfg.maxFilesChanged})"
-        else -> null
+    // null = лимиты не заданы (обычный случай), остановиться нечему.
+    fun budgetReason(run: AgentRun, cfg: AgentConfig): String? {
+        cfg.maxSteps?.let { if (run.steps >= it) return "лимит шагов ($it)" }
+        cfg.maxToolCalls?.let { if (run.invocations.size >= it) return "лимит вызовов тулов ($it)" }
+        cfg.maxFilesChanged?.let { if (run.changedFiles.size >= it) return "лимит изменённых файлов ($it)" }
+        return null
     }
 
     // Нужен ли ещё вызов LLM: opencode считает продолжением сам факт

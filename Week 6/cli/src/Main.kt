@@ -636,9 +636,10 @@ private suspend fun runCommand(args: Array<String>) {
                 ?: fail("проект не выбран: добавь через project-add или укажи --project")
             val dir = svc.projectDir(projectName) ?: fail("папка проекта пропала: $projectName")
             val auto = rest.contains("--auto-approve")
+            // Лимиты задаёт запускающий: без флагов агент работает, пока не вызовет finish.
             val cfg = core.agent.AgentConfig(
-                maxSteps = flag(rest, "--max-steps")?.toIntOrNull() ?: core.agent.DEFAULT_MAX_STEPS,
-                maxFilesChanged = flag(rest, "--max-files")?.toIntOrNull() ?: core.agent.DEFAULT_MAX_FILES_CHANGED,
+                maxSteps = flag(rest, "--max-steps")?.toIntOrNull(),
+                maxFilesChanged = flag(rest, "--max-files")?.toIntOrNull(),
             )
             val svc4 = svc
             val store = core.agent.RunStore()
@@ -1204,6 +1205,21 @@ private fun verifyAgent() {
         check(core.agent.AgentMachine.budgetReason(r3, cfg3) == "лимит шагов (1)") {
             "не названа причина остановки: ${core.agent.AgentMachine.budgetReason(r3, cfg3)}"
         }
+        // Дефолтных лимитов нет: прогон любой длины обязан продолжаться,
+        // пока агент сам не вызовет finish. Предел задаёт только запускающий.
+        val bigRun = core.agent.AgentMachine.newRun("demo", "цель").copy(
+            steps = 500,
+            changedFiles = (1..40).map { "src/File$it.kt" },
+            invocations = (1..120).map { core.agent.ToolInvocation("c$it", "read_file") },
+        )
+        val free = core.agent.AgentConfig()
+        check(core.agent.AgentMachine.budgetReason(bigRun, free) == null) {
+            "без заданных лимитов прогон всё равно останавливается: ${core.agent.AgentMachine.budgetReason(bigRun, free)}"
+        }
+        check(core.agent.AgentMachine.needsContinuation(bigRun, free)) { "прогон без лимитов нельзя продолжать" }
+        check(core.agent.AgentMachine.budgetReason(bigRun, core.agent.AgentConfig(maxFilesChanged = 10)) == "лимит изменённых файлов (10)") {
+            "явно заданный лимит файлов перестал работать"
+        }
         println("OK бюджет шагов")
 
         // --- 10. Правила разрешений ---
@@ -1369,9 +1385,10 @@ private fun usage() {
     println("week6 verify-support")
     println("  Task 3: оффлайн-проверка слоя поддержки (фронтматтер, MCP, промпт, CRM).")
     println()
-    println("week6 agent-run --goal \"цель\" [--project <имя>] [--chat <имя>] [--resume <run-id>] [--auto-approve] [--max-steps 8] [--max-files 10] [--out run.json]")
+    println("week6 agent-run --goal \"цель\" [--project <имя>] [--chat <имя>] [--resume <run-id>] [--auto-approve] [--out run.json]")
     println("  Task 4: агент с доступом к файлам. Цель ставит человек, файлы выбирает агент.")
     println("  --resume <run-id>: продолжить задачу с места остановки (бриф по прошлым прогонам).")
+    println("  Лимитов по умолчанию нет; задать свой предел: --max-steps N / --max-files N.")
     println("  Без --auto-approve каждое изменение спрашивает подтверждение (показывается diff).")
     println("week6 agent-tools [--project <имя>]")
     println("  Task 4: схемы тулов агента — ровно то, что видит модель и MCP-клиент.")
