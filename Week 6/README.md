@@ -67,15 +67,22 @@ FAQ в `support/faq.md`, тикеты — Issues с профилем польз�
 ### Поток одного сообщения
 
 ```
-CLI/UI: support-ask --chat 1042 --message "модель падает на 80%"
+CLI: support-ask --chat 3 --message "модель падает на 80%"
    └─▶ VPS POST /support/ask
-         ├─ MCP-клиент ─▶ POST /mcp  get_ticket(1042)          ← статус, ответственный, обходной путь
-         ├─ RAG          ─▶ FAQ + docs проекта (top-K, цитаты [N])
-         ├─ MCP-клиент ─▶ POST /mcp  search_tickets(query)      ← только если FAQ не ответил
-         └─ DeepSeek     ─▶ ответ: признать проблему, опереться на тикет, дать шаг
+         ├─ CRM-тул get_ticket(3)        ← статус, ответственный, обходной путь, профиль юзера
+         ├─ RAG      → FAQ + docs проекта (top-K, цитаты [N])
+         ├─ CRM-тул search_tickets(query) ← только если FAQ не ответил
+         └─ DeepSeek → ответ: признать проблему, опереться на тикет, дать шаг
 ```
 
 Один диалог = один тикет (`chatId == ticketId`), история — в `support_chats.json`.
+
+**Про MCP честно.** CRM реализована как MCP-сервер: те же тулы, что отдаёт
+`POST /mcp` (`initialize` / `tools/list` / `tools/call`, JSON-RPC 2.0), лежат в
+`CrmTools.registry()`. Сам бот на VPS зовёт их **в процессе** — через HTTP-сам-себя
+он бы занимал вторую нить пула и рисковал исчерпать его. Наружу MCP открыт как обычный
+сервер: `cli mcp-tools --server https://<vps>` делает `initialize` + `tools/list` и
+печатает список тулов — это видно, что слой настоящий, а не имитация.
 
 ### Ключевые решения
 
@@ -96,8 +103,8 @@ CLI/UI: support-ask --chat 1042 --message "модель падает на 80%"
 ### Команды
 
 ```sh
-support-ask   --chat 1042 --message "текст" [--project CallowFellow] [--server URL] [--topK 8]
-support-ticket --list | --id 1042 [--status in-progress] [--assignee ilya] [--comment "..."] [--escalate "..."]
+support-ask   --chat 3 --message "текст" [--project CallowFellow] [--server URL] [--topK 8]
+support-ticket --list | --id 3 [--status in-progress] [--assignee ilya] [--comment "..."] [--escalate "..."]
 mcp-tools     [--server URL]                      # tools/list CRM-сервера по MCP
 support-eval  --cases support/cases.json          # 8 кейсов: тикет/статус/фразы/запрещённое
 verify-support                                   # оффлайн-проверка слоя, без сети и БД
@@ -117,6 +124,7 @@ verify-support                                   # оффлайн-проверк
 | POST | `/crm/ticket` | правка тикета: статус, ответственный, комментарий, эскалация |
 
 MCP-тулы: `get_ticket`, `list_open_tickets`, `search_tickets`, `get_user_tickets`.
+Номера тикетов в демо — 3…8 (Issues репозитория CallowFellow).
 
 ### Подключение к продукту
 

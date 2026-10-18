@@ -54,10 +54,18 @@ Settings → Secrets and variables → Actions:
 
 1. `opened / synchronize / reopened` → Action снимает `git diff origin/main...HEAD`.
 2. `POST <VPS_URL>/review` (auth `VPS_TOKEN` + ключ в `X-LLM-Key`).
-3. VPS: `git pull` доков → RAG-поиск правил по каждому файлу diff →
+3. VPS **не трогает индекс**: только дешёво проверяет через `git ls-remote`,
+   не устарел ли он, и ищет по RAG правила для каждого файла diff →
    DeepSeek возвращает `{summary, comments[]}` → валидация строк.
+   Индекс обновляет отдельный ночной `index-docs` (полная переиндексация ~30 мин).
 4. `post_review.py` постит **inline-комменты** через `POST /pulls/{pr}/reviews`
    (только `+`-строки, `side: RIGHT`); если комментов нет — один общий `LGTM`.
+
+## Обновление файлов этого bundle
+
+Файлы из `Week 6/integration/` не обновляются автоматически — после обновления
+движка их нужно скопировать в репозиторий заново и закоммитить
+(порядок «движок → bundle» и команда `cp` — в `../DEPLOY.md`, раздел 8).
 
 ## Проверка
 
@@ -142,8 +150,8 @@ python3 ../scripts/seed_support_tickets.py
 ```sh
 export VPS_URL=https://<твой-vps> VPS_TOKEN=... DEEPSEEK_API_KEY=...
 ./kotlin run --module cli -- support-ticket --list
-./kotlin run --module cli -- support-ticket --id 1042 --status resolved --comment "починили, релиз 0.1.1"
-./kotlin run --module cli -- support-ask --chat 1042 --message "модель так и не скачалась"
+./kotlin run --module cli -- support-ticket --id 3 --status resolved --comment "починили, релиз 0.1.1"
+./kotlin run --module cli -- support-ask --chat 3 --message "модель так и не скачалась"
 ```
 
 Смена статуса меняет ответ бота в том же диалоге: это и есть «учёт контекста тикета».

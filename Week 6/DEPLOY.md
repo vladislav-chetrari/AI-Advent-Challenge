@@ -20,12 +20,16 @@ e2-medium+, Ubuntu 22.04. Caddy/Nginx с TLS (443/80) → прокси на `127
   поэтому 32B-модели на VPS не нужны),
 - клон **этого** репозитория, `cd "Week 6"`.
 
-## 3. Доки целевых проектов — авто-флоу (настройка не нужна)
+## 3. Доки целевых проектов — ночная индексация (настройка не нужна)
 
-Сервер сам заводит проект при первом обращении: клонирует `repoUrl` из запроса
-в `~/.ai-advent-week6/repos/<имя>`, индексирует доки; при следующих PR —
-`git pull` + доиндексация (`refresh: true`, best-effort). Токен приватного
-репозитория (`repoToken`) идёт только в git-транспорт и не хранится.
+Проект заводится сам: workflow `index-docs` по cron (03:17 UTC) или вручную шлёт
+`POST /index` с `repoUrl`, сервер клонирует репозиторий в `~/.ai-advent-week6/repos/<имя>`,
+делает `git pull` и переиндексирует доки. Полный обход — ~30 минут на 2 vCPU
+(эмбеддинги `bge-m3` на CPU), поэтому это отдельная задача, а не шаг внутри ревью.
+
+Ревью индекс не трогает: только проверяет через `git ls-remote`, не разошёлся ли он
+с GitHub, и пишет `⚠ RAG: индекс устарел`, если разошёлся. Токен приватного
+репозитория (`repoToken` / `X-Repo-Token`) идёт только в git-транспорт и не хранится.
 
 Запасной путь — ручное `project-add` на VPS (доки вне git, клон недоступен):
 
@@ -94,7 +98,7 @@ curl -s -X POST http://127.0.0.1:8080/crm/tickets \
 ./kotlin run --module cli -- mcp-tools --server https://<vps>
 
 # ответ ассистента (ключ придёт из env)
-./kotlin run --module cli -- support-ask --chat 1042 \
+./kotlin run --module cli -- support-ask --chat 3 \
   --message "модель падает на 80%" --server https://<vps>
 ```
 
@@ -108,3 +112,135 @@ curl -s -X POST http://127.0.0.1:8080/crm/tickets \
 - ночная выгрузка GitHub **не затирает** ручные правки (`crm/<project>.overrides.json`);
 - при недоступных эмбеддингах `/support/ask` отвечает по тикету и пишет предупреждение
   в `warning`, а не падает.
+
+---
+
+# 8. Обновления
+
+Движок и «клиентские» файлы обновляются **раздельно**: код живёт на VPS, а в каждом
+ревьюимом репозитории лежат свои копии workflow-скриптов.
+
+## 8.1 Порядок: сначала VPS, потом целевые репозитории
+
+Новый workflow может вызывать новые эндпоинты (`/index`, `/crm/import`, `/mcp`).
+Если обновить наоборот, Action получит `404` и упадёт. Всегда: **движок → потом bundle**.
+
+## 8.2 Обновление движка на VPS
+
+```sh
+cd ~/AI-Advent-Challenge
+git pull --ff-only
+cd "Week 6"
+sudo systemctl restart review-server
+systemctl is-active review-server        # ожидаем active
+```
+
+Юнит запускает `./kotlin run --module server`, поэтому при старте модули
+пересобираются — первый старт после обновления занимает от десятка секунд
+до нескольких минут. Новые зависимости из `module.yaml` Amper скачает сам.
+
+Лучше делать ночью: пока идёт `git pull`+пересборка, текущие ревью и индексация
+отвалятся, и Action получит таймаут.
+
+Проверить, что поднялось и эндпоинты на месте:
+
+```sh
+curl -s localhost:8080/health                                   # ok
+curl -s -o /dev/null -w "%{http_code}\n" -X POST localhost:8080/index \
+  -H "Authorization: Bearer $VPS_TOKEN" -H 'Content-Type: application/json' -d '{}'
+# 500 + «не указан проект» — эндпоинт есть; 404/405 — сервер старый
+```
+
+## 8.3 Обновление bundle в целевых репозиториях
+
+Файлы из `Week 6/integration/` **не подтягиваются автоматически** — их нужно
+скопировать и закоммитить в каждый подключённый проект.
+
+| Файл из `integration/` | Куда в целевом проекте |
+|---|---|
+| `review.yml` | `.github/workflows/review.yml` |
+| `index-docs.yml` | `.github/workflows/index-docs.yml` |
+| `support-index.yml` | `.github/workflows/support-index.yml` (Task 3) |
+| `post_review.py` | `.github/scripts/post_review.py` |
+
+```sh
+cd <целевой-проект>
+git pull --ff-only
+SRC="/путь/к/AI-Advent-Challenge/Week 6/integration"
+cp "$SRC/review.yml"          .github/workflows/review.yml
+cp "$SRC/index-docs.yml"      .github/workflows/index-docs.yml
+cp "$SRC/post_review.py"      .github/scripts/post_review.py
+git commit -am "chore: обновить bundle AI-ревью" && git push
+```
+
+Если в проекте уже был свой форк workflow — сначала покажи разницу:
+`diff .github/workflows/review.yml "$SRC/review.yml"`.
+
+## 8.4 Когда нужна переиндексация
+
+| Причина | Что делать |
+|---|---|
+| Доки проекта обновились | Ничего: ночной `index-docs` сам сделает `pull` + доиндексацию |
+| Смена модели эмбеддингов | Полная переиндексация: старые вектора несовместимы |
+| Смена чанкера / стратегии | То же — вектора считаются для старого разбиения |
+
+Модель эмбеддингов лежит в `~/.ai-advent-week6/embed.json` (по умолчанию `bge-m3`).
+После смены запусти `index-docs` вручную (Actions → Run workflow) — старые вектора
+отбросятся автоматически, но это полный прогон: **~30 минут на 2 vCPU**.
+Делать ночью, ревью в это время будет честно писать `⚠ RAG: индекс устарел`.
+
+## 8.5 Smoke-проверка после обновления
+
+```sh
+# 1. движок собран и поднят
+systemctl is-active review-server && curl -s localhost:8080/health
+
+# 2. логика парсинга diff/JSON цела (без сети и БД)
+cd ~/AI-Advent-Challenge/"Week 6" && ./kotlin run --module cli -- verify-review
+
+# 3. индексация жива — ручной запуск index-docs в целевом репо
+gh workflow run index-docs --repo <owner>/<repo>
+
+# 4. ревью живо — Re-run all jobs на тестовом PR
+gh run list --repo <owner>/<repo> --limit 3
+```
+
+Ожидаемый вывод ревью в PR: общий комментарий (итог + баги/архитектура/рекомендации
++ строка `⚠ RAG`, если индекс устарел) и inline-комментарии на `+`-строках.
+
+## 8.6 Откат
+
+```sh
+# движок
+cd ~/AI-Advent-Challenge
+git log --oneline -5                       # найти предыдущий рабочий коммит
+git checkout <sha>
+cd "Week 6" && sudo systemctl restart review-server
+
+# целевой репозиторий: откатить только bundle
+git revert <sha-коммита-с-bundle>
+# или вернуть файлы из запасной ветки, если её сохранили при синхронизации
+```
+
+Данные (`rag.db`, `projects.json`, `crm/`, `repos/`) живут в `~/.ai-advent-week6/`
+и при обновлении/откате кода не страдают. Бэкап перед рискованными операциями:
+
+```sh
+tar czf ~/ai-advent-week6-$(date +%F).tar.gz ~/.ai-advent-week6/
+```
+
+## 8.7 Логи и типовые сбои
+
+```sh
+journalctl -u review-server -n 50 --no-pager   # системный лог
+tail -f ~/review-server.log                     # прогресс ревью и индексации
+```
+
+| Симптом | Причина | Что делать |
+|---|---|---|
+| Action: `unknown url type` | в `VPS_URL` нет `http(s)://` | перезаписать секрет |
+| Action: `cannot reach VPS host …` | сервер упал или порт закрыт файрволом GCP | `systemctl status`, проверить правило firewall |
+| Action: `VPS HTTP 401` | разошёлся `VPS_TOKEN` (VPS ↔ репозиторий) | синхронизировать оба |
+| Action: `VPS HTTP 404` | на VPS старый движок без нужного эндпоинта | обновить движок (§8.2) |
+| Action: таймаут 600 с | шла тяжёлая индексация — ревью ждал её | повторить запуск; индекс к тому моменту готов |
+| В PR вместо inline один общий коммент | GitHub отверг строки (не `+`, или >40) | см. `integration/README.md` |
