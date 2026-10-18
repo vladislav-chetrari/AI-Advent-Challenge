@@ -46,7 +46,18 @@ jobs:
           git diff --unified=3 --no-color "origin/$BASE_REF...HEAD" > /tmp/pr.diff \
             || git diff --unified=3 --no-color > /tmp/pr.diff
           python3 - <<'EOF'
-          import json, os, urllib.request
+          import json, os, sys, urllib.request, urllib.error, urllib.parse
+
+          # VPS_URL — секрет, поэтому GitHub маскирует его целиком в логах.
+          # Поэтому печатаем только схему и host (без схемы) — так видна причина ошибки.
+          base = os.environ.get('VPS_URL', '').strip()
+          if not base.startswith(('http://', 'https://')):
+              print('FAIL: VPS_URL must start with http:// or https:// (scheme missing)', file=sys.stderr)
+              raise SystemExit(1)
+          host = urllib.parse.urlparse(base).netloc
+          print('review endpoint host:', host, '| scheme:', base.split(':')[0], '| private repo token:',
+                'yes' if os.environ.get('REPO_TOKEN') else 'no')
+
           diff = open('/tmp/pr.diff', encoding='utf-8', errors='replace').read()[:100000]
           if not diff.strip():
               open('review.json', 'w').write(json.dumps({"summary": "Нет изменений — ревью нечего.", "comments": []}))
@@ -62,13 +73,21 @@ jobs:
               "refresh": True,
           }).encode()
           req = urllib.request.Request(
-              os.environ['VPS_URL'].rstrip('/') + '/review', data=payload, method='POST',
+              base.rstrip('/') + '/review', data=payload, method='POST',
               headers={'Content-Type': 'application/json',
                        'Authorization': 'Bearer ' + os.environ.get('VPS_TOKEN', ''),
                        # Ключ летит per-request из GH Secrets, на VPS не хранится.
                        'X-LLM-Key': os.environ.get('DEEPSEEK_API_KEY', '')},
           )
-          body = urllib.request.urlopen(req, timeout=600).read()
+          try:
+              body = urllib.request.urlopen(req, timeout=600).read()
+          except urllib.error.HTTPError as e:
+              print(f'FAIL: VPS HTTP {e.code}: {e.read().decode(errors="replace")[:600]}', file=sys.stderr)
+              raise SystemExit(1)
+          except urllib.error.URLError as e:
+              # Чаще всего: порт закрыт файрволом GCP или сервер не запущен.
+              print(f'FAIL: cannot reach VPS host {host}: {e.reason}', file=sys.stderr)
+              raise SystemExit(1)
           open('review.json', 'wb').write(body)
           print('VPS review ok, bytes:', len(body))
           EOF
