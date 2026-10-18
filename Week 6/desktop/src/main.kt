@@ -25,6 +25,7 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.FilterChip
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
@@ -50,6 +51,7 @@ import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -57,6 +59,7 @@ import androidx.compose.ui.window.Window
 import androidx.compose.ui.window.application
 import androidx.compose.ui.window.rememberWindowState
 import com.mikepenz.markdown.m3.Markdown
+import core.agent.PendingChange
 import core.llm.LlmSettings
 import core.project.ProjectEntry
 import core.rag.DocInfo
@@ -172,6 +175,8 @@ fun Root() {
     if (st.showAddProject) AddProjectDialog(vm)
     if (st.showSettings) SettingsDialog(vm)
     if (st.showRagSettings) RagSettingsDialog(vm)
+    // Task 4: подтверждение записи — решение обязательное, случайно не закрыть.
+    st.pendingChange?.let { ApprovalDialog(vm, it) }
 }
 
 @Composable
@@ -307,8 +312,18 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
                 TextButton(onClick = vm::openRagSettings) { Text("RAG ⚙", fontSize = 12.sp) }
             }
             Spacer(Modifier.width(8.dp))
+            TextButton(onClick = vm::toggleAgentPanel) {
+                Text(
+                    if (st.showAgentPanel) "🎯 Агент ▲" else "🎯 Агент",
+                    fontSize = 12.sp,
+                    color = if (st.agentRun != null) Color(0xFF1E88E5) else Color.Gray,
+                )
+            }
             TextButton(onClick = { vm.clearChat(chat.id) }) { Text("очистить", fontSize = 12.sp) }
         }
+        // Task 4: панель агента над перепиской — видна и по кнопке, и сама
+        // при старте прогона, чтобы ход не терялся в общем потоке сообщений.
+        if (st.showAgentPanel) AgentPane(vm, st.agentRun)
         if (!chat.ragEnabled) {
             Text(
                 "RAG выключен — отвечаю без базы знаний",
@@ -832,3 +847,198 @@ fun WikiDialog(vm: AppViewModel) {
         dismissButton = { TextButton(onClick = vm::closeWiki) { Text("Отмена") } },
     )
 }
+
+// ===== Task 4: панель агента, диалог подтверждения и diff прогона =====
+
+private val STATE_COLORS = mapOf(
+    "goal" to Color(0xFF1E88E5),
+    "thinking" to Color(0xFF6A1B9A),
+    "awaiting" to Color(0xFFEF6C00),
+    "applying" to Color(0xFF00838F),
+    "done" to Color(0xFF2E7D32),
+    "failed" to Color(0xFFB00020),
+    "idle" to Color(0xFF757575),
+    "cancelled" to Color(0xFF9E9E9E),
+)
+
+private fun stateKey(run: core.agent.AgentRun): String = when (run.state) {
+    is core.agent.RunState.Idle -> "idle"
+    is core.agent.RunState.Goal -> "goal"
+    is core.agent.RunState.Thinking -> "thinking"
+    is core.agent.RunState.AwaitingApproval -> "awaiting"
+    is core.agent.RunState.Applying -> "applying"
+    is core.agent.RunState.Done -> "done"
+    is core.agent.RunState.Failed -> "failed"
+    is core.agent.RunState.Cancelled -> "cancelled"
+}
+
+// Панель агента: цель, состояние, список вызовов тулов, журнал и diff.
+// Прогон рисуется как trace — по шагам видно, что агент делал сам.
+@Composable
+fun AgentPane(vm: AppViewModel, run: core.agent.AgentRun?) {
+    val st by vm.state.collectAsState()
+    Column(
+        Modifier.fillMaxWidth()
+            .background(Color(0xFFF7F4EC))
+            .padding(horizontal = 12.dp, vertical = 8.dp),
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            Text("🎯 Агент", fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            Spacer(Modifier.width(8.dp))
+            if (run != null) {
+                val color = STATE_COLORS[stateKey(run)] ?: Color.Gray
+                Box(
+                    Modifier.background(color.copy(alpha = 0.15f))
+                        .padding(horizontal = 8.dp, vertical = 2.dp),
+                ) {
+                    Text(run.label(), fontSize = 11.sp, color = color, fontWeight = FontWeight.Bold)
+                }
+                Spacer(Modifier.width(6.dp))
+                Text("шагов ${run.steps} · вызовов ${run.invocations.size}", fontSize = 11.sp, color = Color.Gray)
+            }
+            Spacer(Modifier.weight(1f))
+            if (st.busy) {
+                TextButton(onClick = vm::cancelAgent) { Text("⏹ стоп", fontSize = 11.sp, color = Color(0xFFB00020)) }
+            }
+            TextButton(onClick = vm::toggleAgentPanel) { Text("скрыть", fontSize = 11.sp) }
+        }
+        // Цель ставит человек; агент сам выбирает файлы под неё.
+        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+            OutlinedTextField(
+                value = st.agentGoal,
+                onValueChange = vm::setAgentGoal,
+                modifier = Modifier.weight(1f),
+                placeholder = { Text("цель: «найди все места, где используется RagTools»", fontSize = 12.sp) },
+                singleLine = true, enabled = !st.busy,
+            )
+            Spacer(Modifier.width(8.dp))
+            Button(
+                onClick = { vm.startAgent(st.agentGoal.trim(), st.activeChatId) },
+                enabled = !st.busy && st.agentGoal.isNotBlank(),
+            ) { Text("▶ Старт", fontSize = 12.sp) }
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (st.agentAutoApprove) "автоподтверждение вкл — пишет без вопроса" else "каждая правка спрашивает подтверждение",
+                fontSize = 10.sp, color = if (st.agentAutoApprove) Color(0xFFB00020) else Color.Gray,
+            )
+            Spacer(Modifier.weight(1f))
+            TextButton(onClick = vm::toggleAgentAutoApprove) {
+                Text(if (st.agentAutoApprove) "выкл autopilot" else "вкл autopilot", fontSize = 10.sp)
+            }
+        }
+        // Список вызовов: каждая строка — состояние тула (значок + аргументы).
+        val invocations = run?.invocations.orEmpty()
+        if (invocations.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Column(Modifier.fillMaxWidth().heightIn(max = 150.dp).verticalScroll(rememberScrollState())) {
+                invocations.forEach { inv ->
+                    val (icon, color, note) = when (val s = inv.state) {
+                        is core.agent.ToolState.Done -> Triple("✅", Color(0xFF2E7D32), s.summary.take(80))
+                        is core.agent.ToolState.Failed -> Triple("❌", Color(0xFFB00020), s.error.take(80))
+                        is core.agent.ToolState.Running -> Triple("🔧", Color(0xFF00838F), "выполняется")
+                        core.agent.ToolState.Pending -> Triple("⏳", Color.Gray, "ждёт")
+                    }
+                    Row(Modifier.fillMaxWidth().padding(vertical = 1.dp)) {
+                        Text(icon, fontSize = 11.sp, modifier = Modifier.width(18.dp))
+                        Text(
+                            inv.tool,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = color,
+                            modifier = Modifier.width(96.dp),
+                            maxLines = 1,
+                        )
+                        SelectionContainer {
+                            Text(
+                                inv.args.replace(Regex("\\s+"), " ").take(70),
+                                fontSize = 11.sp, color = Color.DarkGray, modifier = Modifier.weight(1f), maxLines = 1,
+                            )
+                        }
+                        Text(note, fontSize = 10.sp, color = Color.Gray, maxLines = 1, modifier = Modifier.width(120.dp))
+                    }
+                }
+            }
+        }
+        // Журнал: что агент говорил между шагами.
+        if (st.agentLog.isNotEmpty()) {
+            Spacer(Modifier.height(2.dp))
+            Column(Modifier.fillMaxWidth().heightIn(max = 70.dp).verticalScroll(rememberScrollState())) {
+                st.agentLog.takeLast(20).forEach {
+                    Text("· $it", fontSize = 10.sp, color = Color.Gray, maxLines = 2)
+                }
+            }
+        }
+        // Diff прогона — результат, который по заданию должен быть на руках.
+        if (run != null && run.changedFiles.isNotEmpty()) {
+            Spacer(Modifier.height(4.dp))
+            Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    "изменено файлов: ${run.changedFiles.size} — ${run.changedFiles.joinToString(", ").take(90)}",
+                    fontSize = 11.sp, color = Color(0xFF2E7D32), modifier = Modifier.weight(1f), maxLines = 2,
+                )
+                TextButton(onClick = vm::toggleAgentDiff) {
+                    Text(if (st.showAgentDiff) "скрыть diff" else "показать diff", fontSize = 11.sp)
+                }
+            }
+            if (st.showAgentDiff) {
+                Box(
+                    Modifier.fillMaxWidth().heightIn(max = 220.dp)
+                        .background(Color(0xFFFAFAFA)).padding(6.dp),
+                ) {
+                    SelectionContainer {
+                        Text(
+                            run.diff.take(DIFF_PREVIEW_CHARS),
+                            fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                        )
+                    }
+                }
+                if (run.diff.length > DIFF_PREVIEW_CHARS) {
+                    Text("… diff обрезан; полный — в agent_runs.json или `week6 agent-diff`", fontSize = 10.sp, color = Color.Gray)
+                }
+            }
+        }
+    }
+}
+
+// Диалог подтверждения записи. Diff приходит уже готовым (PendingChange.diff),
+// поэтому пользователь решает по сути правки, а не по описанию.
+@Composable
+fun ApprovalDialog(vm: AppViewModel, change: PendingChange) {
+    AlertDialog(
+        onDismissRequest = { /* нельзя закрыть случайно: решение обязательное */ },
+        title = { Text("Агент хочет изменить файл") },
+        text = {
+            Column(
+                Modifier.fillMaxWidth().verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(change.path, fontWeight = FontWeight.Bold, fontSize = 13.sp)
+                Text(
+                    "действие: ${change.action}" +
+                        if (change.replacements > 1) ", замен: ${change.replacements}" else "",
+                    fontSize = 11.sp, color = Color.Gray,
+                )
+                if (change.summary.isNotBlank()) Text(change.summary, fontSize = 11.sp, color = Color.DarkGray)
+                HorizontalDivider(color = Color(0xFFE0E0E0))
+                SelectionContainer {
+                    Text(
+                        if (change.diff.isBlank()) "(файл станет пустым)" else change.diff.take(DIFF_PREVIEW_CHARS),
+                        fontSize = 10.sp, fontFamily = FontFamily.Monospace,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Row {
+                TextButton(onClick = vm::approveOnce) { Text("Разрешить") }
+                TextButton(onClick = vm::approveAlways) { Text("Всегда для этого файла") }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = vm::rejectAgent) { Text("Отклонить", color = Color(0xFFB00020)) }
+        },
+    )
+}
+
+private const val DIFF_PREVIEW_CHARS = 20_000

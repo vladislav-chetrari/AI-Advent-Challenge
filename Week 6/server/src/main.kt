@@ -260,6 +260,57 @@ fun main() {
         }
     }
 
+    // ===== Task 4: файловые тулы агента как MCP (только чтение) =====
+    //
+    // /mcp — это CRM поддержки (Task 3), её трогать нельзя. Файловые тулы
+    // агента живут на отдельном пути и ТОЛЬКО НА ЧТЕНИЕ: по HTTP спрашивать
+    // подтверждение некого, а approve = null означал бы «писать молча».
+    // Запись остаётся там, где есть человек: desktop и CLI.
+    //
+    // Тот же McpServer, что и у CRM: протокол один, различается только реестр.
+    server.createContext("/mcp/agent") { ex ->
+        try {
+            if (ex.requestMethod != "POST") {
+                ex.sendResponseHeaders(405, -1)
+                return@createContext
+            }
+            if (!authed(ex, token)) return@createContext
+            val body = ex.requestBody.bufferedReader().readText()
+            val out = runBlocking {
+                val args = mcpAgentArgs(body)
+                // Проект берём из аргументов вызова или из REVIEW_PROJECT:
+                // репозиторий должен быть уже зарегистрирован (project-add).
+                val proj = args["project"]
+                    ?: System.getenv("REVIEW_PROJECT")?.trim()?.takeIf { it.isNotBlank() }
+                    ?: defaultProject
+                val dir = svc.projectDir(proj)
+                if (dir == null) {
+                    mcpError("проект $proj не зарегистрирован на сервере — добавь через project-add")
+                } else {
+                    val tools = core.agent.FileTools(core.agent.Workspace(dir))
+                    McpServer(tools.readOnlyMcpRegistry(proj)).handle(body)
+                }
+            }
+            if (out.isEmpty()) {
+                ex.sendResponseHeaders(202, -1)
+            } else {
+                val b = out.toByteArray()
+                ex.responseHeaders.add("Content-Type", "application/json")
+                ex.sendResponseHeaders(200, b.size.toLong())
+                ex.responseBody.use { it.write(b) }
+            }
+        } catch (e: Exception) {
+            val msg = mcpError("mcp/agent failed: ${e.message}").take(500).toByteArray()
+            try {
+                ex.sendResponseHeaders(500, msg.size.toLong())
+                ex.responseBody.use { it.write(msg) }
+            } catch (_: Exception) {
+            }
+        } finally {
+            ex.close()
+        }
+    }
+
     // POST /crm/import — выгрузка тикетов из GitHub + переиндексация их в RAG.
     server.createContext("/crm/import") { ex ->
         try {
@@ -594,4 +645,34 @@ private fun fail(ex: HttpExchange, prefix: String, e: Exception) {
         ex.responseBody.use { it.write(msg) }
     } catch (_: Exception) {
     }
+}
+
+// Аргументы JSON-RPC-вызова из тела /mcp/agent — нужно только, чтобы понять
+// проект. Разбор намеренно терпимый: невалидный JSON разберёт сам McpServer.
+private fun mcpAgentArgs(body: String): Map<String, String> = try {
+    val json = kotlinx.serialization.json.Json
+    val req = json.parseToJsonElement(body) as? kotlinx.serialization.json.JsonObject ?: return emptyMap()
+    val params = req["params"] as? kotlinx.serialization.json.JsonObject
+    val args = params?.get("arguments") as? kotlinx.serialization.json.JsonObject
+    args.orEmpty().mapNotNull { (k, v) ->
+        (v as? kotlinx.serialization.json.JsonPrimitive)?.content?.let { k to it }
+    }.toMap()
+} catch (_: Exception) {
+    emptyMap()
+}
+
+private fun mcpError(message: String): String =
+    """{"jsonrpc":"2.0","id":null,"error":{"code":-32602,"message":${message.jsonEscape()}}}"""
+
+private fun String.jsonEscape(): String = buildString {
+    append('"')
+    for (c in this@jsonEscape) when (c) {
+        '"' -> append("\\\"")
+        '\\' -> append("\\\\")
+        '\n' -> append("\\n")
+        '\r' -> append("\\r")
+        '\t' -> append("\\t")
+        else -> if (c.code < 0x20) append("\\u%04x".format(c.code)) else append(c)
+    }
+    append('"')
 }

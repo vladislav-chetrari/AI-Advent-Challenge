@@ -1,6 +1,9 @@
 package cli
 
 import core.llm.ApiKeyProvider
+import core.llm.intOf
+import core.llm.missingRequired
+import core.llm.strOf
 import core.rag.ChatStore
 import core.rag.DEFAULT_FINAL_K
 import core.rag.DEFAULT_MIN_SCORE
@@ -615,6 +618,113 @@ private suspend fun runCommand(args: Array<String>) {
 
             println("VERIFY-SUPPORT PASSED")
         }
+        // ===== Task 4: агент, который сам работает с файлами проекта =====
+        //   agent-run --goal "цель" [--project P] [--auto-approve] [--max-steps N]
+        //            [--max-files N] [--out run.json] [--format json|md]
+        "agent-run" -> {
+            val (_, rest) = splitPaths(args)
+            val goal = flag(rest, "--goal")?.takeIf { it.isNotBlank() } ?: fail("нужен --goal \"<цель>\"")
+            val projectName = flag(rest, "--project") ?: svc.selectedProject()?.name
+                ?: fail("проект не выбран: добавь через project-add или укажи --project")
+            val dir = svc.projectDir(projectName) ?: fail("папка проекта пропала: $projectName")
+            val auto = rest.contains("--auto-approve")
+            val cfg = core.agent.AgentConfig(
+                maxSteps = flag(rest, "--max-steps")?.toIntOrNull() ?: core.agent.DEFAULT_MAX_STEPS,
+                maxFilesChanged = flag(rest, "--max-files")?.toIntOrNull() ?: core.agent.DEFAULT_MAX_FILES_CHANGED,
+            )
+            val svc4 = svc
+            val store = core.agent.RunStore()
+            val ws = core.agent.Workspace(dir)
+            // --auto-approve -> спрашивать некому (CI/headless). Без флага —
+            // диалог на stdin, ровно как окно подтверждения в desktop.
+            val gate = core.agent.PermissionGate(
+                core.agent.PermissionStore(),
+                if (auto) null else { change -> askChange(change) },
+            )
+            println("Проект: $projectName · ${ws.listFiles(limit = 5000).size} файлов")
+            println("Цель: $goal")
+            if (auto) println("Режим --auto-approve: изменения пишутся без подтверждения.")
+            println("—".repeat(60))
+            val runner = core.agent.AgentRunner(
+                rag = svc4,
+                workspace = ws,
+                runStore = store,
+                gate = gate,
+                config = cfg,
+                onUpdate = { r ->
+                    if (r.state is core.agent.RunState.AwaitingApproval) {
+                        println("   ⏸ ${r.label()}")
+                    }
+                },
+                onLog = { println("   · $it") },
+            )
+            val run = runner.run(goal, projectName)
+            println("—".repeat(60))
+            printRun(run)
+            val out = flag(rest, "--out")
+            if (out != null) {
+                java.io.File(out).writeText(reviewOutJson.encodeToString(core.agent.AgentRun.serializer(), run))
+                println("\nСохранено: $out")
+            }
+            if (run.state is core.agent.RunState.Failed || run.state is core.agent.RunState.Cancelled) {
+                println("\nПрогон не завершён успешно — см. run: ${run.id}")
+            }
+        }
+        // Схемы тулов агента: то же, что видит модель (tools) и MCP-клиент
+        // (tools/list). Доказательство, что слой настоящий, а не имитация.
+        "agent-tools" -> {
+            val projectName = flag(args, "--project") ?: svc.selectedProject()?.name ?: "demo"
+            val dir = svc.projectDir(projectName) ?: java.io.File(".").canonicalFile
+            val tools = core.agent.FileTools(core.agent.Workspace(dir))
+            val specs = tools.specs()
+            println("Тулов агента: ${specs.size}")
+            specs.forEach { s ->
+                println("  · ${s.name} — ${s.description}")
+                val props = s.parameters["properties"] as? kotlinx.serialization.json.JsonObject
+                if (props != null) {
+                    val req = s.required
+                    props.forEach { (k, v) ->
+                        val desc = (v as? kotlinx.serialization.json.JsonObject)?.get("description")
+                            ?.let { (it as? kotlinx.serialization.json.JsonPrimitive)?.content }.orEmpty()
+                        println("      $k${if (k in req) "*" else ""} — ${desc.take(90)}")
+                    }
+                }
+            }
+            println("\nМутирующие (всегда через подтверждение): " +
+                tools.definitions().filter { it.mutating }.joinToString(", ") { it.name })
+        }
+        // Прогоны на диске: ~/.ai-advent-week6/agent_runs.json
+        "agent-runs" -> {
+            val store = core.agent.RunStore()
+            if (store.runs.isEmpty()) {
+                println("Прогонов пока нет.")
+            } else {
+                store.runs.sortedBy { it.startedAt }.forEach { r ->
+                    println("${r.id}  ${r.label()}  файлов=${r.changedFiles.size}  ${r.goal.take(60)}")
+                }
+            }
+        }
+        // Diff прогона — то, что по заданию должно быть «изменениями или diff».
+        "agent-diff" -> {
+            val id = flag(args, "--run") ?: core.agent.RunStore().latest()?.id
+                ?: fail("нет прогонов — сначала agent-run")
+            val r = core.agent.RunStore().get(id) ?: fail("прогон $id не найден")
+            printRun(r)
+        }
+        // Откат к состоянию до прогона: файлы восстанавливаются из снапшотов,
+        // созданных до первой записи.
+        "agent-revert" -> {
+            val id = flag(args, "--run") ?: fail("нужен --run <id>")
+            val store = core.agent.RunStore()
+            val r = store.get(id) ?: fail("прогон $id не найден")
+            val projectName = r.project
+            val dir = svc.projectDir(projectName) ?: fail("папка проекта пропала: $projectName")
+            val n = store.revert(r, core.agent.Workspace(dir))
+            println("Откачено файлов: $n (прогон $id)")
+        }
+        // Чистый оффлайн-тест слоя агента: схемы тулов, редьюсер, клетка путей,
+        // unified diff, MCP-эндпоинт. Без сети, без БД и без LLM.
+        "verify-agent" -> verifyAgent()
         // Скрытый дымовой тест новых путей: RAG вкл/выкл, фильтр документов. He для видео.
         "selftest" -> {
             val docs = svc.indexedDocs()
@@ -781,6 +891,351 @@ private class McpServerProbe(crm: CrmTools) {
     suspend fun handle(body: String): String = server.handle(body)
 }
 
+// ===== Task 4: помощники CLI агента =====
+
+// Подтверждение правки в терминале. Диф печатается ДО вопроса —
+// пользователь решает по сути изменения, а не по описанию.
+// y — один раз, a — всегда для этого файла, n/прочее — отклонить.
+private fun askChange(change: core.agent.PendingChange): core.agent.PermissionReply {
+    println()
+    println("─".repeat(60))
+    println("АГЕНТ ХОЧЕТ ИЗМЕНИТЬ ФАЙЛ")
+    println("  ${change.path}  (${change.action}${if (change.replacements > 1) ", замен: ${change.replacements}" else ""})")
+    if (change.summary.isNotBlank()) println("  ${change.summary}")
+    println()
+    if (change.diff.isBlank()) println("  (содержимое станет пустым)")
+    else println(change.diff.take(DIFF_SHOWN))
+    if (change.diff.length > DIFF_SHOWN) println("  … диф обрезан")
+    print("Разрешить? [y] один раз  [a] всегда для этого файла  [n] отклонить > ")
+    val answer = (readlnOrNull() ?: "").trim().lowercase()
+    // Ответ терминала печатается на той же строке, что и приглашение — без
+    // перевода строки журнал прогона приклеивается к нему.
+    println()
+    return when {
+        answer == "a" || answer == "в" -> core.agent.PermissionReply.Always
+        answer == "y" || answer == "д" || answer.isEmpty() -> core.agent.PermissionReply.Once
+        else -> core.agent.PermissionReply.Reject
+    }
+}
+
+private const val DIFF_SHOWN = 4000
+
+// Итог прогона: цель, состояние, что менял и diff. Читается человеком и
+// попадает в --out для последующего разбора.
+private fun printRun(r: core.agent.AgentRun) {
+    println("Прогон: ${r.id}")
+    println("Состояние: ${r.label()}  ·  шагов: ${r.steps}  ·  вызовов: ${r.invocations.size}")
+    if (r.summary.isNotBlank()) println("\nИтог:\n${r.summary}")
+    if (r.error.isNotBlank() && r.state !is core.agent.RunState.Failed) println("Замечание: ${r.error}")
+    println()
+    if (r.invocations.isEmpty()) {
+        println("Тулы не вызывались.")
+    } else {
+        println("Шаги агента:")
+        r.invocations.forEach { inv ->
+            val icon = when (val st = inv.state) {
+                is core.agent.ToolState.Done -> "✅"
+                is core.agent.ToolState.Failed -> "❌ ${st.error.take(80)}"
+                is core.agent.ToolState.Running -> "🔧"
+                core.agent.ToolState.Pending -> "⏳"
+            }
+            val arg = inv.args.take(90).replace('\n', ' ')
+            println("  $icon ${inv.tool}($arg)")
+        }
+    }
+    // Показываем ВСЕГДА, включая ноль: иначе модель может написать «добавил
+    // раздел в README», ничего не изменив, и это выглядит как успех.
+    println()
+    if (r.changedFiles.isEmpty()) {
+        println("Изменено файлов: 0 (ничего на диске не поменялось)")
+    } else {
+        println("Изменено файлов: ${r.changedFiles.size} — ${r.changedFiles.joinToString(", ")}")
+    }
+    if (r.diff.isNotBlank()) {
+        println()
+        println("Diff:")
+        println(r.diff.take(DIFF_SHOWN))
+        if (r.diff.length > DIFF_SHOWN) println("… диф обрезан (полный — в agent_runs.json)")
+    }
+}
+
+// Оффлайн-проверка слоя агента. Ни сети, ни БД, ни LLM: только чистые
+// функции и временный каталог. Такой же приём, как verify-review/verify-support.
+private fun verifyAgent() {
+    val tmp = java.nio.file.Files.createTempDirectory("week6-agent-verify").toFile()
+    try {
+        tmp.resolve("src").mkdirs()
+        tmp.resolve("src/App.kt").writeText("fun main() {\n    println(\"привет\")\n}\n", Charsets.UTF_8)
+        tmp.resolve("docs").mkdirs()
+        tmp.resolve("docs/README.md").writeText("# Проект\n\nСтарая строка документации.\n", Charsets.UTF_8)
+        tmp.resolve(".git").mkdirs()
+        tmp.resolve(".git/config").writeText("secret\n", Charsets.UTF_8)
+
+        val ws = core.agent.Workspace(tmp)
+        val tools = core.agent.FileTools(ws)
+
+        // --- 1. Схемы тулов ---
+        val specs = tools.specs()
+        check(specs.size >= 8) { "мало тулов: ${specs.size}" }
+        check(specs.map { it.name }.distinct().size == specs.size) { "дублируются имена тулов" }
+        specs.forEach { s ->
+            check(s.name.matches(Regex("[a-z][a-z0-9_]*"))) { "плохое имя тула: ${s.name}" }
+            check(s.description.isNotBlank()) { "тул без описания: ${s.name}" }
+            check((s.parameters["type"] as? kotlinx.serialization.json.JsonPrimitive)?.content == "object") {
+                "схема не object: ${s.name}"
+            }
+        }
+        check(specs.any { it.name == "read_file" } && specs.any { it.name == "write_file" }) { "нет базовых тулов" }
+        // Запись обязана быть помечена мутирующей — от этого зависит гейт.
+        val mutating = tools.definitions().filter { it.mutating }.map { it.name }.toSet()
+        check(mutating.containsAll(setOf("write_file", "edit_file"))) { "пишущие тулы не помечены: $mutating" }
+        check("read_file" !in mutating && "grep" !in mutating) { "читающий тул помечен мутирующим" }
+        println("OK схемы тулов: ${specs.size} (мутирующих: ${mutating.size})")
+
+        // --- 2. Разбор аргументов: битый JSON не должен ронять цикл ---
+        check(core.llm.parseToolArgs("{\"path\":\"a.kt\"}") != null) { "нормальный JSON не разобран" }
+        check(core.llm.parseToolArgs("{путь a.kt}") == null) { "битый JSON принят как валидный" }
+        check(core.llm.parseToolArgs("")!!.isEmpty()) { "пустые аргументы должны быть пустым объектом" }
+        val cleaned = core.llm.parseToolArgs("вот json: {\"path\":\"a.kt\"} — держись")
+        check(cleaned != null && cleaned.strOf("path") == "a.kt") { "мусор вокруг JSON не вычищен: $cleaned" }
+        // Модели пишут числа вместо строк — принимаем.
+        val numeric = core.llm.parseToolArgs("{\"limit\":20}")
+        check(numeric!!.intOf("limit", 5) == 20) { "числовой аргумент не прочитан" }
+        val readSpec = specs.first { it.name == "read_file" }
+        check(core.llm.parseToolArgs("{}")!!.missingRequired(readSpec) == listOf("path")) {
+            "обязательный path не найден"
+        }
+        check(core.llm.parseToolArgs("{\"path\":\"a.kt\"}")!!.missingRequired(readSpec).isEmpty()) {
+            "path есть, а проверка требует"
+        }
+        println("OK разбор аргументов")
+
+        // --- 3. Клетка путей ---
+        listOf("../etc/passwd", "/etc/passwd", "a/../../etc/passwd", "C:/Windows/system32").forEach { bad ->
+            val threw = try {
+                ws.resolve(bad); false
+            } catch (_: core.agent.WorkspaceDenied) {
+                true
+            } catch (_: Exception) {
+                true
+            }
+            check(threw) { "клетка пропустила путь: $bad" }
+        }
+        val jailed = try {
+            ws.resolve(".git/config"); false
+        } catch (_: core.agent.WorkspaceDenied) {
+            true
+        }
+        check(jailed) { "агент добрался до .git/config" }
+        check(ws.norm("src/App.kt") == "src/App.kt") { "norm вернул ${ws.norm("src/App.kt")}" }
+        check(ws.listFiles("src").contains("src/App.kt")) { "listFiles по префиксу не нашёл файл" }
+        println("OK клетка путей")
+
+        // --- 4. Чтение и поиск ---
+        val read = ws.readText("docs/README.md")
+        check(read.contains("Старая строка")) { "read_file вернул не то: $read" }
+        check(ws.readText("docs/README.md", 1, 1).contains("# Проект")) { "диапазон строк не работает" }
+        val grep = ws.grep("Старая строка")
+        check(grep.any { it.path == "docs/README.md" }) { "grep не нашёл строку: $grep" }
+        val refs = ws.findReferences("main")
+        check(refs.any { it.path == "src/App.kt" && it.declaration }) { "find_references не нашёл объявление: $refs" }
+        println("OK чтение и поиск (grep=${grep.size}, refs=${refs.size})")
+
+        // --- 5. unified diff ---
+        check(core.agent.unifiedDiff("a.md", "одно и то же", "одно и то же").isEmpty()) { "диф без изменений не пуст" }
+        val d = core.agent.unifiedDiff("a.md", "alpha\nbeta\ngamma", "alpha\nBETA\ngamma")
+        check(d.startsWith("--- a/a.md") && d.contains("+++ b/a.md")) { "нет заголовков дифа: $d" }
+        check(d.contains("-beta") && d.contains("+BETA")) { "нет пары -/+ в дифе: $d" }
+        check(d.contains("@@")) { "нет хунка в дифе: $d" }
+        println("OK unified diff")
+
+        // --- 6. plan/apply: диф ДО записи, запись после разрешения ---
+        val plan = ws.planEdit("docs/README.md", "Старая строка документации.", "Новая строка документации.")
+        check(plan.diff.contains("-Старая") && plan.diff.contains("+Новая")) { "диф плана неверен: ${plan.diff}" }
+        check(!ws.readText("docs/README.md").contains("Новая")) { "planEdit записал на диск до подтверждения" }
+        val bad = try {
+            ws.planEdit("docs/README.md", "несуществующий фрагмент", "x"); false
+        } catch (_: Exception) {
+            true
+        }
+        check(bad) { "planEdit принял old_string, которого нет в файле" }
+        ws.apply(plan)
+        check(ws.readText("docs/README.md").contains("Новая")) { "apply не записал" }
+        // Создание нового файла.
+        val create = ws.planWrite("docs/ADR.md", "# Решение\n")
+        check(create.action == "create") { "новый файл должен быть create, а не ${create.action}" }
+        ws.apply(create)
+        check(ws.exists("docs/ADR.md")) { "новый файл не создан" }
+        println("OK plan/apply (диф до записи)")
+
+        // --- 6b. Снапшоты и откат ---
+        // Откат не имеет права удалять файл, снапшота которого нет: раньше
+        // «нет снапшота» читалось как «прогон создал файл», и revert сносил
+        // живой README. Проверяем оба направления явно.
+        val snapDir = java.io.File(tmp, "snaps")
+        ws.runIdForSnapshot = "run-test"
+        ws.snapshotDir = snapDir
+        ws.apply(ws.planEdit("docs/README.md", "Новая строка документации.", "Ещё новее."))
+        check(ws.readText("docs/README.md").contains("Ещё новее")) { "вторая правка не записана" }
+        check(ws.revert("docs/README.md", "run-test", snapDir)) { "откат существующего файла не отработал" }
+        // Откат возвращает состояние на момент СНАПШОТА, а не HEAD: к этому
+        // моменту в файле уже была предыдущая правка из блока plan/apply.
+        check(
+            ws.readText("docs/README.md").contains("Новая строка документации"),
+        ) { "откат вернул не состояние на момент снапшота: ${ws.readText("docs/README.md")}" }
+        // Откат НЕ трогает файл, чьего нет в снапшотах (файл создан прогоном).
+        val outside = ws.planWrite("docs/Новый_файл.md", "# новый\n")
+        ws.apply(outside)
+        check(ws.exists("docs/Новый_файл.md")) { "новый файл не создан" }
+        check(
+            !ws.revert("docs/ADR.md", "другой-прогон", snapDir),
+        ) { "откат чужого файла не должен считаться успешным" }
+        check(ws.exists("docs/ADR.md")) { "откат удалил файл, которого не касался прогон" }
+        // Файл, созданный прогоном, снапшот помечает — и только его можно удалить.
+        check(ws.wasNewInRun("docs/Новый_файл.md", "run-test", snapDir)) { "созданный файл не помечен" }
+        check(!ws.wasNewInRun("docs/README.md", "run-test", snapDir)) { "существующий файл помечен как новый" }
+        check(ws.revert("docs/Новый_файл.md", "run-test", snapDir)) { "откат созданного файла не отработал" }
+        check(!ws.exists("docs/Новый_файл.md")) { "созданный прогоном файл не удалён при откате" }
+        check(ws.exists("docs/ADR.md")) { "откат задел чужой файл" }
+        println("OK снапшоты и откат (чужое и пропавший снапшот не трогают файлы)")
+
+        // --- 6c. Разбор вызовов из текста (модель без native tools) ---
+        val mcpShape = core.agent.parseToolCallsFromText(
+            "{\"name\": \"read_file\", \"arguments\": {\"path\": \"a.kt\"}}",
+        )
+        check(mcpShape?.single()?.name == "read_file") { "плоская форма вызова не разобрана: $mcpShape" }
+        check(mcpShape.single().arguments.strOf("path") == "a.kt") { "аргументы не разобраны: $mcpShape" }
+        val openAiShape = core.agent.parseToolCallsFromText(
+            """{"function":{"name":"grep","arguments":"{\"pattern\":\"X\"}"}}""",
+        )
+        check(openAiShape?.single()?.name == "grep") { "форма OpenAI не разобрана: $openAiShape" }
+        check(openAiShape.single().arguments.strOf("pattern") == "X") { "аргументы-строка не разобраны" }
+        // Несколько объектов подряд — частый вывод локальных моделей.
+        val many = core.agent.parseToolCallsFromText(
+            """{"name":"read_file","arguments":{"path":"a.kt"}}""" + "\n" +
+                """{"name":"read_file","arguments":{"path":"b.kt"}}""",
+        )
+        check(many?.size == 2) { "несколько вызовов подряд не разобраны: $many" }
+        // Обычный ответ с фигурными скобками НЕ должен считаться вызовом.
+        check(
+            core.agent.parseToolCallsFromText("Список изменений: {\"файлы\": [\"README.md\"]}") == null,
+        ) { "чужой JSON принят за вызов тула" }
+        check(core.agent.parseToolCallsFromText("Готово, всё нашёл.") == null) { "обычный текст принят за вызов" }
+        println("OK разбор вызовов из текста (MCP, OpenAI, несколько подряд, ложные срабатывания)")
+
+        // --- 7. Редьюсер ---
+        var run = core.agent.AgentMachine.newRun("demo", "найти X")
+        val cfg = core.agent.AgentConfig(maxSteps = 3, maxToolCalls = 5, maxFilesChanged = 2)
+        fun step(e: core.agent.AgentEvent) = core.agent.AgentMachine.reduce(run, e, cfg).also { run = it.run }
+
+        val g = step(core.agent.AgentEvent.GoalAccepted("найти X"))
+        check(g.commands.contains(core.agent.AgentCommand.CallLlm)) { "GoalAccepted должен звать LLM" }
+        check(run.goal == "найти X") { "цель не сохранилась" }
+        step(core.agent.AgentEvent.StepStarted(1))
+        check(run.state is core.agent.RunState.Thinking) { "состояние не Thinking" }
+        step(core.agent.AgentEvent.ToolsProposed("read_file", "c1", "{\"path\":\"a\"}"))
+        step(core.agent.AgentEvent.ToolStarted("c1"))
+        check(run.byId("c1")?.state is core.agent.ToolState.Running) { "вызов не в Running" }
+        step(core.agent.AgentEvent.ToolSucceeded("c1", "прочитано", ""))
+        check(run.byId("c1")?.state is core.agent.ToolState.Done) { "вызов не в Done" }
+        // Гарг opencode: терминальное событие из терминального состояния игнорируется.
+        step(core.agent.AgentEvent.ToolFailed("c1", "опоздно"))
+        check(run.byId("c1")?.state is core.agent.ToolState.Done) { "реплей перетирает результат вызова" }
+        val fin = step(core.agent.AgentEvent.Finished("сделано"))
+        check(fin.terminal && fin.commands.contains(core.agent.AgentCommand.Finish)) { "Finished не терминален" }
+        // После терминала события игнорируются.
+        step(core.agent.AgentEvent.StepStarted(9))
+        check(run.steps == 1) { "события после терминала меняют прогон" }
+        println("OK редьюсер: переходы и гарг терминальных событий")
+
+        // --- 8. Отказ по разрешению обрывает прогон и не крутит цикл ---
+        var r2 = core.agent.AgentMachine.newRun("demo", "обновить доки")
+        val cfg2 = core.agent.AgentConfig()
+        fun step2(e: core.agent.AgentEvent) = core.agent.AgentMachine.reduce(r2, e, cfg2).also { r2 = it.run }
+        step2(core.agent.AgentEvent.GoalAccepted("обновить доки"))
+        step2(core.agent.AgentEvent.StepStarted(1))
+        step2(core.agent.AgentEvent.ToolsProposed("write_file", "w1", "{\"path\":\"x.md\"}"))
+        step2(
+            core.agent.AgentEvent.ApprovalRequested(
+                core.agent.PendingChange("x.md", "create", "@@ +a @@", 1, "создать x.md"),
+            ),
+        )
+        check(r2.state is core.agent.RunState.AwaitingApproval) { "перед правкой не ждём подтверждения" }
+        val denied = step2(core.agent.AgentEvent.ApprovalDenied("x.md"))
+        check(denied.terminal) { "отказ должен быть терминален" }
+        check(denied.commands.contains(core.agent.AgentCommand.AbortStep)) { "отказ должен обрывать шаг" }
+        check(r2.state is core.agent.RunState.Failed) { "после отказа прогон не провален: ${r2.state}" }
+        println("OK отказ по разрешению обрывает прогон")
+
+        // --- 9. Бюджет ---
+        var r3 = core.agent.AgentMachine.newRun("demo", "цель")
+        val cfg3 = core.agent.AgentConfig(maxSteps = 1, maxToolCalls = 99, maxFilesChanged = 99)
+        core.agent.AgentMachine.reduce(r3, core.agent.AgentEvent.GoalAccepted("цель"), cfg3).also { r3 = it.run }
+        core.agent.AgentMachine.reduce(r3, core.agent.AgentEvent.StepStarted(1), cfg3).also { r3 = it.run }
+        check(!core.agent.AgentMachine.needsContinuation(r3, cfg3)) { "после последнего шага продолжать нельзя" }
+        check(core.agent.AgentMachine.budgetReason(r3, cfg3) == "лимит шагов (1)") {
+            "не названа причина остановки: ${core.agent.AgentMachine.budgetReason(r3, cfg3)}"
+        }
+        println("OK бюджет шагов")
+
+        // --- 10. Правила разрешений ---
+        val perms = core.agent.PermissionStore(tmp)
+        check(perms.evaluate("demo", "edit", "docs/a.md") == core.agent.PermissionEffect.Ask) {
+            "по умолчанию должно быть ask, а не auto-allow"
+        }
+        perms.remember("demo", core.agent.PermissionRule("edit", "docs/*", core.agent.PermissionEffect.Allow.name))
+        check(perms.evaluate("demo", "edit", "docs/a.md") == core.agent.PermissionEffect.Allow) { "правило не сработало" }
+        check(perms.evaluate("demo", "edit", "src/a.md") == core.agent.PermissionEffect.Ask) { "маска слишком широкая" }
+        perms.remember("demo", core.agent.PermissionRule("edit", "docs/*", core.agent.PermissionEffect.Deny.name))
+        check(perms.evaluate("demo", "edit", "docs/a.md") == core.agent.PermissionEffect.Deny) { "последнее правило должно побеждать" }
+        check(core.agent.globMatch("*", "любой/путь")) { "глоб * не совпал" }
+        check(core.agent.globMatch("docs/*", "docs/a/b.md")) { "глоб docs/* не совпал с вложенным" }
+        check(!core.agent.globMatch("docs/*", "src/a.md")) { "глоб docs/* совпал с чужим" }
+        println("OK правила разрешений")
+
+        // --- 11. Промпт агента ---
+        val sys = core.rag.buildAgentSystem("demo", specs.map { it.name }, "demo")
+        check(sys.contains("read_file") && sys.contains("write_file")) { "в промпте нет имён тулов" }
+        check(sys.contains("edit_file")) { "в промпте нет предпочтения edit_file" }
+        check(sys.length < 4000) { "системный промпт раздулся: ${sys.length}" }
+        val usr = core.rag.buildAgentUser("обнови документацию", "Проект: demo. Ветка: main.")
+        check(usr.contains("обнови документацию") && usr.indexOf("ЦЕЛЬ") > 0) { "цель не попала в промпт: $usr" }
+        println("OK промпты агента")
+
+        // --- 12. MCP-слой: те же тулы отдаются по JSON-RPC ---
+        val server = core.support.McpServer(tools.mcpRegistry("demo"))
+        val list = kotlinx.coroutines.runBlocking { server.handle("""{"jsonrpc":"2.0","id":1,"method":"tools/list"}""") }
+        check(list.contains("read_file") && list.contains("edit_file")) { "MCP tools/list не показал тулы агента" }
+        val call = kotlinx.coroutines.runBlocking {
+            server.handle(
+                """{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"grep","arguments":{"pattern":"привет"}}}""",
+            )
+        }
+        check(call.contains("src/App.kt")) { "MCP tools/call grep не отработал: $call" }
+        val unknown = kotlinx.coroutines.runBlocking {
+            server.handle(
+                """{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"rm_rf","arguments":{}}}""",
+            )
+        }
+        check(unknown.contains("isError") || unknown.contains("Ошибка")) { "неизвестный тул должен дать ошибку: $unknown" }
+        println("OK MCP-слой агента (tools/list + tools/call)")
+
+        // --- 13. Полировка аргументов тулов ---
+        val writeSpec = specs.first { it.name == "write_file" }
+        check(core.llm.parseToolArgs("{\"path\":\"a.md\"}")!!.missingRequired(writeSpec) == listOf("content")) {
+            "write_file без content не отловлен"
+        }
+        println("OK обязательные аргументы")
+
+        println("VERIFY-AGENT PASSED")
+    } finally {
+        try {
+            tmp.deleteRecursively()
+        } catch (_: Exception) {
+        }
+    }
+}
+
 private fun fail(msg: String): Nothing {
     usage()
     throw IllegalArgumentException(msg)
@@ -822,6 +1277,17 @@ private fun usage() {
     println("  Task 3: прогон кейсов качества (тикет сработал / фразы есть / запрещённого нет).")
     println("week6 verify-support")
     println("  Task 3: оффлайн-проверка слоя поддержки (фронтматтер, MCP, промпт, CRM).")
+    println()
+    println("week6 agent-run --goal \"цель\" [--project <имя>] [--auto-approve] [--max-steps 8] [--max-files 10] [--out run.json]")
+    println("  Task 4: агент с доступом к файлам. Цель ставит человек, файлы выбирает агент.")
+    println("  Без --auto-approve каждое изменение спрашивает подтверждение (показывается diff).")
+    println("week6 agent-tools [--project <имя>]")
+    println("  Task 4: схемы тулов агента — ровно то, что видит модель и MCP-клиент.")
+    println("week6 agent-runs | agent-diff --run <id> | agent-revert --run <id>")
+    println("  Task 4: список прогонов / diff прогона / откат по снапшотам.")
+    println("week6 verify-agent")
+    println("  Task 4: оффлайн-проверка слоя агента (редьюсер, клетка путей, diff, MCP) без сети и БД.")
+    println("  Task 3: оффлайн-проверка слоя поддержки (фронтматтер, MCP, промпт, CRM).")
 }
 
 // Task 5: чат по имени для CLI — тот же ChatStore, что у desktop.
@@ -852,19 +1318,32 @@ private fun flags(args: Array<String>, name: String): List<String> {
     return out
 }
 
+// Флаги без значения: значение после них читать нельзя, иначе флаг «съедает»
+// следующий токен (--auto-approve --goal X терял --goal). Заодно чинит
+// --dry-run у review из Task 2 — там был ровно тот же случай.
+private val BOOL_FLAGS = setOf("--auto-approve", "--dry-run", "--local")
+
 // Позиционные аргументы (пути/названия статей) отдельно от --флагов.
 private fun splitPaths(args: Array<String>): Pair<List<String>, Array<String>> {
     val pos = mutableListOf<String>()
     val rest = mutableListOf<String>()
     var i = 1
     while (i < args.size) {
-        if (args[i].startsWith("--") && i + 1 < args.size) {
-            rest += args[i]
-            rest += args[i + 1]
-            i += 2
-        } else {
-            pos += args[i]
-            i++
+        val a = args[i]
+        when {
+            a in BOOL_FLAGS -> {
+                rest += a
+                i++
+            }
+            a.startsWith("--") && i + 1 < args.size -> {
+                rest += a
+                rest += args[i + 1]
+                i += 2
+            }
+            else -> {
+                pos += a
+                i++
+            }
         }
     }
     return pos to rest.toTypedArray()

@@ -6,6 +6,7 @@ import core.llm.LlmClient
 import core.llm.LlmResult
 import core.llm.LlmSettings
 import core.llm.LlmSettingsStore
+import core.llm.ToolSpec
 import core.project.GitTools
 import core.project.ProjectEntry
 import core.project.ProjectLoader
@@ -91,6 +92,25 @@ class RagService(
     // локальной Ollama ключ не нужен.
     fun resolveApiKey(explicit: String? = null): String? = llmApiKey(explicit)
 
+    // Task 4: ход агента с function-calling. Отдельный метод, а не флаг у ask(),
+    // потому что агент ведёт СВОЮ переписку (роли assistant/tool, эхо
+    // tool_calls) и не должен смешиваться с RAG-диалогом.
+    // toolChoice = "none" выключает вызовы тулов (opencode так поступает на
+    // лимите шагов, чтобы модель подвела итог словами).
+    suspend fun askAgent(
+        transcript: List<ChatMsg>,
+        tools: List<ToolSpec>,
+        toolChoice: String? = null,
+        apiKey: String? = null,
+    ): LlmResult = llm().complete(
+        transcript,
+        llmApiKey(apiKey),
+        AGENT_TEMPERATURE,
+        null,
+        tools,
+        toolChoice,
+    )
+
     fun llmLabelOrProvider(): String = llmProviderLabel()
 
     // Короткий label для UI: "deepseek:deepseek-chat" | "ollama:qwen3:32b · localhost:11434".
@@ -108,6 +128,7 @@ class RagService(
             is LlmResult.HttpError -> throw IllegalStateException("${llmProviderLabel()} HTTP ${r.code}: ${r.detail.take(200)}")
             is LlmResult.NetworkError -> throw IllegalStateException("${llmProviderLabel()}: ${r.detail.take(200)}")
             LlmResult.Empty -> throw IllegalStateException("${llmProviderLabel()}: пустой ответ модели")
+            is LlmResult.Tools -> throw IllegalStateException("проба связи вернула вызовы тулов — это баг настроек")
         }
     }
 
@@ -455,6 +476,9 @@ class RagService(
             is LlmResult.HttpError -> RagAnswer("${llmProviderLabel()} HTTP ${r.code}: ${r.detail.take(200)}", hits, debug, refs = refs)
             is LlmResult.NetworkError -> RagAnswer("Сеть: ${r.detail.take(200)}", hits, debug, refs = refs)
             LlmResult.Empty -> RagAnswer("Пустой ответ модели.", hits, debug, refs = refs)
+            // Task 4: сюда попасть нельзя (ask не шлёт tools), но если модель
+            // всё же ответит вызовом — показываем текст, а не роняем диалог.
+            is LlmResult.Tools -> RagAnswer(r.text, hits, debug, refs = refs)
         }
     }
 
@@ -523,6 +547,7 @@ class RagService(
             is LlmResult.HttpError -> "${llmProviderLabel()} HTTP ${r.code}: ${r.detail.take(200)}"
             is LlmResult.NetworkError -> "Сеть: ${r.detail.take(200)}"
             LlmResult.Empty -> "Пустой ответ модели."
+            is LlmResult.Tools -> r.text
         }
     }
 
@@ -809,6 +834,7 @@ class RagService(
                 is LlmResult.HttpError -> throw IllegalStateException("${llmProviderLabel()} HTTP ${r.code}: ${r.detail.take(200)}")
                 is LlmResult.NetworkError -> throw IllegalStateException("Сеть: ${r.detail.take(200)}")
                 LlmResult.Empty -> throw IllegalStateException("Пустой ответ модели")
+                is LlmResult.Tools -> throw IllegalStateException("Ревью не поддерживает вызовы тулов")
             }
             val (sum, findings, comments) = parseReviewJson(raw)
             if (sum.isNotBlank()) summaries += "### $path\n$sum"
@@ -999,6 +1025,7 @@ class RagService(
                 is LlmResult.HttpError -> throw IllegalStateException("${llmProviderLabel()} HTTP ${r.code}: ${r.detail.take(200)}")
                 is LlmResult.NetworkError -> throw IllegalStateException("Сеть: ${r.detail.take(200)}")
                 LlmResult.Empty -> throw IllegalStateException("Пустой ответ модели")
+                is LlmResult.Tools -> throw IllegalStateException("Ревью не поддерживает вызовы тулов")
             }
             val (sum, findings, comments) = parseReviewJson(raw)
             onLog("[${idx + 1}/$total] $path: правил ${hits.size}, замечаний ${comments.size}, ${(System.currentTimeMillis() - tf) / 1000}с")

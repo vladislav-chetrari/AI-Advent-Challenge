@@ -298,6 +298,13 @@ object SupportService {
                 chatId = id, ticketId = ticketId, ticketStatus = ticketStatusOf(ticketBlock),
                 usedTicket = usedTicket, warning = "llm empty",
             )
+            // Task 4: ветка недостижима (саппорт тулы не шлёт), но отвечаем
+            // текстом, а не падаем — поддержка не должна ломаться от правки ядра.
+            is core.llm.LlmResult.Tools -> SupportReply(
+                text = r.text,
+                chatId = id, ticketId = ticketId, ticketStatus = ticketStatusOf(ticketBlock),
+                usedTicket = usedTicket, warning = "llm tools",
+            )
         }
     }
 
