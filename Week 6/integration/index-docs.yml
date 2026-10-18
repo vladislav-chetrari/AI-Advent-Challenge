@@ -33,7 +33,7 @@ jobs:
         env:
           VPS_URL: ${{ secrets.VPS_URL }}
           VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
-          REVIEW_PROJECT: ${{ inputs.project || vars.REVIEW_PROJECT || github.event.repository.name }}
+          REVIEW_PROJECT: ${{ inputs.project || vars.REVIEW_PROJECT || secrets.REVIEW_PROJECT || github.event.repository.name }}
           REPO_URL: ${{ format('{0}/{1}', github.server_url, github.repository) }}
           REPO_TOKEN: ${{ github.event.repository.private && secrets.GITHUB_TOKEN || '' }}
         run: |

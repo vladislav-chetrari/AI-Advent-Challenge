@@ -46,7 +46,7 @@ jobs:
           VPS_URL: ${{ secrets.VPS_URL }}
           VPS_TOKEN: ${{ secrets.VPS_TOKEN }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REVIEW_PROJECT: ${{ inputs.project || vars.REVIEW_PROJECT || github.event.repository.name }}
+          REVIEW_PROJECT: ${{ inputs.project || vars.REVIEW_PROJECT || secrets.REVIEW_PROJECT || github.event.repository.name }}
           REPO_FULL: ${{ github.repository }}
           TICKET_STATE: ${{ inputs.state || 'all' }}
           # Дополнительно можно сузить выгрузку до лейбла, например: support
