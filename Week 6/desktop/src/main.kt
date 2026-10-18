@@ -52,8 +52,6 @@ import androidx.compose.ui.input.key.isShiftPressed
 import androidx.compose.ui.input.key.key
 import androidx.compose.ui.input.key.onPreviewKeyEvent
 import androidx.compose.ui.input.key.type
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -351,10 +349,6 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
                 TextButton(onClick = vm::openRagSettings) { Text("RAG ⚙", fontSize = 12.sp) }
             }
             Spacer(Modifier.width(8.dp))
-            CopyButton(
-                st.messages.joinToString("\n\n") { "${it.role}: ${it.content}" },
-                title = "весь чат",
-            )
             TextButton(onClick = { vm.clearChat(chat.id) }) { Text("очистить", fontSize = 12.sp) }
         }
         if (!chat.ragEnabled) {
@@ -400,6 +394,9 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
             if (messages.isNotEmpty()) listState.scrollToItem(messages.size - 1)
         }
         Box(Modifier.weight(1f).fillMaxWidth()) {
+            // Контейнер выделения на всю ленту: текст можно тянуть через
+            // несколько сообщений, Ctrl+C копирует выделенное.
+            SelectionContainer {
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(start = 12.dp, end = 20.dp)) {
                 items(messages, key = { it.id }) { m -> MessageBubble(m) }
                 if (st.busy) {
@@ -407,6 +404,7 @@ fun ChatPane(vm: AppViewModel, chat: RagChat) {
                         Text("Печатает…", fontSize = 14.sp, color = Color.Gray, modifier = Modifier.padding(vertical = 6.dp))
                     }
                 }
+            }
             }
             VerticalScrollbar(
                 adapter = rememberScrollbarAdapter(listState),
@@ -452,18 +450,6 @@ fun AgentChatPane(vm: AppViewModel, chat: RagChat) {
                 fontSize = 12.sp, color = if (st.selectedProject != null) Color.Gray else Color(0xFFB00020),
                 maxLines = 1,
             )
-            Spacer(Modifier.width(4.dp))
-            CopyButton(
-                st.chatRuns.joinToString("\n\n") { r ->
-                    buildString {
-                        append("🎯 ").append(r.goal).append('\n')
-                        append(r.label()).append(" · ").append(r.id).append('\n')
-                        append(r.summary).append('\n')
-                        if (r.diff.isNotBlank()) append(r.diff)
-                    }
-                },
-                title = "все прогоны",
-            )
             if (st.busy) {
                 Spacer(Modifier.width(8.dp))
                 TextButton(onClick = vm::cancelAgent) { Text("⏹ стоп", fontSize = 12.sp, color = Color(0xFFB00020)) }
@@ -477,6 +463,9 @@ fun AgentChatPane(vm: AppViewModel, chat: RagChat) {
             if (runs.isNotEmpty()) listState.animateScrollToItem(maxOf(0, listState.layoutInfo.totalItemsCount - 1))
         }
         Box(Modifier.weight(1f).fillMaxWidth()) {
+            // Контейнер выделения на всю ленту: текст можно тянуть через несколько
+            // сообщений и прогонов, а Ctrl+C копирует выделенное.
+            SelectionContainer {
             LazyColumn(state = listState, modifier = Modifier.fillMaxSize().padding(start = 12.dp, end = 24.dp)) {
                 if (runs.isEmpty() && !st.busy) {
                     item(key = "agent-hint") {
@@ -490,8 +479,6 @@ fun AgentChatPane(vm: AppViewModel, chat: RagChat) {
                     }
                 }
                 itemsIndexed(runs, key = { _, r -> "r${r.id}" }) { _, r ->
-                    // Цель и карточка прогона — один выделяемый блок.
-                    SelectionContainer {
                     Column {
                         // Сообщение пользователя — сама цель.
                         Column(
@@ -503,13 +490,13 @@ fun AgentChatPane(vm: AppViewModel, chat: RagChat) {
                         }
                         AgentRunCard(vm, r, st)
                     }
-                    }
                 }
                 if (st.busy && runs.isEmpty()) {
                     item(key = "agent-thinking") {
                         Text("Агент думает…", fontSize = 13.sp, color = Color.Gray, modifier = Modifier.padding(vertical = 6.dp))
                     }
                 }
+            }
             }
             VerticalScrollbar(
                 adapter = rememberScrollbarAdapter(listState),
@@ -565,7 +552,6 @@ fun AgentRunCard(vm: AppViewModel, run: core.agent.AgentRun, st: UiState) {
                 "шагов ${run.steps} · вызовов ${run.invocations.size} · ${run.id}",
                 fontSize = 10.sp, color = Color.Gray, modifier = Modifier.weight(1f), maxLines = 1,
             )
-            CopyButton(run.diff.ifBlank { runSummaryText(run) }, title = "результат")
             // Продолжение: прогон встал на лимит, упал или отменён — задача не
             // закрыта, и кнопка прямо под этим прогоном. Пока идёт он сам,
             // кнопку не показываем.
@@ -644,8 +630,6 @@ fun AgentRunCard(vm: AppViewModel, run: core.agent.AgentRun, st: UiState) {
             TextButton(onClick = { showDiff = !showDiff }) {
                 Text(if (showDiff) "скрыть diff" else "показать diff", fontSize = 11.sp)
             }
-            Spacer(Modifier.weight(1f))
-            CopyButton(run.diff, title = "diff")
             if (showDiff) {
                 Box(Modifier.fillMaxWidth().heightIn(max = 260.dp).background(Color(0xFFFAFAFA)).padding(6.dp)) {
                     Text(
@@ -675,10 +659,7 @@ fun ApprovalCard(vm: AppViewModel, change: core.agent.PendingChange) {
                 if (change.summary.isNotBlank()) "\n${change.summary}" else "",
             fontSize = 12.sp,
         )
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Text("diff изменения", fontSize = 10.sp, color = Color.Gray, modifier = Modifier.weight(1f))
-            CopyButton(change.diff, title = "diff")
-        }
+        Text("diff изменения", fontSize = 10.sp, color = Color.Gray)
         Box(Modifier.fillMaxWidth().heightIn(max = 200.dp).background(Color.White).padding(6.dp)) {
             Text(change.diff.take(DIFF_PREVIEW_CHARS), fontSize = 10.sp, fontFamily = FontFamily.Monospace)
         }
@@ -690,43 +671,13 @@ fun ApprovalCard(vm: AppViewModel, change: core.agent.PendingChange) {
     }
 }
 
-// Копирование текста. Выделение мышью в чате есть (SelectionContainer), но в
-// Markdown с блоками и таблицами выделять неудобно, а из нескольких сообщений —
-// нельзя: контейнер выделения один на сообщение. Поэтому у текста есть кнопка
-// «копировать», которая кладёт в буфер ровно то, что на экране.
-@Composable
-fun CopyButton(text: String, title: String = "копировать") {
-    // LocalClipboardManager помечен deprecated в пользу suspend-версии, но у неё
-    // нет публичного конструктора ClipEntry для текста — берём рабочую.
-    @Suppress("DEPRECATION")
-    val clipboard = LocalClipboardManager.current
-    var copied by remember { mutableStateOf(false) }
-    LaunchedEffect(copied) {
-        if (copied) {
-            kotlinx.coroutines.delay(1500)
-            copied = false
-        }
-    }
-    TextButton(
-        onClick = {
-            clipboard.setText(AnnotatedString(text))
-            copied = true
-        },
-        enabled = text.isNotBlank(),
-    ) { Text(if (copied) "✓ скопировано" else "📋 $title", fontSize = 11.sp) }
-}
-
 @Composable
 fun MessageBubble(m: RagMessage) {
     val bg = if (m.role == "user") Color(0xFFE3F2FD) else Color(0xFFF1F1F1)
-    // Один SelectionContainer на всё сообщение: раньше он обхватывал только тело,
-    // и выделить текст вместе с шапкой или цитатами источников было нельзя.
-    SelectionContainer {
+    // Контейнер выделения — на ленте целиком (см. список сообщений), поэтому
+    // само сообщение остаётся обычным Column без вложенного SelectionContainer.
     Column(Modifier.fillMaxWidth().padding(vertical = 3.dp).background(bg).padding(8.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
-            Text(m.role, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Gray, modifier = Modifier.weight(1f))
-            CopyButton(m.content)
-        }
+        Text(m.role, fontSize = 11.sp, fontWeight = FontWeight.Bold, color = Color.Gray)
         // Task 3: диагностика второго этапа ("найдено 20 → в контекст 4...").
         if (m.info.isNotBlank()) {
             Text(m.info, fontSize = 10.sp, color = Color(0xFF888888))
@@ -768,7 +719,6 @@ fun MessageBubble(m: RagMessage) {
             }
         }
     }
-    }
 }
 
 @Composable
@@ -776,7 +726,6 @@ fun DocPane(vm: AppViewModel, source: String, doc: DocInfo?, text: String) {
     Column(Modifier.fillMaxHeight().padding(12.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
             Text(doc?.title ?: source.substringAfterLast("/"), fontWeight = FontWeight.Bold, fontSize = 16.sp, modifier = Modifier.weight(1f), maxLines = 1)
-            CopyButton(text, title = "файл")
             TextButton(onClick = vm::closeDoc) { Text("закрыть") }
         }
         if (doc != null) {
