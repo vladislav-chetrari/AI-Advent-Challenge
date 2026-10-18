@@ -77,13 +77,6 @@ fun ticketStatusName(status: String): String = when (status) {
     else -> status
 }
 
-fun ticketStatusNameOrFail(status: String): String {
-    require(status in TICKET_STATUSES) {
-        "статус должен быть одним из: ${TICKET_STATUSES.joinToString(", ")}"
-    }
-    return status
-}
-
 // Сырой Issue с GitHub — ровно то, что шлёт Action. Фронтматтер разбирает сервер.
 @Serializable
 data class RawIssue(
@@ -135,9 +128,8 @@ data class SupportReply(
     val usedTicket: Boolean = false,
     val escalated: Boolean = false,
     val escalateReason: String = "",
-    // Цитаты из FAQ/доков и из других тикетов — отдельными списками.
+    // Цитаты из FAQ и документации.
     val faqRefs: List<core.rag.RagRef> = emptyList(),
-    val ticketRefs: List<core.rag.RagRef> = emptyList(),
     // Сколько реплик из истории диалога ушло в промпт.
     val historyUsed: Int = 0,
     val retrieval: core.rag.RetrievalDebug = core.rag.RetrievalDebug(),

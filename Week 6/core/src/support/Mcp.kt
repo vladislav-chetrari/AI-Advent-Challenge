@@ -41,10 +41,6 @@ const val MCP_PROTOCOL_VERSION = "2024-11-05"
 const val MCP_SERVER_NAME = "callowfellow-support-crm"
 const val MCP_SERVER_VERSION = "0.1.0"
 
-private fun obj(vararg pairs: Pair<String, String>) = buildJsonObject {
-    pairs.forEach { (k, v) -> put(k, v) }
-}
-
 private fun str(o: JsonObject, key: String): String =
     (o[key] as? JsonPrimitive)?.takeIf { it !is JsonNull }?.contentOrNull.orEmpty()
 
@@ -310,7 +306,10 @@ class McpServer(private val registry: McpToolRegistry) {
                         )
                         put(
                             "serverInfo",
-                            obj("name" to MCP_SERVER_NAME, "version" to MCP_SERVER_VERSION),
+                            buildJsonObject {
+                                put("name", MCP_SERVER_NAME)
+                                put("version", MCP_SERVER_VERSION)
+                            },
                         )
                     },
                 )

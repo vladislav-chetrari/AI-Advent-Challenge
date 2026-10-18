@@ -164,8 +164,8 @@ object SupportService {
     }
 
     // Один шаг диалога.
-    //   mcp != null — CRM по MCP (обычный режим: бот здесь, CRM на VPS);
-    //   mcp == null и crm != null — локальный режим CLI (без сети).
+    //   crm != null — CRM в процессе (сервер на VPS, CLI локально);
+    //   mcp != null — CRM по MCP (внешний клиент, например mcp-tools).
     suspend fun ask(
         rag: RagService,
         project: String,
@@ -191,7 +191,10 @@ object SupportService {
         // знает), а иначе САМИ ищем подходящее обращение по тексту сообщения.
         // Блок тикета всегда начинается с "Тикет #N" — этим же проверяем, что CRM
         // ответил данными, а не «не найдено».
-        var ticketText = resolveTicket(clean, id, mcp, crm, onLog)
+        // Явный номер обращения знает только оператор (CLI). Из веб-чата приходит
+        // идентификатор сессии («web-abc123») — искать его в CRM бессмысленно.
+        val explicitId = id.takeIf { it.isNotEmpty() && it.all { c -> c.isDigit() } }
+        var ticketText = if (explicitId != null) resolveTicket(clean, explicitId, mcp, crm, onLog) else ""
         var ticketId = ticketIdOf(ticketText)
         if (!ticketText.startsWith(TICKET_HEADER)) {
             val found = findTicketByMessage(rag, clean, message)
@@ -271,6 +274,8 @@ object SupportService {
                 ticketId = ticketId,
                 ticketStatus = ticketStatusOf(ticketBlock),
                 usedTicket = usedTicket,
+                escalated = ticketBlock.contains("ЭСКАЛАЦИЯ:"),
+                escalateReason = ticketBlock.substringAfter("ЭСКАЛАЦИЯ:", "").substringBefore('\n').trim(),
                 faqRefs = refsFromHits(hits),
                 historyUsed = history.size,
                 retrieval = debug,
